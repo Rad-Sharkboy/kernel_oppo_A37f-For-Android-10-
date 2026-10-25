@@ -371,7 +371,7 @@ set_prop:
 	msleep(10);
 	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
 	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "1209600");
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "998400");
 	msleep(10);
 	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "30000");
 	msleep(10);
@@ -535,7 +535,7 @@ static void cinnamon_execute_command_3(void)
 		/* Tune interactive governor for low-latency UI response */
 		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
 		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "1209600");
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "998400");
 		msleep(10);
 		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "40000");
 		msleep(10);

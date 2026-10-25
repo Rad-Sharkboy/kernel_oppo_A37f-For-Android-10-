@@ -2,6 +2,12 @@
 
 ## Development
 
+### Interactive Initial Boost Target (2026-10-26)
+
+- **Changed:** `hispeed_freq` from 1209600 to 998400 kHz in both Cinnamon_Active startup and delayed reapply paths. Maximum CPU frequency remains 1209600 kHz.
+- **Purpose:** reduce initial boost overhead during short CPU bursts, with potential battery savings during light use.
+- **Preserved:** other governor settings, CPU/GPU overclocks, 65 Hz display, thermal policy and radio configuration.
+
 ### Cinnamon I/O Latency Accounting Fix (2026-10-25)
 
 - **Fixed double averaging:** `total_latency_ns` already contains a moving average. Removed the extra division by request count from adaptive tuning and `avg_latency_ns` reporting; a 100 ms average no longer appears as 1 ms at count 100.
