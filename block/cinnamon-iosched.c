@@ -77,7 +77,7 @@ struct cinnamon_data {
 	unsigned int read_batch_count;   /* tracks reads in current cycle */
 	unsigned int fg_dispatch_count;  /* consecutive foreground dispatches */
 
-	/* Latency tracking (ns) */
+	/* Latency EWMA (ns), not a sum over num_requests. */
 	atomic64_t total_latency_ns;
 	atomic_t num_requests;
 
@@ -524,7 +524,7 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd)
 	num = atomic_read(&cd->num_requests);
 	if (num == 0)
 		return;
-	avg_latency_ms = div64_u64(total_ns / num, 1000000);
+	avg_latency_ms = div64_u64(total_ns, 1000000);
 
 	for (i = 0; i < PRIO_COUNT; i++)
 		queue_depth += cd->queue_counts[i];
@@ -925,7 +925,7 @@ static ssize_t cinnamon_avg_latency_ns_show(struct elevator_queue *e, char *page
 	int num = atomic_read(&cd->num_requests);
 	if (num == 0)
 		return sprintf(page, "0\n");
-	return sprintf(page, "%llu\n", (unsigned long long)div64_u64(total_ns, num));
+	return sprintf(page, "%llu\n", (unsigned long long)total_ns);
 }
 
 static ssize_t cinnamon_write_expire_ms_show(struct elevator_queue *e, char *page)

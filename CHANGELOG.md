@@ -1,5 +1,13 @@
 # Cinnamon Kernel Changelog
 
+## Development: correct latency EWMA accounting (2026-10-25)
+
+- `cinnamon_update_latency()` already stores an exponentially weighted average of sampled queue wait in `total_latency_ns`. The adaptive controller and `avg_latency_ns` sysfs reader divided that average by `num_requests` again. At an average of 100 ms and count 100 this incorrectly became 1 ms.
+- Consume the stored EWMA directly in both places. Keep sampling, weighting, count rollover, manual-tuning grace period, clocks, display configuration and fsync behavior unchanged.
+- Host regression harness: `python3 tools/testing/cinnamon-latency-test.py`. It compiles the actual source functions with minimal kernel stubs; confirms the original fails and the fix passes zero/first-sample, repeated-sample/count-rollover, smoothing, adaptive high/low/neutral latency and manual-grace cases. It does not test kernel concurrency or real storage throughput.
+- Cross-compiled `block/cinnamon-iosched.o` with the configured ARM64 GCC 4.9 toolchain. Full image linking, boot and hardware A/B validation are pending; no replacement boot image is supplied by this commit.
+- Device test plan: compare the same app launches and foreground scrolling during identical background file copies on separately identified internal/SD queues, verify copied-file hashes, and record effective scheduler/fsync settings. A correctness fix is not yet a demonstrated speed or battery improvement. Preserve the user's working 65 Hz LCD overclock and CPU/GPU clocks.
+
 ## Builds #389–#402
 
 ### BQ24196 Bypass Charging + Real Current + Voltage SOC Fix (2026-07-01)
