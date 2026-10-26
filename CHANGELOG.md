@@ -2,6 +2,11 @@
 
 ## Development
 
+### Cinnamon I/O Merge Compatibility (2026-10-26)
+
+- **Fixed:** validate request compatibility before front/back merges, including read/write direction, discard flags, device and encryption compatibility.
+- **Preserved:** eight-request scan limit, queue ordering and write durability.
+
 ### Interactive Initial Boost Target (2026-10-26)
 
 - **Changed:** `hispeed_freq` from 1209600 to 998400 kHz in both Cinnamon_Active startup and delayed reapply paths. Maximum CPU frequency remains 1209600 kHz.

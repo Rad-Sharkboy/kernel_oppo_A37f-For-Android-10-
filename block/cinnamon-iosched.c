@@ -421,11 +421,12 @@ static int cinnamon_merge(struct request_queue *q, struct request **req,
 		sector_t rq_sector = blk_rq_pos(rq_iter);
 		sector_t rq_last_sector = rq_sector + blk_rq_sectors(rq_iter);
 
-		if (sector == rq_last_sector) {
+		/* Adjacent sectors still require compatible I/O operations. */
+		if (sector == rq_last_sector && elv_rq_merge_ok(rq_iter, bio)) {
 			*req = rq_iter;
 			return ELEVATOR_BACK_MERGE;
 		}
-		if (last_sector == rq_sector) {
+		if (last_sector == rq_sector && elv_rq_merge_ok(rq_iter, bio)) {
 			*req = rq_iter;
 			return ELEVATOR_FRONT_MERGE;
 		}
