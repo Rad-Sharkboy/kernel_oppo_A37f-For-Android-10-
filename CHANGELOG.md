@@ -2,6 +2,11 @@
 
 ## Development
 
+### Cinnamon zRAM History Search (2026-10-26)
+
+- **Reduced compression work:** skip the repeated comparison against the newest history block after the quick-match check has already rejected it, in both ARM64 NEON and generic paths.
+- **Preserved:** compressed format, history ordering, first-block handling and decompression behavior.
+
 ### Cinnamon I/O Merge Compatibility (2026-10-26)
 
 - **Fixed:** validate request compatibility before front/back merges, including read/write direction, discard flags, device and encryption compatibility.

@@ -801,7 +801,8 @@ static int cinnamon_compress_neon_batched(const unsigned char *src, unsigned cha
 		order[1] = (ctx->prev_index + 2) % 4;
 		order[2] = (ctx->prev_index + 1) % 4;
 		order[3] = ctx->prev_index;
-		for (idx = 0; idx < 4; idx++) {
+		/* The quick check already rejected the most recent block. */
+		for (idx = (i > 0); idx < 4; idx++) {
 			p = order[idx];
 			if (neon_blocks_match_batched(current_src,
 					(const u8 *)ctx->prev_blocks[p], block_size)) {
@@ -1160,7 +1161,8 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 		order[1] = (ctx->prev_index + 2) % 4;
 		order[2] = (ctx->prev_index + 1) % 4;
 		order[3] = ctx->prev_index;
-		for (idx = 0; idx < 4; idx++) {
+		/* The quick check already rejected the most recent block. */
+		for (idx = (i > 0); idx < 4; idx++) {
 			p = order[idx];
 			if (blocks_match(current_src, (const u8 *)ctx->prev_blocks[p], block_size)) {
 				mode = CINNAMON_MODE_MATCH0 + p;
