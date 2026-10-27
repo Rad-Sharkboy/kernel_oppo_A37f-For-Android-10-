@@ -15,55 +15,7 @@
 #include <linux/pagemap.h>
 #include <linux/quotaops.h>
 #include <linux/backing-dev.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/uaccess.h>
 #include "internal.h"
-
-static int dynamic_fsync __read_mostly = 0;
-
-static int dynamic_fsync_proc_show(struct seq_file *m, void *v)
-{
-	seq_printf(m, "%d\n", dynamic_fsync);
-	return 0;
-}
-
-static int dynamic_fsync_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, dynamic_fsync_proc_show, NULL);
-}
-
-static ssize_t dynamic_fsync_proc_write(struct file *file, const char __user *buf,
-					size_t count, loff_t *ppos)
-{
-	char kbuf[8];
-	int val;
-
-	if (count > sizeof(kbuf) - 1)
-		return -EINVAL;
-	if (copy_from_user(kbuf, buf, count))
-		return -EFAULT;
-	kbuf[count] = '\0';
-	if (kstrtoint(kbuf, 10, &val))
-		return -EINVAL;
-	dynamic_fsync = val ? 1 : 0;
-	return count;
-}
-
-static const struct file_operations dynamic_fsync_fops = {
-	.open		= dynamic_fsync_proc_open,
-	.read		= seq_read,
-	.write		= dynamic_fsync_proc_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int __init dynamic_fsync_init(void)
-{
-	proc_create("dynamic_fsync", 0666, NULL, &dynamic_fsync_fops);
-	return 0;
-}
-late_initcall(dynamic_fsync_init);
 
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
 			SYNC_FILE_RANGE_WAIT_AFTER)
@@ -225,8 +177,6 @@ SYSCALL_DEFINE1(syncfs, int, fd)
  */
 int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 {
-	if (unlikely(dynamic_fsync))
-		return 0;
 	if (!file->f_op || !file->f_op->fsync)
 		return -EINVAL;
 	return file->f_op->fsync(file, start, end, datasync);

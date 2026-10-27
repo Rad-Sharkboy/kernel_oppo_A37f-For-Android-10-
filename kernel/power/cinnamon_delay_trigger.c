@@ -23,7 +23,6 @@
 #include <linux/fs.h>
 #include <linux/clk.h>
 #include <linux/of.h>
-#include <linux/power_supply.h>
 #include <dt-bindings/clock/msm-clocks-8916.h>
 
 /* Delay period in milliseconds */
@@ -34,7 +33,6 @@ static struct delayed_work cinnamon_delay_work;
 static struct delayed_work cinnamon_usb_reapply_work;
 static struct delayed_work cinnamon_scheduler_reapply_work;
 static struct delayed_work cinnamon_bimc_retry_work;
-static struct delayed_work cinnamon_dynamic_fsync_work;
 static struct workqueue_struct *cinnamon_wq;
 static bool delay_pending = false;
 static bool auto_trigger = true;  /* Auto-run when module loads */
@@ -432,34 +430,6 @@ static void cinnamon_bimc_retry_work_fn(struct work_struct *work)
 	cinnamon_try_bimc_oc();
 }
 
-static void cinnamon_dynamic_fsync_work_fn(struct work_struct *work)
-{
-	struct power_supply *battery;
-	union power_supply_propval cap, status;
-	int enable = 0;
-
-	battery = power_supply_get_by_name("battery");
-	if (battery) {
-		if (battery->get_property(battery, POWER_SUPPLY_PROP_CAPACITY, &cap) == 0 &&
-		    battery->get_property(battery, POWER_SUPPLY_PROP_STATUS, &status) == 0) {
-			if (cap.intval > 30 && status.intval != POWER_SUPPLY_STATUS_CHARGING &&
-			    status.intval != POWER_SUPPLY_STATUS_FULL)
-				enable = 1;
-		}
-	}
-
-	if (cinnamon_write_path("/proc/dynamic_fsync", enable ? "1" : "0") == 0) {
-		if (enable)
-			pr_info("Cinnamon_Active: dynamic_fsync enabled (cap=%d%%)\n", cap.intval);
-		else if (battery)
-			pr_info("Cinnamon_Active: dynamic_fsync disabled (cap=%d%%, status=%d)\n",
-				cap.intval, status.intval);
-	}
-
-	queue_delayed_work(cinnamon_wq, &cinnamon_dynamic_fsync_work,
-		msecs_to_jiffies(60000));
-}
-
 static void cinnamon_execute_command_3(void)
 {
 	pr_info("Cinnamon_Active: Executing Cinnamon_Active - Step 3\n");
@@ -643,8 +613,6 @@ static void cinnamon_delay_work_fn(struct work_struct *work)
 	queue_delayed_work(cinnamon_wq, &cinnamon_scheduler_reapply_work,
 		msecs_to_jiffies(scheduler_reapply_delay_ms));
 
-	queue_delayed_work(cinnamon_wq, &cinnamon_dynamic_fsync_work,
-		msecs_to_jiffies(120000));
 	
 	pr_info("Cinnamon_Active: Auto execution completed\n");
 }
@@ -788,7 +756,6 @@ static int __init cinnamon_delay_trigger_init(void)
 	INIT_DELAYED_WORK(&cinnamon_usb_reapply_work, cinnamon_usb_reapply_work_fn);
 	INIT_DELAYED_WORK(&cinnamon_scheduler_reapply_work, cinnamon_scheduler_reapply_work_fn);
 	INIT_DELAYED_WORK(&cinnamon_bimc_retry_work, cinnamon_bimc_retry_work_fn);
-	INIT_DELAYED_WORK(&cinnamon_dynamic_fsync_work, cinnamon_dynamic_fsync_work_fn);
 	
 	cinnamon_delay_proc_entry = proc_create_data("cinnamon_delay_trigger", 0666, NULL,
 						&cinnamon_delay_fops, NULL);
@@ -831,7 +798,6 @@ static void __exit cinnamon_delay_trigger_exit(void)
 	cancel_delayed_work_sync(&cinnamon_usb_reapply_work);
 	cancel_delayed_work_sync(&cinnamon_scheduler_reapply_work);
 	cancel_delayed_work_sync(&cinnamon_bimc_retry_work);
-	cancel_delayed_work_sync(&cinnamon_dynamic_fsync_work);
 
 	if (cinnamon_wq) {
 		destroy_workqueue(cinnamon_wq);

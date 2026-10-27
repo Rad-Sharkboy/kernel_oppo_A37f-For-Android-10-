@@ -2,6 +2,11 @@
 
 ## Development
 
+### Restore Filesystem Sync Semantics (2026-10-27)
+
+- **Fixed:** always complete the filesystem's requested fsync/fdatasync operation and return its actual result.
+- **Removed:** battery-dependent fsync bypass, its proc toggle and recurring 60-second polling worker.
+
 ### Cinnamon zRAM History Search (2026-10-26)
 
 - **Reduced compression work:** skip the repeated comparison against the newest history block after the quick-match check has already rejected it, in both ARM64 NEON and generic paths.
