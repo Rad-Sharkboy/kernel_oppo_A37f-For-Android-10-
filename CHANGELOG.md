@@ -2,6 +2,11 @@
 
 ## Development
 
+### Leaner MMC Request Path (2026-10-27)
+
+- **Removed:** optional MMC profiling counters, their request-path flag checks and per-host storage.
+- **Preserved:** eMMC/SD transfer modes, clocks, normal I/O statistics and storage clock scaling.
+
 ### Leaner ARM64 Debug Metadata (2026-10-27)
 
 - **Removed:** dynamic debug callsite tables and runtime flag checks from the A37f build.
