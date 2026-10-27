@@ -1005,7 +1005,8 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 
 	/* Use the tunable block size, ensuring it divides PAGE_SIZE */
 	block_size = cinnamon_block_size;
-	if (PAGE_SIZE % block_size != 0) {
+	if (block_size < MIN_BLOCK_SIZE || block_size > MAX_BLOCK_SIZE ||
+	    PAGE_SIZE % block_size != 0) {
 		block_size = 32;
 		if (PAGE_SIZE % block_size != 0)
 			block_size = 16;
@@ -1396,6 +1397,8 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			if (unlikely(consumed_bytes + 1 > src_len - sizeof(u64)))
 				return -EINVAL;
 			run = src_data[0];
+			if (unlikely(!run || run > blocks_per_page - i))
+				return -EINVAL;
 			src_data += 1;
 			consumed_bytes += 1;
 
@@ -1411,6 +1414,8 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			if (unlikely(consumed_bytes + 2 > src_len - sizeof(u64)))
 				return -EINVAL;
 			run = get_unaligned_le16(src_data);
+			if (unlikely(!run || run > blocks_per_page - i))
+				return -EINVAL;
 			src_data += 2;
 			consumed_bytes += 2;
 
@@ -1427,6 +1432,8 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 				return -EINVAL;
 			repeat_value = src_data[0];
 			run = src_data[1];
+			if (unlikely(!run || run > blocks_per_page - i))
+				return -EINVAL;
 			src_data += 2;
 			consumed_bytes += 2;
 
@@ -1457,6 +1464,7 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			offset = src_data[1];
 			value = src_data[2];
 			if (ref < 0 || ref >= 4) return -EINVAL;
+			if (unlikely(offset >= block_size)) return -EINVAL;
 			memcpy(current_dst, prev_blocks[ref], block_size);
 			current_dst[offset] = value;
 			src_data += 3;
@@ -1470,6 +1478,8 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			off2 = src_data[3];
 			val2 = src_data[4];
 			if (ref < 0 || ref >= 4) return -EINVAL;
+			if (unlikely(off1 >= block_size || off2 >= block_size))
+				return -EINVAL;
 			memcpy(current_dst, prev_blocks[ref], block_size);
 			current_dst[off1] = val1;
 			current_dst[off2] = val2;
@@ -1486,6 +1496,9 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			off3 = src_data[5];
 			val3 = src_data[6];
 			if (ref < 0 || ref >= 4) return -EINVAL;
+			if (unlikely(off1 >= block_size || off2 >= block_size ||
+				     off3 >= block_size))
+				return -EINVAL;
 			memcpy(current_dst, prev_blocks[ref], block_size);
 			current_dst[off1] = val1;
 			current_dst[off2] = val2;

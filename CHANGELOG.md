@@ -2,6 +2,11 @@
 
 ## Development
 
+### Cinnamon zRAM Bounds Validation (2026-10-27)
+
+- **Fixed:** reject decoded runs beyond the remaining page and delta offsets beyond the current block before writing.
+- **Fixed:** fall back to the default compression block size before division or history access when a tunable value is unsupported.
+
 ### E006: Interactive Scheduler Work Reduction (2026-10-27)
 
 - **Reduced task-switch work:** compile UTIL_EST bookkeeping and state only when the schedutil governor is enabled; the A37f interactive build no longer updates an unused estimate.
