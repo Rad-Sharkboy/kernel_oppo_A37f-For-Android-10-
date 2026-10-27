@@ -245,7 +245,7 @@ struct cfs_bandwidth { };
 struct cfs_rq {
 	struct load_weight load;
 	unsigned int nr_running, h_nr_running;
-#ifdef CONFIG_SCHED_HMP
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	unsigned int util_est;
 #endif
 

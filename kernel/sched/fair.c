@@ -1245,6 +1245,7 @@ unsigned int max_task_load(void)
 	return sched_ravg_window;
 }
 
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 /* Scale factor for sched_cpu_util() return value */
 #define SCHED_CAPACITY_SCALE 1024
 
@@ -1387,6 +1388,8 @@ static inline void util_est_dequeue(struct cfs_rq *cfs_rq,
 	cfs_rq->util_est -= min_t(unsigned int, cfs_rq->util_est,
 				  _task_util_est(p));
 }
+
+#endif
 
 /* Use this knob to turn on or off HMP-aware task placement logic */
 unsigned int __read_mostly sched_enable_hmp = 0;
@@ -3324,8 +3327,10 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	update_curr(cfs_rq);
 	enqueue_entity_load_avg(cfs_rq, se, flags & ENQUEUE_WAKEUP);
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	if (entity_is_task(se))
 		util_est_enqueue(cfs_rq, task_of(se));
+#endif
 	account_entity_enqueue(cfs_rq, se);
 	update_cfs_shares(cfs_rq);
 
@@ -3401,11 +3406,13 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	update_curr(cfs_rq);
 	dequeue_entity_load_avg(cfs_rq, se, flags & DEQUEUE_SLEEP);
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	if (entity_is_task(se)) {
 		util_est_dequeue(cfs_rq, task_of(se));
 		if (flags & DEQUEUE_SLEEP)
 			util_est_update(task_of(se));
 	}
+#endif
 
 	update_stats_dequeue(cfs_rq, se);
 	if (flags & DEQUEUE_SLEEP) {

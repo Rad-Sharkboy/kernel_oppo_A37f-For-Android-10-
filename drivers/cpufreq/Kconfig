@@ -194,6 +194,7 @@ config CPU_FREQ_GOV_INTERACTIVE
 
 config CPU_FREQ_GOV_SCHEDUTIL
 	tristate "'schedutil' cpufreq policy governor"
+	depends on SCHED_FREQ_INPUT
 	help
 	  'schedutil' - This driver adds a dynamic cpufreq policy governor
 	  based on scheduler utilization (UTIL_EST). The CPU frequency is

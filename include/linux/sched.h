@@ -1220,7 +1220,9 @@ struct task_struct {
 	struct sched_rt_entity rt;
 #ifdef CONFIG_SCHED_HMP
 	struct ravg ravg;
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	unsigned int util_est;
+#endif
 #endif
 #ifdef CONFIG_CGROUP_SCHED
 	struct task_group *sched_task_group;
@@ -1794,7 +1796,6 @@ extern int task_free_unregister(struct notifier_block *n);
 extern int sched_set_window(u64 window_start, unsigned int window_size);
 extern unsigned long sched_get_busy(int cpu);
 extern void sched_set_io_is_busy(int val);
-extern unsigned long sched_cpu_util(int cpu);
 #else
 static inline int sched_set_window(u64 window_start, unsigned int window_size)
 {
@@ -1804,11 +1805,16 @@ static inline unsigned long sched_get_busy(int cpu)
 {
 	return 0;
 }
+static inline void sched_set_io_is_busy(int val) {};
+#endif
+
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+extern unsigned long sched_cpu_util(int cpu);
+#else
 static inline unsigned long sched_cpu_util(int cpu)
 {
 	return 0;
 }
-static inline void sched_set_io_is_busy(int val) {};
 #endif
 
 /*

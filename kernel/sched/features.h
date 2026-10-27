@@ -71,6 +71,7 @@ SCHED_FEAT(NUMA,	false)
 SCHED_FEAT(NUMA_FORCE,	false)
 #endif
 
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 /*
  * UtilEst: Exponentially Weighted Moving Average (EWMA) of task utilization.
  * When a task goes to sleep, its utilization is stored in an EWMA that decays
@@ -78,3 +79,4 @@ SCHED_FEAT(NUMA_FORCE,	false)
  * periods (e.g., between user input events), reducing jank/lag.
  */
 SCHED_FEAT(UTIL_EST, true)
+#endif

@@ -3426,7 +3426,7 @@ static void __sched_fork(struct task_struct *p)
 
 	INIT_LIST_HEAD(&p->se.group_node);
 
-#ifdef CONFIG_SCHED_HMP
+#if IS_ENABLED(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	p->util_est = 0;
 #endif
 

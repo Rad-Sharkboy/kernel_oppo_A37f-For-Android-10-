@@ -2,6 +2,11 @@
 
 ## Development
 
+### E006: Interactive Scheduler Work Reduction (2026-10-27)
+
+- **Reduced task-switch work:** compile UTIL_EST bookkeeping and state only when the schedutil governor is enabled; the A37f interactive build no longer updates an unused estimate.
+- **Preserved:** HMP load tracking, interactive decisions and optional built-in/module schedutil support.
+
 ### Leaner MMC Request Path (2026-10-27)
 
 - **Removed:** optional MMC profiling counters, their request-path flag checks and per-host storage.
