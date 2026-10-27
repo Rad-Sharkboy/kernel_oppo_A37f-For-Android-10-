@@ -2,6 +2,11 @@
 
 ## Development
 
+### Bounded zRAM Run History (2026-10-27)
+
+- **Reduced compression work:** update at most four history slots for zero/repeated-byte runs, then advance the ring index directly.
+- **Preserved:** compressed bytes and final history state in generic and ARM64 NEON paths.
+
 ### Restore Filesystem Sync Semantics (2026-10-27)
 
 - **Fixed:** always complete the filesystem's requested fsync/fdatasync operation and return its actual result.

@@ -736,11 +736,12 @@ static int cinnamon_compress_neon_batched(const unsigned char *src, unsigned cha
 
 			local_zero += run;
 
-			for (p = 0; p < run; p++) {
+			for (p = 0; p < run && p < 4; p++) {
 				memset(ctx->prev_blocks[ctx->prev_index], 0, block_size);
 				ctx->prev_sig[ctx->prev_index] = 0;
 				ctx->prev_index = (ctx->prev_index + 1) % 4;
 			}
+			ctx->prev_index = (ctx->prev_index + run - p) & 3;
 
 			ctx->pred_stride = 0;   /* run breaks stride pattern */
 			i += run;
@@ -770,11 +771,12 @@ static int cinnamon_compress_neon_batched(const unsigned char *src, unsigned cha
 			out_len += 2;
 
 			repeat_sig = neon_compute_block_signature_batched(current_src, block_size);
-			for (p = 0; p < run; p++) {
+			for (p = 0; p < run && p < 4; p++) {
 				memset(ctx->prev_blocks[ctx->prev_index], repeat_value, block_size);
 				ctx->prev_sig[ctx->prev_index] = repeat_sig;
 				ctx->prev_index = (ctx->prev_index + 1) % 4;
 			}
+			ctx->prev_index = (ctx->prev_index + run - p) & 3;
 
 			ctx->pred_stride = 0;   /* run breaks stride pattern */
 			i += run;
@@ -1097,11 +1099,12 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 
 			local_zero += run;
 
-			for (p = 0; p < run; p++) {
+			for (p = 0; p < run && p < 4; p++) {
 				memset(ctx->prev_blocks[ctx->prev_index], 0, block_size);
 				ctx->prev_sig[ctx->prev_index] = 0;
 				ctx->prev_index = (ctx->prev_index + 1) % 4;
 			}
+			ctx->prev_index = (ctx->prev_index + run - p) & 3;
 
 			ctx->pred_stride = 0;
 			i += run;
@@ -1131,11 +1134,12 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 			out_len += 2;
 
 			repeat_sig = compute_block_signature(current_src, block_size);
-			for (p = 0; p < run; p++) {
+			for (p = 0; p < run && p < 4; p++) {
 				memset(ctx->prev_blocks[ctx->prev_index], repeat_value, block_size);
 				ctx->prev_sig[ctx->prev_index] = repeat_sig;
 				ctx->prev_index = (ctx->prev_index + 1) % 4;
 			}
+			ctx->prev_index = (ctx->prev_index + run - p) & 3;
 
 			ctx->pred_stride = 0;
 			i += run;
