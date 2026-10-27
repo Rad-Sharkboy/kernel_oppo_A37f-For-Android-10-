@@ -2,6 +2,11 @@
 
 ## Development
 
+### Leaner ARM64 Debug Metadata (2026-10-27)
+
+- **Removed:** dynamic debug callsite tables and runtime flag checks from the A37f build.
+- **Preserved:** regular printk/error logging, debugfs, tracing and Qualcomm crash-log symbols.
+
 ### Bounded zRAM Run History (2026-10-27)
 
 - **Reduced compression work:** update at most four history slots for zero/repeated-byte runs, then advance the ring index directly.
