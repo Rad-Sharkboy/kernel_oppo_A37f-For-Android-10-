@@ -2,6 +2,10 @@
 
 ## Development
 
+### E011: 533 MHz Corner Mapping (2026-11-09)
+
+- Match the rounded clock to corner 3; retain all operating frequencies.
+
 ### E010: Active CPU Floors (2026-11-08)
 
 - Allow one lower 12.5 mV step at 533/800/998 MHz while retaining CPR headroom.
