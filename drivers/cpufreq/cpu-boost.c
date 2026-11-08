@@ -201,13 +201,30 @@ static void do_boost_rem(struct work_struct *work)
 
 static void update_policy_online(void)
 {
+	struct cpufreq_policy *policy;
+	cpumask_t updated_cpus, policy_cpus;
 	unsigned int i;
 
-	/* Re-evaluate policy to trigger adjust notifier for online CPUs */
+	/* Re-evaluate each shared policy once to trigger its adjust notifier. */
 	get_online_cpus();
+	cpumask_clear(&updated_cpus);
 	for_each_online_cpu(i) {
+		if (cpumask_test_cpu(i, &updated_cpus))
+			continue;
+
+		cpumask_clear(&policy_cpus);
+		policy = cpufreq_cpu_get(i);
+		if (policy) {
+			down_read(&policy->rwsem);
+			cpumask_copy(&policy_cpus, policy->cpus);
+			up_read(&policy->rwsem);
+			/* Release cpufreq_rwsem before update reacquires it. */
+			cpufreq_cpu_put(policy);
+		}
+
 		pr_debug("Updating policy for CPU%d\n", i);
-		cpufreq_update_policy(i);
+		if (!cpufreq_update_policy(i))
+			cpumask_or(&updated_cpus, &updated_cpus, &policy_cpus);
 	}
 	put_online_cpus();
 }

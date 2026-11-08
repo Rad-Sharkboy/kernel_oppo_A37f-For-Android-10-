@@ -2,6 +2,10 @@
 
 ## Development
 
+### E007: CPU Input Boost Policy Updates (2026-11-08)
+
+- **Fixed:** Avoid duplicate shared-policy reevaluations; retain retries after failures and existing boost timing.
+
 ### Cinnamon zRAM Bounds Validation (2026-10-27)
 
 - **Fixed:** reject decoded runs beyond the remaining page and delta offsets beyond the current block before writing.
