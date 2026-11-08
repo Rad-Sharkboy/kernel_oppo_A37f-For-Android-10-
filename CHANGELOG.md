@@ -2,6 +2,10 @@
 
 ## Development
 
+### E010: Active CPU Floors (2026-11-08)
+
+- Allow one lower 12.5 mV step at 533/800/998 MHz while retaining CPR headroom.
+
 ### E010: CPR Corner Tests (2026-11-08)
 
 - Expose cached corner voltages and reversible target trims; default trim zero.
