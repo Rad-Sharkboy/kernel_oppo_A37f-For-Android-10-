@@ -2,6 +2,10 @@
 
 ## Development
 
+### E008: I/O Prediction (2026-11-08)
+
+- Handle reverse access and reject out-of-range predictions.
+
 ### E008: Per-device I/O Pressure (2026-11-08)
 
 - Prevent SD and eMMC queues from changing each other's policy; retain the legacy export.

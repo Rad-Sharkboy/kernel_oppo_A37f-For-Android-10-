@@ -258,100 +258,74 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 	cinnamon_update_ra(cd);
 }
 
-/* Update read history with confidence-based prediction */
+static int cinnamon_predict_history(sector_t *history, int index,
+				    int count, sector_t *prediction)
+{
+	s64 average = 0, minimum = 0, maximum = 0;
+	int i, consistent = 0, total = 0;
+	int latest = (index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+	sector_t position = history[latest];
+
+	*prediction = 0;
+	if (count < 3)
+		return 0;
+	for (i = 1; i < min(5, count); i++) {
+		int cur = (index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+		int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
+		sector_t distance;
+		s64 delta;
+
+		distance = history[cur] >= history[prev] ?
+			history[cur] - history[prev] : history[prev] - history[cur];
+		if (distance >= 1048576)
+			return 0;
+		delta = history[cur] >= history[prev] ? (s64)distance : -(s64)distance;
+		if (i == 1) {
+			minimum = maximum = average = delta;
+		} else {
+			minimum = min(minimum, delta);
+			maximum = max(maximum, delta);
+			average = div_s64(average * (i - 1) + delta, i);
+		}
+		total++;
+		if (abs(delta - average) < 1024)
+			consistent++;
+	}
+	if (consistent * 100 / total < 80 || maximum - minimum >= 2048 ||
+	    !average || abs(average) >= 1048576)
+		return 0;
+	if (average < 0) {
+		if (position < -average)
+			return 0;
+		*prediction = position - (sector_t)-average;
+		return -1;
+	}
+	if (position > (sector_t)-1 - average)
+		return 0;
+	*prediction = position + average;
+	return 1;
+}
+
 static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sector)
 {
 	cd->read_history[cd->history_index] = sector;
 	cd->history_index = (cd->history_index + 1) % CINNAMON_HISTORY_SIZE;
 	if (cd->history_count < CINNAMON_HISTORY_SIZE)
 		cd->history_count++;
-
-	if (cd->history_count >= 3) {
-		int i, consistent = 0, total_diffs = 0;
-		sector_t avg_diff = 0, min_diff = 0, max_diff = 0;
-		int idx = (cd->history_index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-		int confidence;
-
-		for (i = 1; i < min(5, cd->history_count); i++) {
-			int cur = (cd->history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-			int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-			sector_t diff = cd->read_history[cur] - cd->read_history[prev];
-
-			if (i == 1) {
-				min_diff = max_diff = diff;
-				avg_diff = diff;
-			} else {
-				min_diff = min(min_diff, diff);
-				max_diff = max(max_diff, diff);
-				avg_diff = (avg_diff * (i-1) + diff) / i;
-			}
-			total_diffs++;
-			if (abs(diff - avg_diff) < 1024)
-				consistent++;
-		}
-
-		confidence = consistent * 100 / total_diffs;
-		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 &&
-		    avg_diff != 0 && abs(avg_diff) < 1048576) {
-			cd->predicted_sector = cd->read_history[idx] + avg_diff;
-			cd->last_read_direction = avg_diff > 0 ? 1 : -1;
-		} else {
-			cd->predicted_sector = 0;
-			cd->last_read_direction = 0;
-		}
-	} else {
-		cd->predicted_sector = 0;
-		cd->last_read_direction = 0;
-	}
+	cd->last_read_direction = cinnamon_predict_history(cd->read_history,
+		cd->history_index, cd->history_count, &cd->predicted_sector);
 }
 
-/* Update write history similarly */
 static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sector)
 {
 	cd->write_history[cd->write_history_index] = sector;
 	cd->write_history_index = (cd->write_history_index + 1) % CINNAMON_HISTORY_SIZE;
 	if (cd->write_history_count < CINNAMON_HISTORY_SIZE)
 		cd->write_history_count++;
+	cd->last_write_direction = cinnamon_predict_history(cd->write_history,
+		cd->write_history_index, cd->write_history_count,
+		&cd->predicted_write_sector);
 
-	if (cd->write_history_count >= 3) {
-		int i, consistent = 0, total_diffs = 0;
-		sector_t avg_diff = 0, min_diff = 0, max_diff = 0;
-		int idx = (cd->write_history_index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-		int confidence;
-
-		for (i = 1; i < min(5, cd->write_history_count); i++) {
-			int cur = (cd->write_history_index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-			int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
-			sector_t diff = cd->write_history[cur] - cd->write_history[prev];
-
-			if (i == 1) {
-				min_diff = max_diff = diff;
-				avg_diff = diff;
-			} else {
-				min_diff = min(min_diff, diff);
-				max_diff = max(max_diff, diff);
-				avg_diff = (avg_diff * (i-1) + diff) / i;
-			}
-			total_diffs++;
-			if (abs(diff - avg_diff) < 1024)
-				consistent++;
-		}
-
-		confidence = consistent * 100 / total_diffs;
-		if (confidence >= 80 && abs(max_diff - min_diff) < 2048 &&
-		    avg_diff != 0 && abs(avg_diff) < 1048576) {
-			cd->predicted_write_sector = cd->write_history[idx] + avg_diff;
-			cd->last_write_direction = avg_diff > 0 ? 1 : -1;
-		} else {
-			cd->predicted_write_sector = 0;
-			cd->last_write_direction = 0;
-		}
-	} else {
-		cd->predicted_write_sector = 0;
-		cd->last_write_direction = 0;
-	}
-
-	/* Sequential write detection for eMMC boost */
 	if (cd->last_write_direction != 0 && cd->last_write_sector != 0) {
 		if (sector == cd->last_write_sector + 1)
 			cd->seq_write_count++;
