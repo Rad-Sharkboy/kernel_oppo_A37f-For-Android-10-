@@ -2003,19 +2003,25 @@ static int calculate_soc_from_voltage(struct qpnp_bms_chip *chip)
 		pr_debug("instant-voltage based voltage-soc\n");
 	}
 
+	if (vbat_uv <= 0)
+		return -EINVAL;
+
 	voltage_range_uv = chip->dt.cfg_max_voltage_uv -
 					chip->dt.cfg_v_cutoff_uv;
+	if (voltage_range_uv <= 0)
+		return -EINVAL;
+
 	voltage_remaining_uv = vbat_uv - chip->dt.cfg_v_cutoff_uv;
 	voltage_based_soc = voltage_remaining_uv * 100 / voltage_range_uv;
 
 	voltage_based_soc = clamp(voltage_based_soc, 0, 100);
 
-	if (chip->prev_voltage_based_soc != voltage_based_soc
-				&& chip->bms_psy_registered) {
-		pr_debug("update bms_psy\n");
-		power_supply_changed(&chip->bms_psy);
+	if (chip->prev_voltage_based_soc != voltage_based_soc) {
+		/* Publish the cache before notifying capacity readers. */
+		chip->prev_voltage_based_soc = voltage_based_soc;
+		if (chip->bms_psy_registered)
+			power_supply_changed(&chip->bms_psy);
 	}
-	chip->prev_voltage_based_soc = voltage_based_soc;
 
 	pr_debug("vbat used = %duv\n", vbat_uv);
 	pr_debug("Calculated voltage based soc=%d\n", voltage_based_soc);
@@ -2214,7 +2220,14 @@ static void voltage_soc_timeout_work(struct work_struct *work)
 	mutex_lock(&chip->bms_device_mutex);
 	if (!chip->bms_dev_open) {
 		pr_warn("BMS device not opened, using voltage based SOC\n");
+
+		mutex_lock(&chip->last_soc_mutex);
+		calculate_soc_from_voltage(chip);
 		chip->dt.cfg_use_voltage_soc = true;
+		mutex_unlock(&chip->last_soc_mutex);
+
+		/* The original monitor may already have stopped at catch-up. */
+		mod_delayed_work(system_wq, &chip->monitor_soc_work, 0);
 	}
 	mutex_unlock(&chip->bms_device_mutex);
 }
@@ -2304,7 +2317,10 @@ static int qpnp_vm_bms_power_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CAPACITY:
-		val->intval = get_prop_bms_capacity(chip);
+		value = get_prop_bms_capacity(chip);
+		if (value < 0)
+			return value;
+		val->intval = value;
 		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = chip->battery_status;
@@ -3270,6 +3286,7 @@ static void bms_init_defaults(struct qpnp_bms_chip *chip)
 	chip->battery_present = -EINVAL;
 	chip->calculated_soc = -EINVAL;
 	chip->last_soc = -EINVAL;
+	chip->prev_voltage_based_soc = -EAGAIN;
 	chip->vbms_lv_wake_source.disabled = 1;
 	chip->vbms_cv_wake_source.disabled = 1;
 	chip->vbms_soc_wake_source.disabled = 1;
@@ -4137,6 +4154,8 @@ static int qpnp_vm_bms_remove(struct spmi_device *spmi)
 {
 	struct qpnp_bms_chip *chip = dev_get_drvdata(&spmi->dev);
 
+	/* Stop the fallback producer before draining its monitor work. */
+	cancel_delayed_work_sync(&chip->voltage_soc_timeout_work);
 	cancel_delayed_work_sync(&chip->monitor_soc_work);
 	debugfs_remove_recursive(chip->debug_root);
 	device_destroy(chip->bms_class, chip->dev_no);

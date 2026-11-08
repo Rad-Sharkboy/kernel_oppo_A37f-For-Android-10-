@@ -2,6 +2,10 @@
 
 ## Development
 
+### E007: VM-BMS Fallback Monitoring (2026-11-08)
+
+- **Fixed:** Publish valid SOC before notification, propagate unavailable capacity, restart a stopped monitor after daemon timeout and cancel the timeout before removal.
+
 ### E007: GPU Resume Limits (2026-11-08)
 
 - **Fixed:** Apply the active frequency floor and thermal maximum before resume targeting, with maximum-limit rounding preserved.
