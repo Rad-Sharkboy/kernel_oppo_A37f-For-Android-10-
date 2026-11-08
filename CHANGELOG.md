@@ -2,6 +2,10 @@
 
 ## Development
 
+### E012: 1209 MHz Target (2026-11-09)
+
+- Retain the extra26-count live trial accepted by the user; counts are not millivolts.
+
 ### E012: Low CPU Step (2026-11-09)
 
 - Trial 200/400 MHz at 1.025 V; retain higher-corner limits and CPR.
