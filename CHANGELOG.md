@@ -2,6 +2,10 @@
 
 ## Development
 
+### E010: CPR Corner Tests (2026-11-08)
+
+- Expose cached corner voltages and reversible target trims; default trim zero.
+
 ### E009: Low CPU Voltage (2026-11-08)
 
 - Test 1.0375 V at 200/400 MHz; retain higher corners, clocks and CPR.

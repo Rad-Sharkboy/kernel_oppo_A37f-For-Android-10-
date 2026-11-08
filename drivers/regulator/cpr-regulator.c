@@ -286,6 +286,9 @@ struct cpr_regulator {
 	int		*corner_map;
 	u32		num_corners;
 	int		*quot_adjust;
+#ifdef CONFIG_DEBUG_FS
+	int		*test_quot_trim;
+#endif
 
 	bool		is_cpr_suspended;
 };
@@ -3920,6 +3923,122 @@ static const struct file_operations cpr_debug_info_fops = {
 	.read = cpr_debug_info_read,
 };
 
+static int cpr_set_quotient_trim(struct cpr_regulator *cpr_vreg,
+			       unsigned int corner, unsigned int trim)
+{
+	int fuse_corner, delta, rc = 0;
+	s64 target;
+	bool active;
+
+	if (corner < CPR_CORNER_MIN || corner > cpr_vreg->num_corners)
+		return -EINVAL;
+	mutex_lock(&cpr_vreg->cpr_mutex);
+	fuse_corner = cpr_vreg->corner_map[corner];
+	if (!cpr_vreg->test_quot_trim || !cpr_is_allowed(cpr_vreg)) {
+		rc = -EOPNOTSUPP;
+		goto out;
+	}
+	if (trim > 26 || trim > cpr_vreg->step_quotient[fuse_corner]) {
+		rc = -ERANGE;
+		goto out;
+	}
+	delta = (int)trim - cpr_vreg->test_quot_trim[corner];
+	target = (s64)cpr_vreg->cpr_fuse_target_quot[fuse_corner] -
+		cpr_vreg->quot_adjust[corner] - delta;
+	if (target <= 0 || target >= (1U << RBCPR_GCNT_TARGET_GCNT_SHIFT)) {
+		rc = -ERANGE;
+		goto out;
+	}
+	if (!delta)
+		goto out;
+	active = cpr_vreg->corner == corner && cpr_vreg->vreg_enabled &&
+		!cpr_vreg->is_cpr_suspended;
+	if (active) {
+		cpr_corner_save(cpr_vreg, corner);
+		cpr_ctl_disable(cpr_vreg);
+	}
+	cpr_vreg->quot_adjust[corner] += delta;
+	cpr_vreg->test_quot_trim[corner] = trim;
+	if (active) {
+		cpr_corner_restore(cpr_vreg, corner);
+		cpr_ctl_enable(cpr_vreg, corner);
+	}
+out:
+	mutex_unlock(&cpr_vreg->cpr_mutex);
+	return rc;
+}
+
+static ssize_t cpr_quotient_trim_write(struct file *file,
+		const char __user *buffer, size_t count, loff_t *ppos)
+{
+	struct cpr_regulator *cpr_vreg = file->private_data;
+	char command[40], *cursor, *token;
+	unsigned int corner, trim;
+	int rc;
+
+	if (!count || count >= sizeof(command))
+		return -EINVAL;
+	if (copy_from_user(command, buffer, count))
+		return -EFAULT;
+	if (memchr(command, '\0', count))
+		return -EINVAL;
+	command[count] = '\0';
+	cursor = strim(command);
+	token = strsep(&cursor, " \t");
+	if (!cursor || kstrtouint(token, 10, &corner) ||
+	    kstrtouint(strim(cursor), 10, &trim))
+		return -EINVAL;
+	rc = cpr_set_quotient_trim(cpr_vreg, corner, trim);
+	return rc ? rc : count;
+}
+
+static ssize_t cpr_corners_read(struct file *file, char __user *buffer,
+			      size_t count, loff_t *ppos)
+{
+	struct cpr_regulator *cpr_vreg = file->private_data;
+	char *text;
+	size_t length = 0;
+	ssize_t ret;
+	unsigned int corner;
+	int fuse, target;
+
+	text = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!text)
+		return -ENOMEM;
+	mutex_lock(&cpr_vreg->cpr_mutex);
+	length += scnprintf(text + length, PAGE_SIZE - length,
+		"active=%d enabled=%d\ncorner fuse floor_uV ceiling_uV initial_uV last_uV target trim_counts\n",
+		cpr_vreg->corner, cpr_is_allowed(cpr_vreg));
+	for (corner = CPR_CORNER_MIN;
+	     corner <= cpr_vreg->num_corners && length < PAGE_SIZE; corner++) {
+		fuse = cpr_vreg->corner_map[corner];
+		target = cpr_vreg->cpr_fuse_target_quot[fuse] -
+			cpr_vreg->quot_adjust[corner];
+		length += scnprintf(text + length, PAGE_SIZE - length,
+			"%u %d %d %d %d %d %d %d\n", corner, fuse,
+			cpr_vreg->floor_volt[corner], cpr_vreg->ceiling_volt[corner],
+			cpr_vreg->open_loop_volt[corner], cpr_vreg->last_volt[corner],
+			target, cpr_vreg->test_quot_trim ?
+			cpr_vreg->test_quot_trim[corner] : 0);
+	}
+	mutex_unlock(&cpr_vreg->cpr_mutex);
+	ret = simple_read_from_buffer(buffer, count, ppos, text, length);
+	kfree(text);
+	return ret;
+}
+
+static const struct file_operations cpr_corners_fops = {
+	.owner = THIS_MODULE,
+	.open = cpr_debug_info_open,
+	.read = cpr_corners_read,
+};
+
+static const struct file_operations cpr_quotient_trim_fops = {
+	.owner = THIS_MODULE,
+	.open = cpr_debug_info_open,
+	.write = cpr_quotient_trim_write,
+};
+
 static void cpr_debugfs_init(struct cpr_regulator *cpr_vreg)
 {
 	struct dentry *temp;
@@ -3949,6 +4068,17 @@ static void cpr_debugfs_init(struct cpr_regulator *cpr_vreg)
 		cpr_err(cpr_vreg, "cpr_enable node creation failed\n");
 		return;
 	}
+	temp = debugfs_create_file("corners", S_IRUGO, cpr_vreg->debugfs,
+			cpr_vreg, &cpr_corners_fops);
+	if (IS_ERR_OR_NULL(temp))
+		return;
+	cpr_vreg->test_quot_trim = devm_kzalloc(cpr_vreg->rdev->dev.parent,
+		(cpr_vreg->num_corners + 1) * sizeof(*cpr_vreg->test_quot_trim),
+		GFP_KERNEL);
+	if (!cpr_vreg->test_quot_trim)
+		return;
+	debugfs_create_file("quotient_trim", S_IWUSR, cpr_vreg->debugfs,
+			cpr_vreg, &cpr_quotient_trim_fops);
 }
 
 static void cpr_debugfs_remove(struct cpr_regulator *cpr_vreg)
