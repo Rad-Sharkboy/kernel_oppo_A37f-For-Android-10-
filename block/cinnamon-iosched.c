@@ -472,11 +472,8 @@ static void cinnamon_add_request(struct request_queue *q, struct request *rq)
 
 	set_req_time_and_prio(rq, ktime_to_ns(ktime_get()), prio);
 
-	/* Sync requests go to head for faster service */
-	if (rq->cmd_flags & REQ_SYNC)
-		list_add(&rq->queuelist, &cd->queues[prio]);
-	else
-		list_add_tail(&rq->queuelist, &cd->queues[prio]);
+	/* Preserve arrival order within each priority tier. */
+	list_add_tail(&rq->queuelist, &cd->queues[prio]);
 
 	cd->queue_counts[prio]++;
 }

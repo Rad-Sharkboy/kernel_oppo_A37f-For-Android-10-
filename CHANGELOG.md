@@ -2,6 +2,10 @@
 
 ## Development
 
+### E007: FIFO Within I/O Priority Tiers (2026-11-08)
+
+- **Fixed:** Serve older requests first within each existing priority tier, including synchronous writes.
+
 ### E007: CPU Input Boost Policy Updates (2026-11-08)
 
 - **Fixed:** Avoid duplicate shared-policy reevaluations; retain retries after failures and existing boost timing.
