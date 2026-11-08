@@ -2,6 +2,10 @@
 
 ## Development
 
+### E012: Scheduler Bookkeeping (2026-11-09)
+
+- Disable unused detailed scheduler statistics; retain profiling and UID CPU accounting.
+
 ### E012: Bounded Target Trials (2026-11-09)
 
 - Allow up to two quotient steps (52 counts max); retain target/floor/ceiling checks and zero default.
