@@ -2,6 +2,10 @@
 
 ## Development
 
+### E008: Trace RAM (2026-11-08)
+
+- Default to 128 KiB per CPU; retain runtime resizing and trace events.
+
 ### E008: SMEM Logging (2026-11-08)
 
 - Skip routine AP log writes by default; keep runtime opt-in and modem transport.
