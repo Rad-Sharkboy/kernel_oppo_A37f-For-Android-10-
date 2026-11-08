@@ -2,6 +2,10 @@
 
 ## Development
 
+### E007: GPU Resume Limits (2026-11-08)
+
+- **Fixed:** Apply the active frequency floor and thermal maximum before resume targeting, with maximum-limit rounding preserved.
+
 ### E007: Read Batch Accounting (2026-11-08)
 
 - **Fixed:** Count foreground/background reads once in common dispatch so the configured read batch is honored; preserve critical dispatch behavior.

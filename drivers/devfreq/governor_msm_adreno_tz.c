@@ -343,10 +343,18 @@ static int tz_resume(struct devfreq *devfreq)
 {
 	struct devfreq_dev_profile *profile = devfreq->profile;
 	unsigned long freq;
+	u32 flags = 0;
 
 	freq = profile->initial_freq;
+	/* Resume bypasses update_devfreq, so apply its limits here too. */
+	if (devfreq->min_freq && freq < devfreq->min_freq)
+		freq = devfreq->min_freq;
+	if (devfreq->max_freq && freq > devfreq->max_freq) {
+		freq = devfreq->max_freq;
+		flags |= DEVFREQ_FLAG_LEAST_UPPER_BOUND;
+	}
 
-	return profile->target(devfreq->dev.parent, &freq, 0);
+	return profile->target(devfreq->dev.parent, &freq, flags);
 }
 
 static int tz_suspend(struct devfreq *devfreq)
