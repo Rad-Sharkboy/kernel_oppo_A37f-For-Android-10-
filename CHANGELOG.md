@@ -2,6 +2,10 @@
 
 ## Development
 
+### E012: Low CPU Step (2026-11-09)
+
+- Trial 200/400 MHz at 1.025 V; retain higher-corner limits and CPR.
+
 ### E011: 800 MHz Balanced Target (2026-11-09)
 
 - Align delayed defaults with the 800 MHz trial; retain the full CPU range.
