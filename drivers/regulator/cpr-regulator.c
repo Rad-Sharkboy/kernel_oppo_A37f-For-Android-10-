@@ -3927,6 +3927,7 @@ static int cpr_set_quotient_trim(struct cpr_regulator *cpr_vreg,
 			       unsigned int corner, unsigned int trim)
 {
 	int fuse_corner, delta, rc = 0;
+	unsigned int limit;
 	s64 target;
 	bool active;
 
@@ -3938,7 +3939,8 @@ static int cpr_set_quotient_trim(struct cpr_regulator *cpr_vreg,
 		rc = -EOPNOTSUPP;
 		goto out;
 	}
-	if (trim > 26 || trim > cpr_vreg->step_quotient[fuse_corner]) {
+	limit = min_t(u32, cpr_vreg->step_quotient[fuse_corner], 26) * 2;
+	if (trim > limit) {
 		rc = -ERANGE;
 		goto out;
 	}

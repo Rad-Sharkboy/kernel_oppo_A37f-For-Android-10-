@@ -2,6 +2,10 @@
 
 ## Development
 
+### E012: Bounded Target Trials (2026-11-09)
+
+- Allow up to two quotient steps (52 counts max); retain target/floor/ceiling checks and zero default.
+
 ### E012: 1209 MHz Target (2026-11-09)
 
 - Retain the extra26-count live trial accepted by the user; counts are not millivolts.
