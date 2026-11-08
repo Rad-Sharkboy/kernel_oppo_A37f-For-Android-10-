@@ -2,6 +2,10 @@
 
 ## Development
 
+### E008: Per-device I/O Pressure (2026-11-08)
+
+- Prevent SD and eMMC queues from changing each other's policy; retain the legacy export.
+
 ### E008: Compression Work (2026-11-08)
 
 - Remove discarded clock reads from the compression fallback.

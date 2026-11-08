@@ -82,6 +82,7 @@ struct cinnamon_data {
 	atomic_t num_requests;
 
 	/* Pressure & read-ahead */
+	int pressure;
 	int last_ra_pressure;
 	unsigned long last_pressure_change_jiffies;
 	unsigned long last_manual_param_change_jiffies;
@@ -133,7 +134,7 @@ struct cinnamon_data {
 	sector_t last_write_sector;
 };
 
-/* Global pressure indicator */
+/* Legacy last-transition statistic; decisions are per queue. */
 atomic_t cinnamon_io_pressure = ATOMIC_INIT(0);
 EXPORT_SYMBOL(cinnamon_io_pressure);
 
@@ -190,7 +191,7 @@ static void cinnamon_clamp_for_emmc(struct cinnamon_data *cd)
 /* Update read-ahead based on global pressure with smoothing */
 static void cinnamon_update_ra(struct cinnamon_data *cd)
 {
-	int curr_press = atomic_read(&cinnamon_io_pressure);
+	int curr_press = cd->pressure;
 	if (curr_press != cd->last_ra_pressure) {
 		unsigned int ra_kb;
 		unsigned long target_ra_pages;
@@ -223,63 +224,38 @@ static void cinnamon_update_ra(struct cinnamon_data *cd)
 	}
 }
 
-/* Set global pressure with hysteresis and idle mode */
+/* Queue lock protects pressure and saved parameters. */
 static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 {
-	int old_pressure, curr_pressure;
-	int retries = 0;
+	int old_pressure = cd->pressure;
 
-	do {
-		curr_pressure = atomic_read(&cinnamon_io_pressure);
-		if (new_pressure == curr_pressure)
-			return;
-
-		/* Always allow dropping to idle (0) */
-		if (new_pressure == 0) {
-			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure,
-						       curr_pressure, 0);
-			if (old_pressure == curr_pressure) {
-				cd->last_pressure_change_jiffies = jiffies;
-
-				/* Entering idle: save and halve parameters */
-				cd->saved_read_batch = cd->read_batch;
-				cd->saved_write_batch = cd->write_batch;
-				cd->saved_write_expire_ms = cd->write_expire_ms;
-				cd->read_batch = max(cd->read_batch / 2, 8);
-				cd->write_batch = max(cd->write_batch / 2, 8);
-				cd->write_expire_ms = min(cd->write_expire_ms + 100, 300);
-				cinnamon_clamp_for_emmc(cd);
-				cinnamon_update_ra(cd);
-			}
-			return;
-		}
-
-		/* Hysteresis check for non-idle transitions */
+	if (new_pressure == old_pressure)
+		return;
+	if (new_pressure) {
 		if (!time_after(jiffies, cd->last_pressure_change_jiffies +
 				msecs_to_jiffies(cd->hysteresis_ms)))
 			return;
-
-		/* Only allow increasing pressure or from 0 to non-zero */
-		if (curr_pressure == 0 || new_pressure > curr_pressure) {
-			old_pressure = atomic_cmpxchg(&cinnamon_io_pressure,
-						       curr_pressure, new_pressure);
-			if (old_pressure == curr_pressure) {
-				cd->last_pressure_change_jiffies = jiffies;
-
-				/* Leaving idle: restore saved */
-				if (curr_pressure == 0) {
-					cd->read_batch = cd->saved_read_batch;
-					cd->write_batch = cd->saved_write_batch;
-					cd->write_expire_ms = cd->saved_write_expire_ms;
-				}
-				cinnamon_clamp_for_emmc(cd);
-				cinnamon_update_ra(cd);
-				return;
-			}
-		} else {
+		if (old_pressure && new_pressure < old_pressure)
 			return;
-		}
-	} while (++retries < 10);
+	}
+
+	cd->pressure = new_pressure;
+	atomic_set(&cinnamon_io_pressure, new_pressure);
+	cd->last_pressure_change_jiffies = jiffies;
+	if (!new_pressure) {
+		cd->saved_read_batch = cd->read_batch;
+		cd->saved_write_batch = cd->write_batch;
+		cd->saved_write_expire_ms = cd->write_expire_ms;
+		cd->read_batch = max(cd->read_batch / 2, 8);
+		cd->write_batch = max(cd->write_batch / 2, 8);
+		cd->write_expire_ms = min(cd->write_expire_ms + 100, 300);
+	} else if (!old_pressure) {
+		cd->read_batch = cd->saved_read_batch;
+		cd->write_batch = cd->saved_write_batch;
+		cd->write_expire_ms = cd->saved_write_expire_ms;
+	}
+	cinnamon_clamp_for_emmc(cd);
+	cinnamon_update_ra(cd);
 }
 
 /* Update read history with confidence-based prediction */
@@ -573,7 +549,7 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	struct request *rq = NULL;
 	u64 now_ns = ktime_to_ns(ktime_get());
 	int target_pressure = 0;
-	int pressure = atomic_read(&cinnamon_io_pressure);
+	int pressure = cd->pressure;
 	unsigned long write_expire_ns = cd->write_expire_ms * 1000000ULL;
 	unsigned long read_batch = cd->read_batch;
 	int prio, i;
@@ -777,7 +753,7 @@ dispatch:
 		if (total_pending > cd->pressure_thres)
 			target_pressure = 3;
 
-		if (target_pressure != atomic_read(&cinnamon_io_pressure))
+		if (target_pressure != cd->pressure)
 			cinnamon_set_pressure(cd, target_pressure);
 
 		elv_dispatch_sort(q, rq);
@@ -844,6 +820,7 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	cd->fg_dispatch_count = 0;
 	atomic64_set(&cd->total_latency_ns, 0);
 	atomic_set(&cd->num_requests, 0);
+	cd->pressure = 0;
 	cd->last_ra_pressure = -1;
 	cd->last_pressure_change_jiffies = 0;
 	cd->last_manual_param_change_jiffies = jiffies;
@@ -911,7 +888,9 @@ static void cinnamon_exit_queue(struct elevator_queue *e)
 /* Sysfs attributes (unchanged except for adding fg_dispatch_count maybe) */
 static ssize_t cinnamon_pressure_show(struct elevator_queue *e, char *page)
 {
-	return sprintf(page, "%d\n", atomic_read(&cinnamon_io_pressure));
+	struct cinnamon_data *cd = e->elevator_data;
+
+	return sprintf(page, "%d\n", cd->pressure);
 }
 
 static ssize_t cinnamon_avg_latency_ns_show(struct elevator_queue *e, char *page)
