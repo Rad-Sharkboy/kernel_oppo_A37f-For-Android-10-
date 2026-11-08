@@ -2,6 +2,10 @@
 
 ## Development
 
+### E007: Battery SOC Error Handling (2026-11-08)
+
+- **Fixed:** Use BMS SOC consistently, stop unchanged charging SOC from rising, reject invalid voltage reads and bound RTC-assisted discharge at one percent.
+
 ### E007: VM-BMS Fallback Monitoring (2026-11-08)
 
 - **Fixed:** Publish valid SOC before notification, propagate unavailable capacity, restart a stopped monitor after daemon timeout and cancel the timeout before removal.

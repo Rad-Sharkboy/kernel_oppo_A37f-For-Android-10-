@@ -131,7 +131,12 @@ static bool opchg_soc_reduce_slowly_when_1(struct opchg_charger *chip)
 	if(opchg_get_prop_batt_present(chip) == false)
 		return 0;
 
-	batt_vol = opchg_get_prop_battery_voltage_now(chip)/1000;
+	batt_vol = opchg_get_prop_battery_voltage_now(chip);
+	if (batt_vol <= 0) {
+		reduce_count = 0;
+		return false;
+	}
+	batt_vol /= 1000;
 	if(batt_vol < 3410)
 		reduce_count++;
 	else
@@ -153,36 +158,31 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 	static char sync_down_limit = 0;
 	union power_supply_propval ret = {0, };
 	struct rtc_time	soc_update_rtc_time;
-	int rc = 0;
+	int rc = 0, vbat_uv;
+	bool low_voltage;
 
-	if(!chip->bms_psy){
-		return OPCHG_DEFAULT_BATT_CAPACITY;
-	} else if (chip->bms_psy) {
-		chip->bms_psy->get_property(chip->bms_psy,POWER_SUPPLY_PROP_CAPACITY, &ret);
-	}
+	if (!chip->bms_psy)
+		return chip->bat_volt_check_point;
+	rc = chip->bms_psy->get_property(chip->bms_psy,
+			POWER_SUPPLY_PROP_CAPACITY, &ret);
+	if (rc < 0 || ret.intval < 0 || ret.intval > 100)
+		return chip->bat_volt_check_point;
 	chip->soc_bms = ret.intval;
-	if (chip->soc_bms == 0 && chip->bat_instant_vol > 3500000
-			&& chip->bat_volt_check_point > 0)
-		chip->soc_bms = chip->bat_volt_check_point;
 
 	/************************************
 	*  bms soc is init
 	************************************/
 	if(is_pon_on == 0){
 		is_pon_on = 1;
-		if (chip->bat_instant_vol > 3500000) {
-			int volt_soc = (chip->bat_instant_vol - 3300000) / 9000;
-			if (volt_soc > 99) volt_soc = 99;
-			if (volt_soc > chip->soc_bms)
-				chip->soc_bms = volt_soc;
-			pr_err("soc: volt_est=%d%%, bms_raw=%d, vol=%d\n",
-			       volt_soc, ret.intval, chip->bat_instant_vol);
-		}
 		chip->bat_volt_check_point = chip->soc_bms;
 		pr_err("soc is %d after pon (bms_raw=%d, vol=%d)\n",
 		       chip->bat_volt_check_point, ret.intval, chip->bat_instant_vol);
 		return chip->bat_volt_check_point;
 	}
+
+	vbat_uv = opchg_get_prop_battery_voltage_now(chip);
+	low_voltage = vbat_uv > 0 && vbat_uv < 3300 * 1000 &&
+			opchg_get_prop_batt_present(chip) == true;
 
 	/************************************
 	*  charging full but soc is not 100%
@@ -208,8 +208,7 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 		return chip->bat_volt_check_point;
 	} else if((chip->chg_present) && (opchg_get_prop_batt_status(chip) == POWER_SUPPLY_STATUS_CHARGING) && (opchg_get_prop_batt_present(chip) == 1)){
 		sync_down_count = 0;
-		if (chip->soc_bms >= chip->bat_volt_check_point ||
-				chip->bat_instant_vol > 4100000) {
+		if (chip->soc_bms > chip->bat_volt_check_point) {
 			if (sync_up_count >= OPCHG_SOC_CHANGE_35S) {
 				sync_up_count = 0;
 				if (chip->bat_volt_check_point < 100)
@@ -217,21 +216,16 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 			} else {
 				sync_up_count++;
 			}
+		} else {
+			sync_up_count = 0;
 		}
 	} else {
 		sync_up_count = 0;
 		{
 			bool should_decrement = false;
-			if (chip->soc_bms == 0) {
-				int volt_soc = (chip->bat_instant_vol - 3300000) / 9000;
-				if (volt_soc < 0) volt_soc = 0;
-				if (volt_soc < chip->bat_volt_check_point)
-					should_decrement = true;
-			}
 			if (chip->soc_bms < chip->bat_volt_check_point)
 				should_decrement = true;
-			if ((opchg_get_prop_battery_voltage_now(chip) < 3300 * 1000) &&
-					(opchg_get_prop_batt_present(chip) == true))
+			if (low_voltage)
 				should_decrement = true;
 
 			if (should_decrement) {
@@ -239,10 +233,13 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 					rc = msmrtc_alarm_read_time(&soc_update_rtc_time);
 					if (rc < 0) {
 						pr_err("%s: failed to read soc update time\n", __func__);
+					} else {
+						rtc_tm_to_time(&soc_update_rtc_time, &chip->soc_update_time);
+						if (chip->bat_volt_check_point > 1 &&
+							chip->soc_update_time >= chip->soc_update_pre_time &&
+							(chip->soc_update_time - chip->soc_update_pre_time) >= EIGHT_MINUTES)
+							chip->bat_volt_check_point--;
 					}
-					rtc_tm_to_time(&soc_update_rtc_time, &chip->soc_update_time);
-					if((chip->soc_update_time - chip->soc_update_pre_time) >= EIGHT_MINUTES)
-						chip->bat_volt_check_point--;
 				}
 
 				if(chip->bat_volt_check_point == 100)
@@ -254,7 +251,7 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 				else
 					sync_down_limit = OPCHG_SOC_CHANGE_40S;
 
-				if((opchg_get_prop_battery_voltage_now(chip) < 3300 * 1000) && (opchg_get_prop_batt_present(chip) == true)){
+				if(low_voltage){
 					sync_down_limit = OPCHG_SOC_CHANGE_20S;
 				}
 
@@ -267,6 +264,8 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 					}
 					sync_down_count = 0;
 				}
+			} else {
+				sync_down_count = 0;
 			}
 		}
 	}
