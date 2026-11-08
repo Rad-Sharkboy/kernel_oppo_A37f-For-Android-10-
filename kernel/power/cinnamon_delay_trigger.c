@@ -369,7 +369,7 @@ set_prop:
 	msleep(10);
 	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
 	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "998400");
+	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "800000");
 	msleep(10);
 	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "30000");
 	msleep(10);
@@ -382,7 +382,7 @@ set_prop:
 	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration", "80000");
 	msleep(10);
 	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/target_loads",
-		"1 200000:25 400000:35 533333:45 800000:55 998400:60 1094400:65 1152000:70 1209600:80");
+		"1 200000:25 400000:35 533333:45 800000:65 998400:65 1094400:65 1152000:70 1209600:80");
 }
 
 static void cinnamon_try_bimc_oc(void)
@@ -505,13 +505,13 @@ static void cinnamon_execute_command_3(void)
 		/* Tune interactive governor for low-latency UI response */
 		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
 		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "998400");
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "800000");
 		msleep(10);
 		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "40000");
 		msleep(10);
 		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/timer_rate", "10000");
 		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/target_loads", "80");
+		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/target_loads", "1 200000:25 400000:35 533333:45 800000:65 998400:65 1094400:65 1152000:70 1209600:80");
 		msleep(10);
 		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay", "20000");
 		msleep(10);

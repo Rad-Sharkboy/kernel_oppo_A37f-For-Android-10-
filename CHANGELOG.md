@@ -2,6 +2,10 @@
 
 ## Development
 
+### E011: 800 MHz Balanced Target (2026-11-09)
+
+- Align delayed defaults with the 800 MHz trial; retain the full CPU range.
+
 ### E011: Upper CPU Targets (2026-11-09)
 
 - Retain the tested 1094/1152/1209 MHz target trims; preserve CPR voltage limits.
