@@ -32,9 +32,6 @@
 #include <crypto/cinnamon.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/ktime.h>
-#include <linux/timex.h>        /* for get_cycles() */
-#include <linux/sched.h>
 
 #ifdef CONFIG_ARM64
 #include <asm/neon.h>
@@ -989,8 +986,6 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 	int idx;
 	int local_zero, local_match, local_delta, local_raw, local_partial;
 	struct cinnamon_ctx *ctx = private;
-	u64 start_ns, end_ns, delta_ns;
-	cycles_t start_cycles, end_cycles, delta_cycles;
 #ifdef CONFIG_ARM64
 	bool use_neon_batch;
 	int ret;
@@ -1043,8 +1038,6 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 	ctx->prev_index = 0;
 	ctx->pred_stride = 0;   /* initialize stride prediction */
 
-	start_ns = sched_clock();
-	start_cycles = get_cycles();
 
 	i = 0;
 	while (i < blocks_per_page) {
@@ -1285,10 +1278,6 @@ set_mode:
 		i++;
 	}
 
-	end_ns = sched_clock();
-	end_cycles = get_cycles();
-	delta_ns = end_ns - start_ns;
-	delta_cycles = end_cycles - start_cycles;
 
 	/* Batch update statistics */
 	atomic_inc(&cinnamon_pages_compressed);
@@ -1311,10 +1300,6 @@ set_mode:
 	return 0;
 
 fallback_raw:
-	end_ns = sched_clock();
-	end_cycles = get_cycles();
-	delta_ns = end_ns - start_ns;
-	delta_cycles = end_cycles - start_cycles;
 
 	memcpy(dst, src, PAGE_SIZE);
 	*dst_len = PAGE_SIZE;

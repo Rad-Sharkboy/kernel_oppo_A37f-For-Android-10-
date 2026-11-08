@@ -2,6 +2,10 @@
 
 ## Development
 
+### E008: Compression Work (2026-11-08)
+
+- Remove discarded clock reads from the compression fallback.
+
 ### E008: Trace RAM (2026-11-08)
 
 - Default to 128 KiB per CPU; retain runtime resizing and trace events.
