@@ -2,6 +2,10 @@
 
 ## Development
 
+### E009: Low CPU Voltage (2026-11-08)
+
+- Test 1.0375 V at 200/400 MHz; retain higher corners, clocks and CPR.
+
 ### E008: GPU Limit Rounding (2026-11-08)
 
 - Round non-table ceilings downward while retaining thermal and wake handling.

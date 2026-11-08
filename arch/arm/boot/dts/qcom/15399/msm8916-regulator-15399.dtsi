@@ -15,6 +15,8 @@
 
 &soc {
 	regulator@b018000 {
+		qcom,cpr-voltage-ceiling = <1037500 1150000 1350000>;
+		qcom,cpr-voltage-floor = <1037500 1050000 1162500>;
 	    regulator-max-microvolt = <8>;
 		vdd-apc-optional-prim-supply = <&ncp6335d_regulator>;
 		qcom,cpr-step-quotient = <26>;
@@ -38,3 +40,7 @@
 	};
 };
 
+
+&pm8916_s2 {
+	regulator-min-microvolt = <1037500>;
+};
