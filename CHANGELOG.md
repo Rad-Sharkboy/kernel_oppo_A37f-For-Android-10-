@@ -2,6 +2,10 @@
 
 ## Development
 
+### E007: Read Batch Accounting (2026-11-08)
+
+- **Fixed:** Count foreground/background reads once in common dispatch so the configured read batch is honored; preserve critical dispatch behavior.
+
 ### E007: FIFO Within I/O Priority Tiers (2026-11-08)
 
 - **Fixed:** Serve older requests first within each existing priority tier, including synchronous writes.

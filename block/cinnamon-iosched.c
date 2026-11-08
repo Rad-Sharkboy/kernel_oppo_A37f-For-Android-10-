@@ -682,7 +682,6 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 			rq = list_first_entry(&cd->queues[PRIO_READ_FG],
 					      struct request, queuelist);
 			target_pressure = 1;
-			cd->read_batch_count++;
 			cd->fg_dispatch_count++;
 			goto dispatch;
 		}
@@ -702,7 +701,6 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 		rq = list_first_entry(&cd->queues[PRIO_READ_BG],
 				      struct request, queuelist);
 		target_pressure = 1;
-		cd->read_batch_count++;
 		cd->fg_dispatch_count = 0;  /* reset on background */
 		goto dispatch;
 	}
