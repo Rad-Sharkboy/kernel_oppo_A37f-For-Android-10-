@@ -2,6 +2,10 @@
 
 ## Development
 
+### E008: SMEM Snapshots (2026-11-08)
+
+- Free 320 KB of permanent debug RAM; retain independent partial-read snapshots.
+
 ### E007: Battery SOC Error Handling (2026-11-08)
 
 - **Fixed:** Use BMS SOC consistently, stop unchanged charging SOC from rising, reject invalid voltage reads and bound RTC-assisted discharge at one percent.

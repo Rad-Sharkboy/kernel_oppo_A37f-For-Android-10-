@@ -15,6 +15,8 @@
  */
 
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/mutex.h>
 #include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -893,25 +895,62 @@ static int debug_dump_sym(char *buf, int max, uint32_t cont)
 	return _debug_dump_sym(GEN, buf, max, cont);
 }
 
-static char debug_buffer[EVENTS_PRINT_SIZE];
+struct smem_debug_snapshot {
+	char *buffer;
+	int length;
+	struct mutex lock;
+	int (*fill)(char *, int, uint32_t);
+};
+
+static int debug_snapshot_open(struct inode *inode, struct file *file)
+{
+	struct smem_debug_snapshot *snapshot;
+
+	snapshot = kzalloc(sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot)
+		return -ENOMEM;
+	mutex_init(&snapshot->lock);
+	snapshot->fill = inode->i_private;
+	file->private_data = snapshot;
+	return 0;
+}
 
 static ssize_t debug_read(struct file *file, char __user *buf,
 			  size_t count, loff_t *ppos)
 {
-	int r;
-	int bsize = 0;
-	int (*fill)(char *, int, uint32_t) = file->private_data;
-	if (!(*ppos)) {
-		bsize = fill(debug_buffer, EVENTS_PRINT_SIZE, 0);
+	struct smem_debug_snapshot *snapshot = file->private_data;
+	ssize_t ret;
 
-		if (bsize < 0)
-			bsize = scnprintf(debug_buffer,
+	if (!count)
+		return 0;
+	if (mutex_lock_interruptible(&snapshot->lock))
+		return -ERESTARTSYS;
+	if (!snapshot->buffer) {
+		snapshot->buffer = vmalloc(EVENTS_PRINT_SIZE);
+		if (!snapshot->buffer) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		snapshot->length = snapshot->fill(snapshot->buffer,
+						EVENTS_PRINT_SIZE, 0);
+		if (snapshot->length < 0)
+			snapshot->length = scnprintf(snapshot->buffer,
 				EVENTS_PRINT_SIZE, "Log not available\n");
 	}
-	DBG("%s: count %zu ppos %d\n", __func__, count, (unsigned int)*ppos);
-	r =  simple_read_from_buffer(buf, count, ppos, debug_buffer,
-				     bsize);
-	return r;
+	ret = simple_read_from_buffer(buf, count, ppos, snapshot->buffer,
+				     snapshot->length);
+out:
+	mutex_unlock(&snapshot->lock);
+	return ret;
+}
+
+static int debug_snapshot_release(struct inode *inode, struct file *file)
+{
+	struct smem_debug_snapshot *snapshot = file->private_data;
+
+	vfree(snapshot->buffer);
+	kfree(snapshot);
+	return 0;
 }
 
 static ssize_t debug_read_cont(struct file *file, char __user *buf,
@@ -949,7 +988,8 @@ static int debug_open(struct inode *inode, struct file *file)
 
 static const struct file_operations debug_ops = {
 	.read = debug_read,
-	.open = debug_open,
+	.open = debug_snapshot_open,
+	.release = debug_snapshot_release,
 };
 
 static const struct file_operations debug_ops_cont = {
