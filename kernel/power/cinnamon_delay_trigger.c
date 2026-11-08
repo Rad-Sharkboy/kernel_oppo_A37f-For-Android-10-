@@ -189,83 +189,36 @@ static char *cinnamon_find_main_block(void)
 }
 
 /* Cinnamon_Active command functions */
-static void cinnamon_execute_command_1(void)
+static int cinnamon_setup_zram(void)
 {
-	pr_info("Cinnamon_Active: Executing Cinnamon_Active - Step 1\n");
-	
-	/* Step 1: Cleanup old zRAM and reset */
-	{
-		/* Check if zram0 exists before proceeding */
-		if (!cinnamon_file_exists("/sys/block/zram0/comp_algorithm")) {
-			pr_err("Cinnamon_Active: zram0 not available\n");
-			return;
-		}
-		
-		/* Minimal wait for system stabilization */
-		msleep(50);
-		
-		/* echo 1 > /sys/block/zram0/reset */
-		if (cinnamon_write_path("/sys/block/zram0/reset", "1") != 0) {
-			pr_err("Cinnamon_Active: Failed to reset zram0\n");
-		}
-		
-		/* Reduced wait - reset usually completes quickly */
-		msleep(100);
+	char size[32];
+	unsigned long long bytes;
+	char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
+	char *mkswap[] = {"/system/bin/mkswap", "/dev/block/zram0", NULL};
+	char *swapon[] = {"/system/bin/swapon", "/dev/block/zram0", "-p", "10", NULL};
+	int ret;
+
+	ret = cinnamon_read_path(size, sizeof(size), "/sys/block/zram0/disksize");
+	if (ret)
+		return ret;
+	ret = kstrtoull(strim(size), 10, &bytes);
+	if (ret)
+		return ret;
+	if (bytes) {
+		pr_info("Cinnamon_Active: zRAM already initialized; retaining it\n");
+		return 0;
 	}
-	pr_info("Cinnamon_Active: zRAM cleanup completed\n");
-}
 
-static void cinnamon_execute_command_2(void)
-{
-	pr_info("Cinnamon_Active: Executing Cinnamon_Active - Step 2\n");
-	
-	/* Step 2: Setup Cinnamon compression and disk size */
-	{
-		/* Check if zram0 exists before proceeding */
-		if (!cinnamon_file_exists("/sys/block/zram0/comp_algorithm")) {
-			pr_err("Cinnamon_Active: zram0 not available for setup\n");
-			return;
-		}
-		
-		/* Reduced wait - previous step already completed */
-		msleep(100);
-		
-		/* echo cinnamon > /sys/block/zram0/comp_algorithm */
-		if (cinnamon_write_path("/sys/block/zram0/comp_algorithm", "cinnamon") != 0) {
-			pr_err("Cinnamon_Active: Failed to set comp_algorithm\n");
-		}
-		
-		/* Minimal wait between sysfs operations */
-		msleep(50);
-		
-		/* echo 805306368 > /sys/block/zram0/disksize */
-		if (cinnamon_write_path("/sys/block/zram0/disksize", "805306368") != 0) {
-			pr_err("Cinnamon_Active: Failed to set disksize\n");
-		}
-
-		msleep(200);
-		{
-			char *argv[] = {"/system/bin/mkswap", "/dev/block/zram0", NULL};
-			char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
-			int ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-			if (ret != 0)
-				pr_err("Cinnamon_Active: mkswap failed with code %d\n", ret);
-			else
-				pr_info("Cinnamon_Active: mkswap completed successfully\n");
-		}
-
-		msleep(500);
-		{
-			char *argv[] = {"/system/bin/swapon", "/dev/block/zram0", "-p", "10", NULL};
-			char *envp[] = {"PATH=/system/bin:/system/xbin", NULL};
-			int ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-			if (ret != 0)
-				pr_err("Cinnamon_Active: swapon failed with code %d\n", ret);
-			else
-				pr_info("Cinnamon_Active: swapon completed successfully\n");
-		}
-	}
-	pr_info("Cinnamon_Active: zRAM compression and swap setup completed\n");
+	ret = cinnamon_write_path("/sys/block/zram0/comp_algorithm", "cinnamon");
+	if (ret)
+		return ret;
+	ret = cinnamon_write_path("/sys/block/zram0/disksize", "805306368");
+	if (ret)
+		return ret;
+	ret = call_usermodehelper(mkswap[0], mkswap, envp, UMH_WAIT_PROC);
+	if (ret)
+		return ret;
+	return call_usermodehelper(swapon[0], swapon, envp, UMH_WAIT_PROC);
 }
 
 static int cinnamon_apply_block_tuning(void)
@@ -554,11 +507,8 @@ static void cinnamon_delay_work_fn(struct work_struct *work)
 	
 	delay_pending = false;
 	
-	pr_info("Cinnamon_Active: Executing Step 1\n");
-	cinnamon_execute_command_1();
-	
-	pr_info("Cinnamon_Active: Executing Step 2\n");
-	cinnamon_execute_command_2();
+	if (cinnamon_setup_zram())
+		pr_err("Cinnamon_Active: zRAM setup failed\n");
 	
 	pr_info("Cinnamon_Active: Executing Step 3\n");
 	cinnamon_execute_command_3();

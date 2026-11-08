@@ -2,6 +2,10 @@
 
 ## Development
 
+### E012: zRAM Boot Ownership (2026-11-09)
+
+- Keep initialized swap intact; stop on setup errors and remove redundant sleeps after synchronous operations.
+
 ### E012: Scheduler Bookkeeping (2026-11-09)
 
 - Disable unused detailed scheduler statistics; retain profiling and UID CPU accounting.
