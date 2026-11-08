@@ -1043,7 +1043,6 @@ static int smem_log_initialize(void)
 		return ret;
 	}
 
-	smem_log_enable = 1;
 	smem_log_initialized = 1;
 	smem_log_debugfs_init();
 	return ret;

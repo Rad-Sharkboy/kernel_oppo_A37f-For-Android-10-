@@ -2,6 +2,10 @@
 
 ## Development
 
+### E008: SMEM Logging (2026-11-08)
+
+- Skip routine AP log writes by default; keep runtime opt-in and modem transport.
+
 ### E008: SMEM Snapshots (2026-11-08)
 
 - Free 320 KB of permanent debug RAM; retain independent partial-read snapshots.
