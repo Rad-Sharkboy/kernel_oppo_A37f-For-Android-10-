@@ -2,6 +2,10 @@
 
 ## Development
 
+### E011: Upper CPU Targets (2026-11-09)
+
+- Retain the tested 1094/1152/1209 MHz target trims; preserve CPR voltage limits.
+
 ### E011: 533 MHz Corner Mapping (2026-11-09)
 
 - Match the rounded clock to corner 3; retain all operating frequencies.
