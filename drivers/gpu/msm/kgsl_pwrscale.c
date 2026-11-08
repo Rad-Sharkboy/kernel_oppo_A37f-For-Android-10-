@@ -253,15 +253,23 @@ int kgsl_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 
 	/* If the governor recommends a new frequency, update it here */
 	if (*freq != cur_freq) {
-		level = pwr->max_pwrlevel;
-		for (i = pwr->min_pwrlevel; i >= pwr->max_pwrlevel; i--)
-			if (*freq <= pwr->pwrlevels[i].gpu_freq) {
-				if (pwr->thermal_cycle == CYCLE_ACTIVE)
-					level = _thermal_adjust(pwr, i);
-				else
+		if (flags & DEVFREQ_FLAG_LEAST_UPPER_BOUND) {
+			level = pwr->min_pwrlevel;
+			for (i = pwr->max_pwrlevel; i <= pwr->min_pwrlevel; i++)
+				if (*freq >= pwr->pwrlevels[i].gpu_freq) {
 					level = i;
-				break;
-			}
+					break;
+				}
+		} else {
+			level = pwr->max_pwrlevel;
+			for (i = pwr->min_pwrlevel; i >= pwr->max_pwrlevel; i--)
+				if (*freq <= pwr->pwrlevels[i].gpu_freq) {
+					level = i;
+					break;
+				}
+		}
+		if (pwr->thermal_cycle == CYCLE_ACTIVE)
+			level = _thermal_adjust(pwr, level);
 		if (level != pwr->active_pwrlevel)
 			kgsl_pwrctrl_pwrlevel_change(device, level);
 	}

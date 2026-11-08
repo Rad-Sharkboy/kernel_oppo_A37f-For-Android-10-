@@ -2,6 +2,10 @@
 
 ## Development
 
+### E008: GPU Limit Rounding (2026-11-08)
+
+- Round non-table ceilings downward while retaining thermal and wake handling.
+
 ### E008: I/O Prediction (2026-11-08)
 
 - Handle reverse access and reject out-of-range predictions.
