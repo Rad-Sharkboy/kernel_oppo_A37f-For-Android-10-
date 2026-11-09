@@ -50,6 +50,7 @@
 #endif
 
 #include <linux/module.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/bitops.h>
@@ -1704,16 +1705,21 @@ static struct page *isolate_source_page(struct size_class *class)
 }
 
 static unsigned long __zs_compact(struct zs_pool *pool,
-				struct size_class *class)
+				struct size_class *class,
+				unsigned long deadline)
 {
 	int nr_to_migrate;
 	struct zs_compact_control cc;
 	struct page *src_page;
 	struct page *dst_page = NULL;
 	unsigned long nr_total_migrated = 0;
+	unsigned long before;
 
 	spin_lock(&class->lock);
 	while ((src_page = isolate_source_page(class))) {
+		if (time_after_eq(jiffies, deadline))
+			break;
+		before = nr_total_migrated;
 
 		BUG_ON(!is_first_page(src_page));
 
@@ -1742,10 +1748,13 @@ static unsigned long __zs_compact(struct zs_pool *pool,
 
 		putback_zspage(pool, class, dst_page);
 		putback_zspage(pool, class, src_page);
+		src_page = NULL;
 		spin_unlock(&class->lock);
 		nr_total_migrated += cc.nr_migrated;
 		cond_resched();
 		spin_lock(&class->lock);
+		if (nr_total_migrated == before)
+			break;
 	}
 
 	if (src_page)
@@ -1760,15 +1769,18 @@ unsigned long zs_compact(struct zs_pool *pool)
 {
 	int i;
 	unsigned long nr_migrated = 0;
+	unsigned long deadline = jiffies + msecs_to_jiffies(8);
 	struct size_class *class;
 
 	for (i = zs_size_classes - 1; i >= 0; i--) {
+		if (time_after_eq(jiffies, deadline))
+			break;
 		class = pool->size_class[i];
 		if (!class)
 			continue;
 		if (class->index != i)
 			continue;
-		nr_migrated += __zs_compact(pool, class);
+		nr_migrated += __zs_compact(pool, class, deadline);
 	}
 
 	return nr_migrated;
