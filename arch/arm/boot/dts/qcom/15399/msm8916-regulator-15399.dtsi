@@ -23,7 +23,7 @@
 		qcom,cpr-up-threshold = <0>;
 		qcom,cpr-down-threshold = <2>;
 		qcom,cpr-apc-volt-step = <12500>;
-		qcom,cpr-virtual-corner-quotient-adjustment = <0 0 0 0 0 (-26) (-20) (-39)>;
+		qcom,cpr-virtual-corner-quotient-adjustment = <0 0 (-39) (-39) 0 (-65) (-43) (-65)>;
 		
 	    qcom,cpr-corner-map = <1 1 2 2 3 3 3 3>;
 	    qcom,cpr-corner-frequency-map = <1 200000000>,

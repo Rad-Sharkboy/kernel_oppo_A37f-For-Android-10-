@@ -2,6 +2,10 @@
 
 ## Development
 
+### E013: CPU Targets (2026-11-09)
+
+- Retain individually computation-checked 533/800/1094/1152/1209 MHz targets; voltage limits retained.
+
 ### E012: zRAM Boot Ownership (2026-11-09)
 
 - Keep initialized swap intact; stop on setup errors and remove redundant sleeps after synchronous operations.
