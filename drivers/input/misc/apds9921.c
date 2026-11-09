@@ -797,15 +797,25 @@ static int apds9921_enable_als_sensor(struct i2c_client *client, int val)
 		return -1;
 	}
 
-	if ((data->enable_als_sensor == 0) &&(data->enable_ps_sensor == 0))
+	if (!val && !data->enable_als_sensor && !data->enable_ps_sensor &&
+	    !data->power_on_flag)
+		return 0;
+
+	if (val == APDS_ENABLE_ALS && !data->enable_als_sensor &&
+	    !data->enable_ps_sensor)
 	{
 		/* Power on and initalize the device */
-		if (data->power_on)
-			data->power_on(true);
+		if (data->power_on) {
+			rc = data->power_on(true);
+			if (rc)
+				return rc;
+		}
 
 		rc = apds9921_init_client(client);
 		if (rc) {
 			dev_err(&client->dev, "Failed to init apds993x\n");
+			if (data->power_on)
+				data->power_on(false);
 			return rc;
 		}
 	}
@@ -830,8 +840,7 @@ static int apds9921_enable_als_sensor(struct i2c_client *client, int val)
 				 * If work is already scheduled then subsequent schedules will not
 				 * change the scheduled time that's why we have to cancel it first.
 				 */
-				cancel_delayed_work(&data->als_dwork);
-				flush_delayed_work(&data->als_dwork);
+				cancel_delayed_work_sync(&data->als_dwork);
 
 				queue_delayed_work(apds_workqueue, &data->als_dwork, msecs_to_jiffies(data->als_poll_delay));
 			}
@@ -848,8 +857,7 @@ static int apds9921_enable_als_sensor(struct i2c_client *client, int val)
 		 * If work is already scheduled then subsequent schedules will not
 		 * change the scheduled time that's why we have to cancel it first.
 		 */
-		cancel_delayed_work(&data->als_dwork);
-		flush_delayed_work(&data->als_dwork);
+		cancel_delayed_work_sync(&data->als_dwork);
 	}
 
 	/* Vote off  regulators if both light and prox sensor are off */
@@ -959,11 +967,19 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 		return -1;
 	}
 
-	if ((data->enable_als_sensor == 0) &&(data->enable_ps_sensor == 0))
+	if (!val && !data->enable_als_sensor && !data->enable_ps_sensor &&
+	    !data->power_on_flag)
+		return 0;
+
+	if (val == APDS_ENABLE_PS && !data->enable_als_sensor &&
+	    !data->enable_ps_sensor)
 	{
 		/* Power on and initalize the device */
-		if (data->power_on)
-			data->power_on(true);
+		if (data->power_on) {
+			rc = data->power_on(true);
+			if (rc)
+				return rc;
+		}
 
 		for(init_client_time = 0; init_client_time < 3; init_client_time ++)
 		{
@@ -977,6 +993,11 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 			{
 				break;
 			}
+		}
+		if (rc) {
+			if (data->power_on)
+				data->power_on(false);
+			return rc;
 		}
 	}
 
