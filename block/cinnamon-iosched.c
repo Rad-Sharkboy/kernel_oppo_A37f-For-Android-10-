@@ -115,7 +115,8 @@ struct cinnamon_data {
 	int saved_write_expire_ms;
 
 	struct request_queue *q;   /* for ra_pages access */
-	int dispatch_seq;
+	unsigned int dispatch_seq;
+	unsigned int last_adjust_dispatch_seq;
 	int empty_dispatch_count;
 	bool emmc_mode;
 
@@ -123,7 +124,6 @@ struct cinnamon_data {
 	unsigned int write_starved_count;
 	unsigned long last_starved_jiffies;
 	unsigned long starvation_recovery_until;
-	int saved_read_batch_for_starve;
 
 	/* Sequential write detection boost */
 	unsigned int seq_write_count;
@@ -181,9 +181,27 @@ static void cinnamon_clamp_for_emmc(struct cinnamon_data *cd)
 		return;
 	cd->read_batch = min(cd->read_batch, EMMC_MAX_BATCH);
 	cd->write_batch = min(cd->write_batch, EMMC_MAX_BATCH);
+	cd->saved_read_batch = min(cd->saved_read_batch, EMMC_MAX_BATCH);
+	cd->saved_write_batch = min(cd->saved_write_batch, EMMC_MAX_BATCH);
 	cd->pressure_thres = clamp(cd->pressure_thres,
 				    EMMC_MIN_PRESSURE_THRES,
 				    EMMC_MAX_PRESSURE_THRES);
+}
+
+/* Derive temporary modes from the normal policy, never from each other. */
+static void cinnamon_apply_params(struct cinnamon_data *cd)
+{
+	cd->read_batch = cd->saved_read_batch;
+	cd->write_batch = cd->saved_write_batch;
+	cd->write_expire_ms = cd->saved_write_expire_ms;
+	if (!cd->pressure) {
+		cd->read_batch = max(cd->read_batch / 2, 8);
+		cd->write_batch = max(cd->write_batch / 2, 8);
+		cd->write_expire_ms = min(cd->write_expire_ms, 200) + 100;
+	}
+	if (cd->starvation_recovery_until)
+		cd->read_batch = min(cd->read_batch, 4);
+	cinnamon_clamp_for_emmc(cd);
 }
 
 /* Queue-locked, rate-limited convergence; no idle worker. */
@@ -235,19 +253,7 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 	cd->pressure = new_pressure;
 	atomic_set(&cinnamon_io_pressure, new_pressure);
 	cd->last_pressure_change_jiffies = jiffies;
-	if (!new_pressure) {
-		cd->saved_read_batch = cd->read_batch;
-		cd->saved_write_batch = cd->write_batch;
-		cd->saved_write_expire_ms = cd->write_expire_ms;
-		cd->read_batch = max(cd->read_batch / 2, 8);
-		cd->write_batch = max(cd->write_batch / 2, 8);
-		cd->write_expire_ms = min(cd->write_expire_ms + 100, 300);
-	} else if (!old_pressure) {
-		cd->read_batch = cd->saved_read_batch;
-		cd->write_batch = cd->saved_write_batch;
-		cd->write_expire_ms = cd->saved_write_expire_ms;
-	}
-	cinnamon_clamp_for_emmc(cd);
+	cinnamon_apply_params(cd);
 }
 
 static int cinnamon_predict_history(sector_t *history, int index,
@@ -477,8 +483,12 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd)
 
 	total_ns = atomic64_read(&cd->total_latency_ns);
 	num = atomic_read(&cd->num_requests);
-	if (num == 0)
+	if (num == 0 || cd->last_adjust_dispatch_seq == cd->dispatch_seq)
 		return;
+	cd->last_adjust_dispatch_seq = cd->dispatch_seq;
+	cd->read_batch = cd->saved_read_batch;
+	cd->write_batch = cd->saved_write_batch;
+	cd->write_expire_ms = cd->saved_write_expire_ms;
 	avg_latency_ms = div64_u64(total_ns, 1000000);
 
 	for (i = 0; i < PRIO_COUNT; i++)
@@ -516,11 +526,12 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd)
 		cd->write_batch = max(cd->write_batch / 2, 4);
 	}
 
+	cinnamon_clamp_for_emmc(cd);
 	cd->saved_read_batch = cd->read_batch;
 	cd->saved_write_batch = cd->write_batch;
 	cd->saved_write_expire_ms = cd->write_expire_ms;
 
-	cinnamon_clamp_for_emmc(cd);
+	cinnamon_apply_params(cd);
 }
 
 /* Dispatch function with tiered priority, starvation avoidance, and background anti-starvation */
@@ -539,9 +550,8 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	/* Starvation recovery check */
 	if (cd->starvation_recovery_until &&
 	    time_after(jiffies, cd->starvation_recovery_until)) {
-		cd->read_batch = cd->saved_read_batch_for_starve;
 		cd->starvation_recovery_until = 0;
-		cinnamon_clamp_for_emmc(cd);
+		cinnamon_apply_params(cd);
 	}
 	read_batch = cd->read_batch;
 	cinnamon_update_ra(cd);
@@ -603,10 +613,8 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 				cd->write_starved_count++;
 				cd->last_starved_jiffies = jiffies;
 				if (!cd->starvation_recovery_until) {
-					cd->saved_read_batch_for_starve = cd->read_batch;
-					cd->read_batch = 4;
-					cinnamon_clamp_for_emmc(cd);
 					cd->starvation_recovery_until = jiffies + 2 * HZ;
+					cinnamon_apply_params(cd);
 				}
 			}
 			rq = wrq;
@@ -815,12 +823,12 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 
 	cd->q = q;
 	cd->dispatch_seq = 0;
+	cd->last_adjust_dispatch_seq = 0;
 	cd->empty_dispatch_count = 0;
 
 	cd->write_starved_count = 0;
 	cd->last_starved_jiffies = 0;
 	cd->starvation_recovery_until = 0;
-	cd->saved_read_batch_for_starve = 0;
 
 	cd->emmc_mode = false;
 	if (q->backing_dev_info.dev) {
@@ -877,10 +885,14 @@ static ssize_t cinnamon_write_expire_ms_store(struct elevator_queue *e, const ch
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val) || val <= 0)
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2 || val <= 0)
 		return -EINVAL;
-	cd->write_expire_ms = val;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
+	cd->saved_write_expire_ms = val;
+	cinnamon_apply_params(cd);
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
@@ -894,11 +906,15 @@ static ssize_t cinnamon_read_batch_store(struct elevator_queue *e, const char *p
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val) || val <= 0)
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2 || val <= 0)
 		return -EINVAL;
-	cd->read_batch = val;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
+	cd->saved_read_batch = val;
+	cinnamon_apply_params(cd);
 	cinnamon_clamp_for_emmc(cd);
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
@@ -912,11 +928,15 @@ static ssize_t cinnamon_write_batch_store(struct elevator_queue *e, const char *
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val) || val <= 0)
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2 || val <= 0)
 		return -EINVAL;
-	cd->write_batch = val;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
+	cd->saved_write_batch = val;
+	cinnamon_apply_params(cd);
 	cinnamon_clamp_for_emmc(cd);
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
@@ -930,11 +950,14 @@ static ssize_t cinnamon_pressure_thres_store(struct elevator_queue *e, const cha
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val) || val < 0)
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2 || val < 0)
 		return -EINVAL;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
 	cd->pressure_thres = val;
 	cinnamon_clamp_for_emmc(cd);
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
@@ -948,10 +971,13 @@ static ssize_t cinnamon_hysteresis_ms_store(struct elevator_queue *e, const char
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val) || val <= 0)
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2 || val <= 0)
 		return -EINVAL;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
 	cd->hysteresis_ms = val;
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
@@ -965,10 +991,13 @@ static ssize_t cinnamon_target_latency_ms_store(struct elevator_queue *e, const 
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val) || val <= 0)
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2 || val <= 0)
 		return -EINVAL;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
 	cd->target_latency_ms = val;
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
@@ -982,10 +1011,13 @@ static ssize_t cinnamon_adjust_interval_ms_store(struct elevator_queue *e, const
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val) || val < 100)
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2 || val < 100)
 		return -EINVAL;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
 	cd->adjust_interval_ms = val;
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
@@ -1038,11 +1070,14 @@ static ssize_t cinnamon_emmc_mode_store(struct elevator_queue *e, const char *pa
 {
 	struct cinnamon_data *cd = e->elevator_data;
 	long val;
-	if (kstrtol(page, 10, &val))
+	unsigned long flags;
+	if (kstrtol(page, 10, &val) || val > INT_MAX / 2)
 		return -EINVAL;
+	spin_lock_irqsave(cd->q->queue_lock, flags);
 	cd->emmc_mode = (val != 0);
 	cinnamon_clamp_for_emmc(cd);
 	cd->last_manual_param_change_jiffies = jiffies;
+	spin_unlock_irqrestore(cd->q->queue_lock, flags);
 	return count;
 }
 
