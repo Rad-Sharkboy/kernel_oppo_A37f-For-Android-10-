@@ -2,6 +2,10 @@
 
 ## Development
 
+### E014: Sequential Writes (2026-11-09)
+
+- Use every request end for contiguity; bound boosts to two foreground writes while reads wait; remove unused write prediction.
+
 ### E014: GPU SVS Trial (2026-11-09)
 
 - Board opt-in retains the unplugged310MHz lower-vote trial; keep620MHz HIGH and other clients/rail tables unchanged.

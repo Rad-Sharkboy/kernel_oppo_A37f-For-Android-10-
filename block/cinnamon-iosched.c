@@ -66,6 +66,8 @@ enum io_priority {
 /* Shift and mask for storing priority with timestamp */
 #define CINNAMON_PRIO_SHIFT 8
 #define CINNAMON_PRIO_MASK ((1 << CINNAMON_PRIO_SHIFT) - 1)
+#define CINNAMON_SEQ_TRIGGER 5U
+#define CINNAMON_SEQ_BURST 2U
 
 struct cinnamon_data {
 	/* Tiered queues */
@@ -102,13 +104,6 @@ struct cinnamon_data {
 	int last_read_direction;
 	sector_t predicted_sector;
 
-	/* Write pattern history */
-	sector_t write_history[CINNAMON_HISTORY_SIZE];
-	int write_history_index;
-	int write_history_count;
-	int last_write_direction;
-	sector_t predicted_write_sector;
-
 	/* Adaptive tuning */
 	unsigned long last_adjust_jiffies;
 	int target_latency_ms;
@@ -132,7 +127,9 @@ struct cinnamon_data {
 
 	/* Sequential write detection boost */
 	unsigned int seq_write_count;
-	sector_t last_write_sector;
+	sector_t last_write_end;
+	unsigned int seq_write_burst;
+	bool last_write_valid;
 };
 
 /* Legacy last-transition statistic; decisions are per queue. */
@@ -311,23 +308,38 @@ static void cinnamon_update_read_history(struct cinnamon_data *cd, sector_t sect
 		cd->history_index, cd->history_count, &cd->predicted_sector);
 }
 
-static void cinnamon_update_write_history(struct cinnamon_data *cd, sector_t sector)
+static void cinnamon_account_sequence(struct cinnamon_data *cd,
+				      struct request *rq, int prio)
 {
-	cd->write_history[cd->write_history_index] = sector;
-	cd->write_history_index = (cd->write_history_index + 1) % CINNAMON_HISTORY_SIZE;
-	if (cd->write_history_count < CINNAMON_HISTORY_SIZE)
-		cd->write_history_count++;
-	cd->last_write_direction = cinnamon_predict_history(cd->write_history,
-		cd->write_history_index, cd->write_history_count,
-		&cd->predicted_write_sector);
+	sector_t sector = blk_rq_pos(rq);
+	unsigned int sectors = blk_rq_sectors(rq);
 
-	if (cd->last_write_direction != 0 && cd->last_write_sector != 0) {
-		if (sector == cd->last_write_sector + 1)
-			cd->seq_write_count++;
-		else
-			cd->seq_write_count = 0;
+	if (rq_data_dir(rq) == READ) {
+		cd->seq_write_burst = 0;
+		return;
 	}
-	cd->last_write_sector = sector;
+	if (prio == PRIO_WRITE_FG && cd->seq_write_burst < CINNAMON_SEQ_BURST)
+		cd->seq_write_burst++;
+	if (!sectors || (rq->cmd_flags & (REQ_DISCARD | REQ_FLUSH)) ||
+	    (sector_t)sectors > (sector_t)-1 - sector) {
+		cd->seq_write_count = 0;
+		cd->last_write_valid = false;
+		return;
+	}
+	if (cd->last_write_valid && sector == cd->last_write_end)
+		cd->seq_write_count = min(cd->seq_write_count + 1,
+					CINNAMON_SEQ_TRIGGER);
+	else
+		cd->seq_write_count = 1;
+	cd->last_write_end = sector + sectors;
+	cd->last_write_valid = true;
+}
+
+static bool cinnamon_sequence_ready(struct cinnamon_data *cd)
+{
+	return cd->emmc_mode && cd->seq_write_count >= CINNAMON_SEQ_TRIGGER &&
+		(cd->seq_write_burst < CINNAMON_SEQ_BURST ||
+		 list_empty(&cd->queues[PRIO_READ_FG]));
 }
 
 /* Merge function with O(1) scan limit */
@@ -605,7 +617,7 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	}
 
 	/* 4. eMMC sequential write boost */
-	if (cd->emmc_mode && cd->seq_write_count > 4) {
+	if (cinnamon_sequence_ready(cd)) {
 		if (!list_empty(&cd->queues[PRIO_WRITE_FG])) {
 			rq = list_first_entry(&cd->queues[PRIO_WRITE_FG],
 					      struct request, queuelist);
@@ -678,6 +690,7 @@ dispatch:
 			cd->queue_counts[prio]--;
 
 		list_del_init(&rq->queuelist);
+		cinnamon_account_sequence(cd, rq, prio);
 
 		/* Latency tracking */
 		if ((cd->dispatch_seq % ((rq_data_dir(rq) == READ) ? 8 : 16)) == 0) {
@@ -686,12 +699,8 @@ dispatch:
 		}
 
 		/* Update history */
-		if ((cd->dispatch_seq++ % 4) == 0) {
-			if (rq_data_dir(rq) == READ)
-				cinnamon_update_read_history(cd, blk_rq_pos(rq));
-			else
-				cinnamon_update_write_history(cd, blk_rq_pos(rq));
-		}
+		if ((cd->dispatch_seq++ % 4) == 0 && rq_data_dir(rq) == READ)
+			cinnamon_update_read_history(cd, blk_rq_pos(rq));
 
 		/* Clear timestamp (optional) */
 		set_req_time_and_prio(rq, 0, 0);
@@ -792,12 +801,10 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	cd->last_read_direction = 0;
 	cd->predicted_sector = 0;
 
-	cd->write_history_index = 0;
-	cd->write_history_count = 0;
-	cd->last_write_direction = 0;
-	cd->predicted_write_sector = 0;
 	cd->seq_write_count = 0;
-	cd->last_write_sector = 0;
+	cd->last_write_end = 0;
+	cd->seq_write_burst = 0;
+	cd->last_write_valid = false;
 
 	cd->last_adjust_jiffies = jiffies;
 	cd->target_latency_ms = CINNAMON_TARGET_LATENCY_MS;
