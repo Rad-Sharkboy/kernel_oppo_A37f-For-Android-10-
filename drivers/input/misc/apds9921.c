@@ -635,6 +635,10 @@ static int apds9921_check_intr(struct i2c_client *client)
 	int main_status = 0;
 
 	main_status = i2c_smbus_read_byte_data(client, APDS9921_DD_MAIN_STATUS_ADDR);
+	if (main_status < 0) {
+		dev_err_ratelimited(&client->dev, "status read failed: %d\n", main_status);
+		return main_status;
+	}
 
 	printk(KERN_ERR"%s , main_status = 0x%x\n",__func__, main_status);
 
@@ -655,7 +659,14 @@ static void apds9921_change_ps_threshold(struct i2c_client *client)
 {
 	struct apds9921_data *data = i2c_get_clientdata(client);
 
-	data->ps_data =	i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
+	int ps_data;
+
+	ps_data = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
+	if (ps_data < 0) {
+		dev_err_ratelimited(&client->dev, "proximity read failed: %d\n", ps_data);
+		return;
+	}
+	data->ps_data = ps_data;
 	data->ps_overflow = data->ps_data >> 11;
 	data->ps_data = data->ps_data & 0x7FF;
 
@@ -676,13 +687,19 @@ static void apds9921_change_ps_threshold(struct i2c_client *client)
 static void apds9921_change_als_threshold(struct i2c_client *client)
 {
 	struct apds9921_data *data = i2c_get_clientdata(client);
-	int clr_data, als_data;
+	int clr_data, als_data, gain_index, rc;
 	int luxValue=0;
 	unsigned char change_again=0;
 
 	clr_data = i2c_smbus_read_word_data(client, APDS9921_DD_CLEAR_DATA_ADDR);
 	als_data = i2c_smbus_read_word_data(client, APDS9921_DD_ALS_DATA_ADDR);
 
+	if (clr_data < 0 || als_data < 0) {
+		dev_err_ratelimited(&client->dev, "failed light sample: %d/%d\n",
+				    clr_data, als_data);
+		return;
+	}
+	gain_index = data->als_gain_index;
 	luxValue = LuxCalculation(client, clr_data, als_data);
 
 	//printk(KERN_ERR"lux=%d clr_data=%d als_data=%d again=%d als_res=%d\n", luxValue, clr_data, als_data, apds9921_als_gain_tb[data->als_gain_index], data->als_res_index);
@@ -695,20 +712,25 @@ static void apds9921_change_als_threshold(struct i2c_client *client)
 	if (data->als_data >= data->als_threshold_h) {
 		// lower AGAIN if possible
 		if (data->als_gain_index != APDS9921_DD_ALS_GAIN_1X) {
-			data->als_gain_index--;
+			gain_index--;
 			change_again = 1;
 		}
 	}
 	else if (data->als_data < data->als_threshold_l) {
 		// increase AGAIN if possible
 		if (data->als_gain_index != APDS9921_DD_ALS_GAIN_18X) {
-			data->als_gain_index++;
+			gain_index++;
 			change_again = 1;
 		}
 	}
 
 	if (change_again) {
-		apds9921_dd_set_als_gain(client, apds9921_als_gain_bit_tb[data->als_gain_index]);
+		rc = apds9921_dd_set_als_gain(client, apds9921_als_gain_bit_tb[gain_index]);
+		if (rc < 0) {
+			dev_err_ratelimited(&client->dev, "gain write failed: %d\n", rc);
+			return;
+		}
+		data->als_gain_index = gain_index;
 
 		return;
 	}
@@ -764,7 +786,7 @@ static void apds9921_work_handler(struct work_struct *work)
 	{
 		status = apds9921_check_intr(client);
 
-		if (status & APDS9921_DD_PRX_INT_STATUS)
+		if (status >= 0 && (status & APDS9921_DD_PRX_INT_STATUS))
 		{
 			apds9921_change_ps_threshold(client);
 		}
@@ -1022,7 +1044,12 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 
 			msleep(100); // must be more than APDS9921_DD_PRX_DEFAULT_MEAS_RATE
 
-			data->ps_data = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR) & 0x7FF;
+			rc = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
+			if (rc < 0) {
+				apds9921_enable_ps_sensor(client, APDS_DISABLE_PS);
+				return rc;
+			}
+			data->ps_data = rc & 0x7FF;
 
 			if (data->ps_data >= data->piht)
 				data->ps_detection = 1;
