@@ -831,7 +831,7 @@ static int lis3dh_acc_get_fifo_lvl(struct lis3dh_acc_data *acc)
 	}
 	fifo_lvl = buf[0] & FIFO_SRC_DATA_CNT_MASK;
 	if ((fifo_lvl == FIFO_MAX_CNT)
-		&& (buf[0] | FIFO_SRC_OVRN_MASK))
+		&& (buf[0] & FIFO_SRC_OVRN_MASK))
 		fifo_lvl = FIFO_MAX_CNT + 1;
 
 	return fifo_lvl;
@@ -1527,27 +1527,21 @@ static ssize_t attr_get_polling_rate(struct device *dev,
 	return snprintf(buf, 8, "%d\n", val);
 }
 
+static int lis3dh_acc_poll_delay_set(struct sensors_classdev *sensors_cdev,
+	unsigned int delay_msec);
+
 static ssize_t attr_set_polling_rate(struct device *dev,
 				     struct device_attribute *attr,
 				     const char *buf, size_t size)
 {
 	struct lis3dh_acc_data *acc = dev_get_drvdata(dev);
 	unsigned long interval_ms;
+	int err;
 
-	if (atomic_read(&acc->cal_status)) {
-		dev_err(&acc->client->dev,
-			"can not set rate when sensor do calibration now\n");
-		return -EBUSY;
-	}
-	if (kstrtoul(buf, 10, &interval_ms))
+	if (kstrtoul(buf, 10, &interval_ms) || !interval_ms || interval_ms > UINT_MAX)
 		return -EINVAL;
-	if (!interval_ms)
-		return -EINVAL;
-	mutex_lock(&acc->lock);
-	acc->delay_ms = interval_ms;
-	lis3dh_acc_update_odr(acc, interval_ms);
-	mutex_unlock(&acc->lock);
-	return size;
+	err = lis3dh_acc_poll_delay_set(&acc->cdev, interval_ms);
+	return err < 0 ? err : size;
 }
 
 static ssize_t attr_get_range(struct device *dev,
@@ -1997,9 +1991,11 @@ static int lis3dh_acc_poll_delay_set(struct sensors_classdev *sensors_cdev,
 {
 	struct lis3dh_acc_data *acc = container_of(sensors_cdev,
 		struct lis3dh_acc_data, cdev);
-	int err;
+	int err = 0;
 	int watermark;
 
+	if (!delay_msec)
+		return -EINVAL;
 	if (atomic_read(&acc->cal_status)) {
 		dev_err(&acc->client->dev,
 			"can not set delay when sensor do calibration now\n");
@@ -2007,7 +2003,6 @@ static int lis3dh_acc_poll_delay_set(struct sensors_classdev *sensors_cdev,
 	}
 	dev_dbg(&acc->client->dev, "set poll delay =%d\n", delay_msec);
 	mutex_lock(&acc->lock);
-	acc->delay_ms = delay_msec;
 	/*
 	 * Device may not power on,
 	 * only set register when device is enabled.
@@ -2016,9 +2011,9 @@ static int lis3dh_acc_poll_delay_set(struct sensors_classdev *sensors_cdev,
 		err = lis3dh_acc_update_odr(acc, delay_msec);
 		if (err < 0) {
 			dev_err(&acc->client->dev, "Cannot update ODR\n");
-			err = -EBUSY;
 			goto exit;
 		}
+		acc->delay_ms = delay_msec;
 		if (acc->use_batch) {
 			watermark = lis3dh_acc_calc_watermark(acc,
 					acc->fifo_timeout_ms);
@@ -2032,6 +2027,8 @@ static int lis3dh_acc_poll_delay_set(struct sensors_classdev *sensors_cdev,
 				err = lis3dh_acc_set_waterwark(acc, watermark);
 			}
 		}
+	} else {
+		acc->delay_ms = delay_msec;
 	}
 exit:
 	mutex_unlock(&acc->lock);
