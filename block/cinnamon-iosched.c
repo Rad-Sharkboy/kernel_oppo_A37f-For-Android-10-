@@ -525,7 +525,7 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	int target_pressure = 0;
 	int pressure = cd->pressure;
 	unsigned long write_expire_ns = cd->write_expire_ms * 1000000ULL;
-	unsigned long read_batch = cd->read_batch;
+	unsigned long read_batch;
 	int prio, i;
 	int total_pending;
 
@@ -536,6 +536,7 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 		cd->starvation_recovery_until = 0;
 		cinnamon_clamp_for_emmc(cd);
 	}
+	read_batch = cd->read_batch;
 
 	/* Dynamic expiration based on pressure and queue depth */
 	if (unlikely(pressure == 3))

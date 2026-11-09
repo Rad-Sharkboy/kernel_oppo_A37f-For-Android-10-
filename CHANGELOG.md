@@ -2,6 +2,10 @@
 
 ## Development
 
+### E013: Read Batch Recovery (2026-11-09)
+
+- Refresh the local batch after starvation recovery restores queue settings.
+
 ### E013: CPU Targets (2026-11-09)
 
 - Retain individually computation-checked 533/800/1094/1152/1209 MHz targets; voltage limits retained.
