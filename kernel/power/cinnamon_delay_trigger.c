@@ -318,24 +318,7 @@ set_prop:
 	msleep(10);
 	cinnamon_write_path("/proc/sys/net/ipv4/tcp_congestion_control", "westwood");
 
-	/* Reapply interactive governor tunings after Android power HAL override */
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "800000");
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "30000");
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/timer_rate", "20000");
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/timer_slack", "20000");
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay", "20000");
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration", "80000");
-	msleep(10);
-	cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/target_loads",
-		"1 200000:25 400000:35 533333:45 800000:65 998400:65 1094400:65 1152000:70 1209600:80");
+
 }
 
 static void cinnamon_try_bimc_oc(void)
@@ -435,44 +418,6 @@ static void cinnamon_execute_command_3(void)
 		cinnamon_apply_block_tuning();
 	}
 
-	/* Step 5: Interactive governor tuning */
-	{
-		int i;
-		const char *cpu_policies[] = {
-			"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-			"/sys/devices/system/cpu/cpu1/cpufreq/scaling_governor",
-			"/sys/devices/system/cpu/cpu2/cpufreq/scaling_governor",
-			"/sys/devices/system/cpu/cpu3/cpufreq/scaling_governor",
-		};
-
-		msleep(50);
-
-		/* Switch from performance to interactive governor */
-		for (i = 0; i < 4; i++) {
-			if (cinnamon_file_exists(cpu_policies[i]))
-				cinnamon_write_path(cpu_policies[i], "interactive");
-		}
-
-		msleep(50);
-
-		/* Tune interactive governor for low-latency UI response */
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load", "75");
-		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "800000");
-		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "40000");
-		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/timer_rate", "10000");
-		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/target_loads", "1 200000:25 400000:35 533333:45 800000:65 998400:65 1094400:65 1152000:70 1209600:80");
-		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay", "20000");
-		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/io_is_busy", "1");
-		msleep(10);
-		cinnamon_write_path("/sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration", "40000");
-	}
-
 	/* Step 6: USB Gadget setup for ADB+HID */
 	{
 		msleep(100);
@@ -496,7 +441,7 @@ static void cinnamon_execute_command_3(void)
 		msleep(25);
 		cinnamon_write_path("/proc/sys/net/ipv4/tcp_congestion_control", "westwood");
 	}
-	pr_info("Cinnamon_Active: VM, interactive governor, USB gadget, LMK, and TCP Westwood optimization completed\n");
+	pr_info("Cinnamon_Active: VM, USB gadget, LMK, and TCP Westwood optimization completed\n");
 }
 
 /* Main work function - executes after delay */

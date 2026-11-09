@@ -2,6 +2,10 @@
 
 ## Development
 
+### E013: CPU Policy Ownership (2026-11-09)
+
+- Remove only delayed CPU governor writers; ROM init and native Power HAL own them. Keep I/O, VM, USB and other startup work.
+
 ### E013: GPU Vote Trial (2026-11-09)
 
 - Root-only default-off 310MHz SVS trial; require unprepared clock, preserve620MHz and shared rail tables; expose vote indices.
