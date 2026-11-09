@@ -34,6 +34,7 @@
 #include <linux/seq_file.h>
 
 #ifdef CONFIG_ARM64
+#include <linux/interrupt.h>
 #include <asm/neon.h>
 #endif
 
@@ -185,65 +186,40 @@ static inline int find_first_diff_byte_generic(const u8 *b1, const u8 *b2, int b
 /* ========== NEON implementations (ARM64 only) ========== */
 #ifdef CONFIG_ARM64
 
-/* NEON version: check if a block is all zero (block size multiple of 16) – with begin/end */
-static inline int __attribute__((optimize("O0"))) neon_is_zero_block(const u8 *block, int block_size)
+static inline int neon_is_zero_block_batched(const u8 *block, int block_size)
 {
-	int i;
-	uint8_t max_val;
+	const u8 *ptr = block;
+	int len = block_size;
+	unsigned int result;
 
-	kernel_neon_begin();
-	asm volatile(
-		"movi v0.16b, #0\n"                /* accumulator = 0 */
-		: : : "v0"
-	);
-	for (i = 0; i < block_size; i += 16) {
-		asm volatile(
-			"ld1 {v1.16b}, [%0]\n"         /* load 16 bytes */
-			"orr v0.16b, v0.16b, v1.16b\n" /* OR into accumulator */
-			: : "r"(block + i) : "v1", "v0"
-		);
-	}
-	asm volatile(
-		"umaxv b2, v0.16b\n"               /* find max byte in accumulator */
-		"umov %w0, v2.b[0]\n"               /* move to general register */
-		: "=r"(max_val) : : "v2"
-	);
-	kernel_neon_end();
-	return max_val == 0;
-}
-
-/* NEON batched version – assumes NEON context already active */
-static inline int __attribute__((optimize("O0"))) neon_is_zero_block_batched(const u8 *block, int block_size)
-{
-	int i;
-	uint8_t max_val;
-	/* No kernel_neon_begin/end here */
 	asm volatile(
 		"movi v0.16b, #0\n"
-		: : : "v0"
-	);
-	for (i = 0; i < block_size; i += 16) {
-		asm volatile(
-			"ld1 {v1.16b}, [%0]\n"
-			"orr v0.16b, v0.16b, v1.16b\n"
-			: : "r"(block + i) : "v1", "v0"
-		);
-	}
-	asm volatile(
+		"1: ld1 {v1.16b}, [%[ptr]], #16\n"
+		"orr v0.16b, v0.16b, v1.16b\n"
+		"subs %w[len], %w[len], #16\n"
+		"b.gt 1b\n"
 		"umaxv b2, v0.16b\n"
-		"umov %w0, v2.b[0]\n"
-		: "=r"(max_val) : : "v2"
-	);
-	return max_val == 0;
+		"umov %w[result], v2.b[0]\n"
+		: [ptr] "+&r" (ptr), [len] "+&r" (len), [result] "=r" (result)
+		: : "v0", "v1", "v2", "cc", "memory");
+	return result == 0;
 }
 
-/* NEON version: exact match of two blocks – with begin/end */
-static inline int __attribute__((optimize("O0"))) neon_blocks_match(const u8 *b1, const u8 *b2, int block_size)
+static inline int neon_is_zero_block(const u8 *block, int block_size)
 {
-	int i;
-	uint8_t min_val;
+	int result;
 
 	kernel_neon_begin();
+	result = neon_is_zero_block_batched(block, block_size);
+	kernel_neon_end();
+	return result;
+}
+
+static inline int neon_blocks_match_batched(const u8 *b1, const u8 *b2, int block_size)
+{
+	int i;
+	unsigned int equal;
+
 	for (i = 0; i < block_size; i += 16) {
 		asm volatile(
 			"ld1 {v0.16b}, [%1]\n"
@@ -251,77 +227,29 @@ static inline int __attribute__((optimize("O0"))) neon_blocks_match(const u8 *b1
 			"cmeq v2.16b, v0.16b, v1.16b\n"
 			"uminv b3, v2.16b\n"
 			"umov %w0, v3.b[0]\n"
-			: "=r"(min_val)
-			: "r"(b1 + i), "r"(b2 + i)
-			: "v0", "v1", "v2", "v3"
-		);
-		if (min_val != 0xFF) {
-			kernel_neon_end();
-			return 0;
-		}
-	}
-	kernel_neon_end();
-	return 1;
-}
-
-/* NEON batched version – assumes NEON context active */
-static inline int __attribute__((optimize("O0"))) neon_blocks_match_batched(const u8 *b1, const u8 *b2, int block_size)
-{
-	int i;
-	uint8_t min_val;
-	for (i = 0; i < block_size; i += 16) {
-		asm volatile(
-			"ld1 {v0.16b}, [%1]\n"
-			"ld1 {v1.16b}, [%2]\n"
-			"cmeq v2.16b, v0.16b, v1.16b\n"
-			"uminv b3, v2.16b\n"
-			"umov %w0, v3.b[0]\n"
-			: "=r"(min_val)
-			: "r"(b1 + i), "r"(b2 + i)
-			: "v0", "v1", "v2", "v3"
-		);
-		if (min_val != 0xFF)
+			: "=r" (equal) : "r" (b1 + i), "r" (b2 + i)
+			: "v0", "v1", "v2", "v3", "memory");
+		if (equal != 0xff)
 			return 0;
 	}
 	return 1;
 }
 
-/* NEON version: count differing bytes – with begin/end */
-static inline int __attribute__((optimize("O0"))) neon_count_diff_bytes(const u8 *b1, const u8 *b2, int block_size)
+static inline int neon_blocks_match(const u8 *b1, const u8 *b2, int block_size)
 {
-	int i, total = 0;
-	uint16_t sum;
+	int result;
 
 	kernel_neon_begin();
-	for (i = 0; i < block_size; i += 16) {
-		asm volatile(
-			"ld1 {v0.16b}, [%1]\n"
-			"ld1 {v1.16b}, [%2]\n"
-			"eor v2.16b, v0.16b, v1.16b\n"
-			"cmeq v3.16b, v2.16b, #0\n"    /* v3 = 0xFF where equal */
-			"mvn v3.16b, v3.16b\n"         /* v3 = 0xFF where differ */
-			"ushr v3.16b, v3.16b, 7\n"     /* v3 = 1 where differ, 0 elsewhere */
-			"uaddlv h4, v3.16b\n"          /* sum across vector */
-			"umov %w0, v4.h[0]\n"
-			: "=r"(sum)
-			: "r"(b1 + i), "r"(b2 + i)
-			: "v0", "v1", "v2", "v3", "v4"
-		);
-		total += sum;
-		if (total > 3) {
-			kernel_neon_end();
-			return total;
-		}
-	}
+	result = neon_blocks_match_batched(b1, b2, block_size);
 	kernel_neon_end();
-	return total;
+	return result;
 }
 
-/* NEON batched version – assumes NEON context active */
-static inline int __attribute__((optimize("O0"))) neon_count_diff_bytes_batched(const u8 *b1, const u8 *b2, int block_size)
+static inline int neon_count_diff_bytes_batched(const u8 *b1, const u8 *b2, int block_size)
 {
 	int i, total = 0;
-	uint16_t sum;
+	unsigned int sum;
+
 	for (i = 0; i < block_size; i += 16) {
 		asm volatile(
 			"ld1 {v0.16b}, [%1]\n"
@@ -332,10 +260,8 @@ static inline int __attribute__((optimize("O0"))) neon_count_diff_bytes_batched(
 			"ushr v3.16b, v3.16b, 7\n"
 			"uaddlv h4, v3.16b\n"
 			"umov %w0, v4.h[0]\n"
-			: "=r"(sum)
-			: "r"(b1 + i), "r"(b2 + i)
-			: "v0", "v1", "v2", "v3", "v4"
-		);
+			: "=r" (sum) : "r" (b1 + i), "r" (b2 + i)
+			: "v0", "v1", "v2", "v3", "v4", "memory");
 		total += sum;
 		if (total > 3)
 			return total;
@@ -343,179 +269,111 @@ static inline int __attribute__((optimize("O0"))) neon_count_diff_bytes_batched(
 	return total;
 }
 
-/* NEON: check if all bytes in a block equal the first byte – with begin/end */
-static inline int __attribute__((optimize("O0"))) neon_is_repeat_byte_block(const u8 *block, int block_size, u8 *value)
+static inline int neon_count_diff_bytes(const u8 *b1, const u8 *b2, int block_size)
 {
-	int i;
-	uint8_t first = block[0];
-	uint8_t all_equal;
-	*value = first;
+	int result;
 
 	kernel_neon_begin();
-	/* Duplicate first byte into v0 */
-	asm volatile(
-		"dup v0.16b, %w0\n"
-		:
-		: "r"(first)
-		: "v0"
-	);
-	for (i = 0; i < block_size; i += 16) {
-		asm volatile(
-			"ld1 {v1.16b}, [%1]\n"
-			"cmeq v2.16b, v1.16b, v0.16b\n"
-			"uminv b3, v2.16b\n"
-			"umov %w0, v3.b[0]\n"
-			: "=r"(all_equal)
-			: "r"(block + i)
-			: "v1", "v2", "v3"
-		);
-		if (all_equal != 0xFF) {
-			kernel_neon_end();
-			return 0;
-		}
-	}
+	result = neon_count_diff_bytes_batched(b1, b2, block_size);
 	kernel_neon_end();
+	return result;
+}
+
+static inline int neon_is_repeat_byte_block_batched(const u8 *block, int block_size, u8 *value)
+{
+	const u8 *ptr = block;
+	int len = block_size;
+	unsigned int equal;
+	u8 first = block[0];
+
+	asm volatile(
+		"dup v0.16b, %w[first]\n"
+		"1: ld1 {v1.16b}, [%[ptr]], #16\n"
+		"cmeq v2.16b, v1.16b, v0.16b\n"
+		"uminv b3, v2.16b\n"
+		"umov %w[equal], v3.b[0]\n"
+		"cmp %w[equal], #255\n"
+		"b.ne 2f\n"
+		"subs %w[len], %w[len], #16\n"
+		"b.gt 1b\n"
+		"2:\n"
+		: [ptr] "+&r" (ptr), [len] "+&r" (len), [equal] "=&r" (equal)
+		: [first] "r" (first) : "v0", "v1", "v2", "v3", "cc", "memory");
+	if (equal != 0xff)
+		return 0;
+	*value = first;
 	return 1;
 }
 
-/* NEON batched version – assumes NEON context active */
-static inline int __attribute__((optimize("O0"))) neon_is_repeat_byte_block_batched(const u8 *block, int block_size, u8 *value)
+static inline int neon_is_repeat_byte_block(const u8 *block, int block_size, u8 *value)
 {
-	int i;
-	uint8_t first = block[0];
-	uint8_t all_equal;
-	*value = first;
-
-	asm volatile(
-		"dup v0.16b, %w0\n"
-		:
-		: "r"(first)
-		: "v0"
-	);
-	for (i = 0; i < block_size; i += 16) {
-		asm volatile(
-			"ld1 {v1.16b}, [%1]\n"
-			"cmeq v2.16b, v1.16b, v0.16b\n"
-			"uminv b3, v2.16b\n"
-			"umov %w0, v3.b[0]\n"
-			: "=r"(all_equal)
-			: "r"(block + i)
-			: "v1", "v2", "v3"
-		);
-		if (all_equal != 0xFF)
-			return 0;
-	}
-	return 1;
-}
-
-/* NEON: compute 64‑bit XOR signature – with begin/end */
-static inline u64 __attribute__((optimize("O0"))) neon_compute_block_signature(const u8 *block, int block_size)
-{
-	u64 sig_lo, sig_hi;
-	const u8 *ptr = block;
-	int len = block_size;
+	int result;
 
 	kernel_neon_begin();
-	asm volatile(
-		"movi v0.16b, #0\n"
-		"1:\n"
-		"subs %w[len], %w[len], #16\n"
-		"ld1 {v1.2d}, [%[ptr]], #16\n"
-		"eor v0.16b, v0.16b, v1.16b\n"
-		"b.gt 1b\n"
-		"umov %[sig_lo], v0.d[0]\n"
-		"umov %[sig_hi], v0.d[1]\n"
-		: [ptr] "+r"(ptr), [len] "+r"(len),
-		  [sig_lo] "=r"(sig_lo), [sig_hi] "=r"(sig_hi)
-		:
-		: "v0", "v1", "cc"
-	);
+	result = neon_is_repeat_byte_block_batched(block, block_size, value);
 	kernel_neon_end();
-	return sig_lo ^ sig_hi;
+	return result;
 }
 
-/* NEON batched version – assumes NEON context active */
-static inline u64 __attribute__((optimize("O0"))) neon_compute_block_signature_batched(const u8 *block, int block_size)
+static inline u64 neon_compute_block_signature_batched(const u8 *block, int block_size)
 {
-	u64 sig_lo, sig_hi;
 	const u8 *ptr = block;
 	int len = block_size;
+	u64 lo, hi;
 
 	asm volatile(
 		"movi v0.16b, #0\n"
-		"1:\n"
-		"subs %w[len], %w[len], #16\n"
-		"ld1 {v1.2d}, [%[ptr]], #16\n"
+		"1: ld1 {v1.2d}, [%[ptr]], #16\n"
 		"eor v0.16b, v0.16b, v1.16b\n"
+		"subs %w[len], %w[len], #16\n"
 		"b.gt 1b\n"
-		"umov %[sig_lo], v0.d[0]\n"
-		"umov %[sig_hi], v0.d[1]\n"
-		: [ptr] "+r"(ptr), [len] "+r"(len),
-		  [sig_lo] "=r"(sig_lo), [sig_hi] "=r"(sig_hi)
-		:
-		: "v0", "v1", "cc"
-	);
-	return sig_lo ^ sig_hi;
+		"umov %[lo], v0.d[0]\n"
+		"umov %[hi], v0.d[1]\n"
+		: [ptr] "+&r" (ptr), [len] "+&r" (len), [lo] "=r" (lo), [hi] "=r" (hi)
+		: : "v0", "v1", "cc", "memory");
+	return lo ^ hi;
 }
 
-/* NEON: find first differing byte offset – with begin/end */
-static inline int __attribute__((optimize("O0"))) neon_find_first_diff_byte(const u8 *b1, const u8 *b2, int block_size)
+static inline u64 neon_compute_block_signature(const u8 *block, int block_size)
+{
+	u64 result;
+
+	kernel_neon_begin();
+	result = neon_compute_block_signature_batched(block, block_size);
+	kernel_neon_end();
+	return result;
+}
+
+static inline int neon_find_first_diff_byte_batched(const u8 *b1, const u8 *b2, int block_size)
 {
 	int i, j;
-	uint8_t cmp_result;
+	unsigned int different;
 
-	kernel_neon_begin();
 	for (i = 0; i < block_size; i += 16) {
 		asm volatile(
 			"ld1 {v0.16b}, [%1]\n"
 			"ld1 {v1.16b}, [%2]\n"
-			"cmeq v2.16b, v0.16b, v1.16b\n"   /* v2 = 0xFF where equal */
-			"uminv b3, v2.16b\n"               /* min across vector */
+			"eor v2.16b, v0.16b, v1.16b\n"
+			"umaxv b3, v2.16b\n"
 			"umov %w0, v3.b[0]\n"
-			: "=r"(cmp_result)
-			: "r"(b1 + i), "r"(b2 + i)
-			: "v0", "v1", "v2", "v3"
-		);
-		if (cmp_result != 0xFF) {
-			kernel_neon_end();
-			/* Found a difference – scan bytewise */
-			for (j = 0; j < 16; j++) {
+			: "=r" (different) : "r" (b1 + i), "r" (b2 + i)
+			: "v0", "v1", "v2", "v3", "memory");
+		if (different)
+			for (j = 0; j < 16; j++)
 				if (b1[i + j] != b2[i + j])
 					return i + j;
-			}
-			/* Should never happen */
-			break;
-		}
-	}
-	kernel_neon_end();
-	return 0; /* all equal */
-}
-
-/* NEON batched version – assumes NEON context active */
-static inline int __attribute__((optimize("O0"))) neon_find_first_diff_byte_batched(const u8 *b1, const u8 *b2, int block_size)
-{
-	int i, j;
-	uint8_t cmp_result;
-	for (i = 0; i < block_size; i += 16) {
-		asm volatile(
-			"ld1 {v0.16b}, [%1]\n"
-			"ld1 {v1.16b}, [%2]\n"
-			"cmeq v2.16b, v0.16b, v1.16b\n"
-			"uminv b3, v2.16b\n"
-			"umov %w0, v3.b[0]\n"
-			: "=r"(cmp_result)
-			: "r"(b1 + i), "r"(b2 + i)
-			: "v0", "v1", "v2", "v3"
-		);
-		if (cmp_result != 0xFF) {
-			for (j = 0; j < 16; j++) {
-				if (b1[i + j] != b2[i + j])
-					return i + j;
-			}
-			break;
-		}
 	}
 	return 0;
+}
+
+static inline int neon_find_first_diff_byte(const u8 *b1, const u8 *b2, int block_size)
+{
+	int result;
+
+	kernel_neon_begin();
+	result = neon_find_first_diff_byte_batched(b1, b2, block_size);
+	kernel_neon_end();
+	return result;
 }
 
 /* Macro to check if NEON can be used safely for a given pointer */
@@ -528,7 +386,7 @@ static inline bool cinnamon_cpu_has_neon(void)
 }
 
 #define NEON_SAFE(ptr, size) \
-    (use_neon && cinnamon_cpu_has_neon() && ((unsigned long)(ptr) & 0xF) == 0)
+    (use_neon && !in_interrupt() && cinnamon_cpu_has_neon() && ((unsigned long)(ptr) & 0xF) == 0)
 
 #else /* !CONFIG_ARM64 */
 #define NEON_SAFE(ptr, size) (0)
@@ -1012,7 +870,7 @@ static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
 
 	/* OPTIMIZATION: Try NEON batched path if conditions are met */
 #ifdef CONFIG_ARM64
-	use_neon_batch = use_neon && cinnamon_cpu_has_neon() &&
+	use_neon_batch = use_neon && !in_interrupt() && cinnamon_cpu_has_neon() &&
 			 ((unsigned long)src & 0xF) == 0 &&
 			 ((unsigned long)dst & 0xF) == 0;
 	if (use_neon_batch) {
