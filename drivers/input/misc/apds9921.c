@@ -905,75 +905,87 @@ static int apds9921_set_als_poll_delay(struct i2c_client *client, unsigned int v
 static int apds9921_ps_calibration(struct i2c_client *client)
 {
 	struct apds9921_data *data = i2c_get_clientdata(client);
-	int i, rc= 0;
-	int ps_data=0;
-	int ps_meas_rate;
+	int i, rc = 0, cleanup_rc, total = 0, sample;
+	int rate = -1, offset = data->ps_offset, old_offset = data->ps_offset;
+	bool own_power = !data->enable_als_sensor && !data->enable_ps_sensor;
+	bool own_prx = false, rate_changed = false, can_changed = false;
 
-	if ((data->enable_als_sensor == 0) &&(data->enable_ps_sensor == 0))
-	{
-		/* Power on and initalize the device */
-		if (data->power_on)
-			data->power_on(true);
-
+	if (own_power) {
+		if (data->power_on) {
+			rc = data->power_on(true);
+			if (rc < 0)
+				return rc;
+		}
 		rc = apds9921_init_client(client);
-		if (rc) {
-			dev_err(&client->dev, "Failed to init apds993x\n");
-			return -1;
+		if (rc < 0)
+			goto out;
+	}
+	if (!data->enable_ps_sensor) {
+		own_prx = true;
+		rc = apds9921_dd_set_main_ctrl(client, APDS9921_DD_PRX_EN | APDS9921_DD_ALS_EN);
+		if (rc < 0)
+			goto out;
+	}
+	rate = i2c_smbus_read_byte_data(client, APDS9921_DD_PRX_MEAS_RATE_ADDR);
+	if (rate < 0) {
+		rc = rate;
+		goto out;
+	}
+	can_changed = true;
+	rc = apds9921_dd_set_prx_can(client, 0);
+	if (rc < 0)
+		goto restore;
+	rate_changed = true;
+	rc = apds9921_dd_set_prx_meas_rate(client,
+		0x40 | APDS9921_DD_PRX_DEFAULT_RES | APDS9921_DD_PRX_DEFAULT_MEAS_RATE);
+	if (rc < 0)
+		goto restore;
+	for (i = 0; i < APDS9921_PS_CAL_LOOP; i++) {
+		msleep(70);
+		sample = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
+		if (sample < 0) {
+			rc = sample;
+			goto restore;
 		}
+		total += sample;
 	}
-
-	apds9921_dd_set_prx_can(client, 0);
-	msleep(10);
-
-	ps_meas_rate = i2c_smbus_read_byte_data(client, APDS9921_DD_PRX_MEAS_RATE_ADDR);
-	if (ps_meas_rate < 0)
-		return -4;
-
-	apds9921_dd_set_prx_meas_rate(client, 0x40|APDS9921_DD_PRX_DEFAULT_RES|APDS9921_DD_PRX_DEFAULT_MEAS_RATE);
-
-	for (i=0; i<APDS9921_PS_CAL_LOOP; i++) {
-		mdelay(70); // must be greater than prx meas rate
-		ps_data += i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
-	}
-
-	apds9921_dd_set_prx_meas_rate(client, ps_meas_rate);
-
-	ps_data = ps_data/i;
-	printk(KERN_ERR"APDS9921_PS_CAL pdata = %d\n", ps_data);
-
-	if ((ps_data <= APDS9921_PS_CAL_CROSSTALK_HIGH) &&  // don't adjust if within
-			(ps_data >= APDS9921_PS_CAL_CROSSTALK_LOW))
-	{
-		printk(KERN_ERR"ps_data = %d, no need to adjust.\n", ps_data);
-
-		data->ps_offset = 0;
-
-		return 0;
-	}
-	else if (ps_data > APDS9921_PS_CAL_CROSSTALK_HIGH)
-	{
-		if (ps_data <= 900)
-		{
-			data->ps_offset = ps_data - APDS9921_PS_CAL_CROSSTALK_HIGH;
-			apds9921_dd_set_prx_can(client, data->ps_offset);
-
-			printk(KERN_ERR"APDS9921_PS_CAL ps_offset = %d\n", data->ps_offset);
+	sample = total / APDS9921_PS_CAL_LOOP;
+	if (sample >= APDS9921_PS_CAL_CROSSTALK_LOW &&
+	    sample <= APDS9921_PS_CAL_CROSSTALK_HIGH)
+		offset = 0;
+	else if (sample > APDS9921_PS_CAL_CROSSTALK_HIGH) {
+		if (sample > 900) {
+			rc = -ERANGE;
+			goto restore;
 		}
-		else
-		{
-			printk(KERN_ERR"ps_data = %d, something over p_sensor.\n", data->ps_data);
-
-			return -1;
-		}
+		offset = sample - APDS9921_PS_CAL_CROSSTALK_HIGH;
 	}
-
-	if ((data->enable_als_sensor == 0) &&(data->enable_ps_sensor == 0) && (data->power_on))
-	{
-		apds9921_dd_set_main_ctrl(client, 0);
-		data->power_on(false);
+	rc = apds9921_dd_set_prx_can(client, offset);
+	if (!rc)
+		data->ps_offset = offset;
+restore:
+	if (rc < 0 && can_changed)
+		apds9921_dd_set_prx_can(client, old_offset);
+	if (rate_changed) {
+		cleanup_rc = apds9921_dd_set_prx_meas_rate(client, rate);
+		if (!rc)
+			rc = cleanup_rc;
 	}
-
-	return data->ps_offset;
+out:
+	if (own_prx && !data->enable_ps_sensor) {
+		cleanup_rc = apds9921_dd_set_main_ctrl(client,
+			data->enable_als_sensor ? APDS9921_DD_ALS_EN : 0);
+		if (!rc)
+			rc = cleanup_rc;
+	}
+	if (own_power && !data->enable_als_sensor && !data->enable_ps_sensor && data->power_on) {
+		cleanup_rc = data->power_on(false);
+		if (!rc)
+			rc = cleanup_rc;
+	}
+	if (rc < 0)
+		dev_err_ratelimited(&client->dev, "proximity calibration failed: %d\n", rc);
+	return rc < 0 ? rc : data->ps_offset;
 }
 
 static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
@@ -1499,67 +1511,53 @@ static int apds_parse_dt(struct device *dev, struct apds9921_data *data)
 #ifdef APDS9921_ALSPS_DYNAMIC_THRESHOLD
 static void sample_work_func(struct work_struct *work)
 {
-	struct apds9921_data *data;
-	struct i2c_client *client;
-	int i, rc;
-	uint16_t ps, als;
+	struct i2c_client *client = apds9921_i2c_client;
+	struct apds9921_data *data = pdev_data;
+	int i, rc = 0, ps, als;
+	bool own_power, own_prx = false;
 
-	printk("%s ps rboot sample start\n", __func__);
-
-	if (apds9921_i2c_client != NULL)
-		client = apds9921_i2c_client;
-	else{
-		printk(KERN_EMERG"%s:apds9921: sample fail because of global pointer is NULL\n",__func__);
+	if (!client || !data)
 		return;
-	}
-
-	data = pdev_data;
-	if (data == NULL)
-		return;
-
-	if ((data->enable_als_sensor == 0) &&(data->enable_ps_sensor == 0))
-	{
-		/* Power on and initalize the device */
-		if (data->power_on)
-			data->power_on(true);
-
-		rc = apds9921_init_client(client);
-		if (rc) {
-			dev_err(&client->dev, "Failed to init apds993x\n");
-			return ;
+	own_power = !data->enable_als_sensor && !data->enable_ps_sensor;
+	if (own_power) {
+		if (data->power_on) {
+			rc = data->power_on(true);
+			if (rc < 0)
+				return;
 		}
+		rc = apds9921_init_client(client);
+		if (rc < 0)
+			goto out;
 	}
-
-	if (data->enable_ps_sensor==0) {
-		apds9921_dd_set_main_ctrl(client, 1);
+	if (!data->enable_ps_sensor) {
+		own_prx = true;
+		rc = apds9921_dd_set_main_ctrl(client, APDS9921_DD_PRX_EN | APDS9921_DD_ALS_EN);
+		if (rc < 0)
+			goto out;
 	}
-
 	msleep(10);
-
-	for (i = 0; i < 10; i++){
+	for (i = 0; i < 10; i++) {
 		als = i2c_smbus_read_word_data(client, APDS9921_DD_ALS_DATA_ADDR);
-		if (als < 8000){
-			ps = i2c_smbus_read_word_data(client,APDS9921_DD_PRX_DATA_ADDR) & 0x7FF;
-
-			pr_err("%s ps = %d \n", __func__, ps);
-
-			if( (ps != 0) &&((ps_min == 0) || (ps_min > ps)))
-				ps_min = ps;
+		if (als >= 0 && als < 8000) {
+			ps = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
+			if (ps >= 0) {
+				ps &= 0x7ff;
+				if (ps && (!ps_min || ps_min > ps))
+					ps_min = ps;
+			}
 		}
 		msleep(80);
 	}
-
 	if (ps_min > ps_adjust_max)
 		ps_min = 0;
-
-	if (data->enable_ps_sensor==0) {
-		apds9921_dd_set_main_ctrl(client, 0);
-	}
-
-	if ((data->enable_als_sensor == 0) && (data->enable_ps_sensor == 0) && (data->power_on))
+out:
+	if (rc < 0)
+		dev_err_ratelimited(&client->dev, "proximity startup sample failed: %d\n", rc);
+	if (own_prx && !data->enable_ps_sensor)
+		apds9921_dd_set_main_ctrl(client,
+			data->enable_als_sensor ? APDS9921_DD_ALS_EN : 0);
+	if (own_power && !data->enable_als_sensor && !data->enable_ps_sensor && data->power_on)
 		data->power_on(false);
-
-	pr_err("%s ps_min:%d \n", __func__,  ps_min);
 }
 #endif
 
