@@ -20,6 +20,8 @@
 #include <linux/regulator/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/string.h>
 #include <linux/of.h>
 #include <soc/qcom/clock-local2.h>
 #include <soc/qcom/clock-pll.h>
@@ -613,6 +615,90 @@ static struct rcg_clk gfx3d_clk_src = {
 		CLK_INIT(gfx3d_clk_src.c),
 	},
 };
+
+/* Off by default; change only the GPU clock vote while unprepared. */
+static DEFINE_MUTEX(a37_gpu_vote_lock);
+static bool a37_gpu_vote_ready;
+static bool a37_gpu_svs_310;
+
+static int a37_gpu_svs_set(const char *value, const struct kernel_param *kp)
+{
+	struct clk *c = &gfx3d_clk_src.c;
+	bool enabled;
+	int ret = strtobool(value, &enabled);
+
+	if (ret)
+		return ret;
+	mutex_lock(&a37_gpu_vote_lock);
+	if (!a37_gpu_vote_ready) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	mutex_lock(&c->prepare_lock);
+	if (enabled == a37_gpu_svs_310)
+		goto unlock;
+	if (c->prepare_count) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	if (c->vdd_class != &vdd_dig || c->num_fmax <= VDD_DIG_HIGH ||
+	    c->fmax[VDD_DIG_NOMINAL] != 310000000 ||
+	    c->fmax[VDD_DIG_HIGH] != 620000000 ||
+	    c->fmax[VDD_DIG_LOW] != (a37_gpu_svs_310 ? 310000000 : 200000000)) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	c->fmax[VDD_DIG_LOW] = enabled ? 310000000 : 200000000;
+	a37_gpu_svs_310 = enabled;
+unlock:
+	mutex_unlock(&c->prepare_lock);
+out:
+	mutex_unlock(&a37_gpu_vote_lock);
+	return ret;
+}
+
+static int a37_gpu_svs_get(char *buffer, const struct kernel_param *kp)
+{
+	int ret;
+
+	mutex_lock(&a37_gpu_vote_lock);
+	ret = scnprintf(buffer, PAGE_SIZE, "%u\n", a37_gpu_svs_310);
+	mutex_unlock(&a37_gpu_vote_lock);
+	return ret;
+}
+
+static int a37_gpu_vote_status(char *buffer, const struct kernel_param *kp)
+{
+	struct clk *c = &gfx3d_clk_src.c;
+	int ret;
+
+	mutex_lock(&a37_gpu_vote_lock);
+	if (!a37_gpu_vote_ready) {
+		ret = scnprintf(buffer, PAGE_SIZE, "ready=0\n");
+		goto out;
+	}
+	mutex_lock(&c->prepare_lock);
+	mutex_lock(&c->vdd_class->lock);
+	ret = scnprintf(buffer, PAGE_SIZE,
+		"trial=%u prepared=%u rate=%lu gpu_level=%d shared_level=%lu\n",
+		a37_gpu_svs_310, (unsigned int)c->prepare_count, c->rate,
+		find_vdd_level(c, c->rate), c->vdd_class->cur_level);
+	mutex_unlock(&c->vdd_class->lock);
+	mutex_unlock(&c->prepare_lock);
+out:
+	mutex_unlock(&a37_gpu_vote_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops a37_gpu_svs_ops = {
+	.set = a37_gpu_svs_set,
+	.get = a37_gpu_svs_get,
+};
+static const struct kernel_param_ops a37_gpu_status_ops = {
+	.get = a37_gpu_vote_status,
+};
+module_param_cb(gpu_svs_310, &a37_gpu_svs_ops, NULL, 0600);
+module_param_cb(gpu_vote_status, &a37_gpu_status_ops, NULL, 0444);
 
 static struct clk_freq_tbl ftbl_gcc_blsp1_qup1_6_i2c_apps_clk[] = {
 	F(  19200000,	      xo,   1,	  0,	0),
@@ -2856,6 +2942,10 @@ static int msm_gcc_probe(struct platform_device *pdev)
 
 	clk_set_rate(&apss_ahb_clk_src.c, 19200000);
 	clk_prepare_enable(&apss_ahb_clk_src.c);
+
+	mutex_lock(&a37_gpu_vote_lock);
+	a37_gpu_vote_ready = true;
+	mutex_unlock(&a37_gpu_vote_lock);
 
 	dev_info(&pdev->dev, "Registered GCC clocks\n");
 
