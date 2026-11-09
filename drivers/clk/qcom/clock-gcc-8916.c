@@ -2850,6 +2850,10 @@ static void gcc_gfx3d_fmax(struct platform_device *pdev)
 {
 	pr_info("%s: Forcing 465 MHz GPU (overclock)\n", __func__);
 
+	a37_gpu_svs_310 = of_property_read_bool(pdev->dev.of_node,
+					      "qcom,a37-gpu-svs-310");
+	if (a37_gpu_svs_310)
+		gfx3d_clk_src.c.fmax[VDD_DIG_LOW] = 310000000;
 	gfx3d_clk_src.c.fmax[VDD_DIG_HIGH] = 620000000;
 	gfx3d_clk_src.freq_tbl = ftbl_gcc_oxili_gfx3d_465_clk;
 }

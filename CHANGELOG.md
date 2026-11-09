@@ -2,6 +2,10 @@
 
 ## Development
 
+### E014: GPU SVS Trial (2026-11-09)
+
+- Board opt-in retains the unplugged310MHz lower-vote trial; keep620MHz HIGH and other clients/rail tables unchanged.
+
 ### E014: Clock Failure Reporting (2026-11-09)
 
 - Keep the original mux/rate failure through rollback; do not report success or cache an unapplied frequency.

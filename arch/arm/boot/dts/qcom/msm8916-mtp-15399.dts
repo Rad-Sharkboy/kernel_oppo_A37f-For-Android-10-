@@ -24,3 +24,7 @@
 	qcom,board-id = <8 0 15399>;
 };
 
+
+&clock_gcc {
+	qcom,a37-gpu-svs-310;
+};
