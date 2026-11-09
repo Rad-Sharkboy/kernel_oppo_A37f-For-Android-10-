@@ -2,6 +2,10 @@
 
 ## Development
 
+### E013: Reclaim Selection (2026-11-09)
+
+- Keep the largest eligible anonymous sets with a cached minimum; sort once, with valid equal-size comparison.
+
 ### E013: Read Ahead Convergence (2026-11-09)
 
 - One per-queue path converges every50ms; retain pressure targets and idle256/1024KiB caps.

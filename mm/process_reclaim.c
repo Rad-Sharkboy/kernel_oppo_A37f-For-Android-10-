@@ -77,15 +77,22 @@ struct selected_task {
 	short oom_score_adj;
 };
 
-int selected_cmp(const void *a, const void *b)
+static int selected_cmp(const void *a, const void *b)
 {
 	const struct selected_task *x = a;
 	const struct selected_task *y = b;
-	int ret;
 
-	ret = x->tasksize < y->tasksize ? -1 : 1;
+	return (x->tasksize > y->tasksize) - (x->tasksize < y->tasksize);
+}
 
-	return ret;
+static int selected_smallest(struct selected_task *tasks, int count)
+{
+	int i, smallest = 0;
+
+	for (i = 1; i < count; i++)
+		if (tasks[i].tasksize < tasks[smallest].tasksize)
+			smallest = i;
+	return smallest;
 }
 
 static int test_task_flag(struct task_struct *p, int flag)
@@ -114,7 +121,7 @@ static void swap_fn(struct work_struct *work)
 
 	/* Pick the best MAX_SWAP_TASKS tasks in terms of anon size */
 	struct selected_task selected[MAX_SWAP_TASKS] = {{0, 0, 0},};
-	int si = 0;
+	int si = 0, smallest = 0;
 	int i;
 	int tasksize;
 	int total_sz = 0;
@@ -151,21 +158,23 @@ static void swap_fn(struct work_struct *work)
 			continue;
 
 		if (si == MAX_SWAP_TASKS) {
-			sort(&selected[0], MAX_SWAP_TASKS,
-					sizeof(struct selected_task),
-					&selected_cmp, NULL);
-			if (tasksize < selected[0].tasksize)
+			if (tasksize <= selected[smallest].tasksize)
 				continue;
-			selected[0].p = p;
-			selected[0].oom_score_adj = oom_score_adj;
-			selected[0].tasksize = tasksize;
+			selected[smallest].p = p;
+			selected[smallest].oom_score_adj = oom_score_adj;
+			selected[smallest].tasksize = tasksize;
+			smallest = selected_smallest(selected, si);
 		} else {
 			selected[si].p = p;
 			selected[si].oom_score_adj = oom_score_adj;
 			selected[si].tasksize = tasksize;
+			if (tasksize < selected[smallest].tasksize)
+				smallest = si;
 			si++;
 		}
 	}
+
+	sort(selected, si, sizeof(*selected), selected_cmp, NULL);
 
 	for (i = 0; i < si; i++)
 		total_sz += selected[i].tasksize;
