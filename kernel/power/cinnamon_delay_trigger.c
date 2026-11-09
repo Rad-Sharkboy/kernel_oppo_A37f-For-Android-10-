@@ -424,18 +424,6 @@ static void cinnamon_execute_command_3(void)
 		cinnamon_apply_usb_gadget();
 	}
 
-	/* Step 7: LMK tuning for 2GB RAM */
-	{
-		msleep(50);
-		if (cinnamon_file_exists("/sys/module/lowmemorykiller/parameters/minfree")) {
-			cinnamon_write_path("/sys/module/lowmemorykiller/parameters/minfree",
-				"7168,8192,11776,15360,18944,22528");
-			msleep(10);
-			cinnamon_write_path("/sys/module/lowmemorykiller/parameters/adj",
-				"0,100,200,300,528,900");
-		}
-	}
-
 	/* Step 8: TCP Westwood+ for lower wireless latency */
 	{
 		msleep(25);
