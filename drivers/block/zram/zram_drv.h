@@ -68,6 +68,7 @@ enum zram_pageflags {
 	/* Page consists entirely of zeros */
 	ZRAM_ZERO = ZRAM_FLAG_SHIFT,
 	ZRAM_ACCESS,	/* page is now accessed */
+	ZRAM_SAME,	/* nonzero uniform page; handle stores its word */
 
 	__NR_ZRAM_PAGEFLAGS,
 };
@@ -90,6 +91,7 @@ struct zram_stats {
 	atomic64_t invalid_io;	/* non-page-aligned I/O requests */
 	atomic64_t notify_free;	/* no. of swap slot free notifications */
 	atomic64_t zero_pages;		/* no. of zero filled pages */
+	atomic64_t same_pages;		/* all uniform pages, including zero */
 	atomic64_t pages_stored;	/* no. of pages currently stored */
 	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
 };

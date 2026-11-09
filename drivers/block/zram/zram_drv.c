@@ -356,7 +356,7 @@ static void zram_meta_free(struct zram_meta *meta, u64 disksize)
 	for (index = 0; index < num_pages; index++) {
 		unsigned long handle = meta->table[index].handle;
 
-		if (!handle)
+		if (!handle || zram_test_flag(meta, index, ZRAM_SAME))
 			continue;
 
 		zs_free(meta->mem_pool, handle);
@@ -417,19 +417,27 @@ static void update_position(u32 *index, int *offset, struct bio_vec *bvec)
 	*offset = (*offset + bvec->bv_len) % PAGE_SIZE;
 }
 
-static int page_zero_filled(void *ptr)
+static int page_same_filled(void *ptr, unsigned long *element)
 {
 	unsigned int pos;
-	unsigned long *page;
+	unsigned long *page = ptr;
+	unsigned long value = page[0];
 
-	page = (unsigned long *)ptr;
-
-	for (pos = 0; pos != PAGE_SIZE / sizeof(*page); pos++) {
-		if (page[pos])
+	for (pos = 1; pos != PAGE_SIZE / sizeof(*page); pos++)
+		if (page[pos] != value)
 			return 0;
-	}
 
+	*element = value;
 	return 1;
+}
+
+static void zram_fill_page(void *ptr, unsigned long element)
+{
+	unsigned int pos;
+	unsigned long *page = ptr;
+
+	for (pos = 0; pos != PAGE_SIZE / sizeof(*page); pos++)
+		page[pos] = element;
 }
 
 static void handle_zero_page(struct bio_vec *bvec)
@@ -458,6 +466,14 @@ static void zram_free_page(struct zram *zram, size_t index)
 	struct zram_meta *meta = zram->meta;
 	unsigned long handle = meta->table[index].handle;
 
+	if (zram_test_flag(meta, index, ZRAM_SAME)) {
+		zram_clear_flag(meta, index, ZRAM_SAME);
+		meta->table[index].handle = 0;
+		atomic64_dec(&zram->stats.same_pages);
+		atomic64_dec(&zram->stats.pages_stored);
+		return;
+	}
+
 	if (unlikely(!handle)) {
 		/*
 		 * No memory is allocated for zero filled pages.
@@ -466,6 +482,7 @@ static void zram_free_page(struct zram *zram, size_t index)
 		if (zram_test_flag(meta, index, ZRAM_ZERO)) {
 			zram_clear_flag(meta, index, ZRAM_ZERO);
 			atomic64_dec(&zram->stats.zero_pages);
+			atomic64_dec(&zram->stats.same_pages);
 		}
 		return;
 	}
@@ -491,6 +508,12 @@ static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
 	bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
 	handle = meta->table[index].handle;
 	size = zram_get_obj_size(meta, index);
+
+	if (zram_test_flag(meta, index, ZRAM_SAME)) {
+		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+		zram_fill_page(mem, handle);
+		return 0;
+	}
 
 	if (!handle || zram_test_flag(meta, index, ZRAM_ZERO)) {
 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
@@ -585,7 +608,7 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 {
 	int ret = 0;
 	size_t clen;
-	unsigned long handle;
+	unsigned long handle, element = 0;
 	struct page *page;
 	unsigned char *user_mem, *cmem, *src, *uncmem = NULL;
 	struct zram_meta *meta = zram->meta;
@@ -622,16 +645,22 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 		uncmem = user_mem;
 	}
 
-	if (page_zero_filled(uncmem)) {
+	if (page_same_filled(uncmem, &element)) {
 		if (user_mem)
 			kunmap_atomic(user_mem);
 		/* Free memory associated with this sector now. */
 		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
 		zram_free_page(zram, index);
-		zram_set_flag(meta, index, ZRAM_ZERO);
+		if (element) {
+			meta->table[index].handle = element;
+			zram_set_flag(meta, index, ZRAM_SAME);
+			atomic64_inc(&zram->stats.pages_stored);
+		} else {
+			zram_set_flag(meta, index, ZRAM_ZERO);
+			atomic64_inc(&zram->stats.zero_pages);
+		}
+		atomic64_inc(&zram->stats.same_pages);
 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
-
-		atomic64_inc(&zram->stats.zero_pages);
 		ret = 0;
 		goto out;
 	}
@@ -1079,6 +1108,20 @@ static ssize_t mm_stat_show(struct device *dev,
 	return ret;
 }
 
+static ssize_t same_pages_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+	ssize_t ret;
+
+	down_read(&zram->init_lock);
+	ret = scnprintf(buf, PAGE_SIZE, "%llu\n",
+		(u64)atomic64_read(&zram->stats.same_pages));
+	up_read(&zram->init_lock);
+	return ret;
+}
+
+static DEVICE_ATTR_RO(same_pages);
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);
 ZRAM_ATTR_RO(num_reads);
@@ -1102,6 +1145,7 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_invalid_io.attr,
 	&dev_attr_notify_free.attr,
 	&dev_attr_zero_pages.attr,
+	&dev_attr_same_pages.attr,
 	&dev_attr_orig_data_size.attr,
 	&dev_attr_compr_data_size.attr,
 	&dev_attr_mem_used_total.attr,

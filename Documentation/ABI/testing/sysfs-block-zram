@@ -166,3 +166,10 @@ Description:
 		The mm_stat file is read-only and represents device's mm
 		statistics (orig_data_size, compr_data_size, etc.) in a format
 		similar to block layer statistics file format.
+
+What:           /sys/block/zram<id>/same_pages
+Date:           November 2026
+Description:
+                Number of uniform machine-word pages, including zero pages.
+                These pages use no compressed-pool allocation. zero_pages and
+                the existing mm_stat fields retain their previous meanings.
