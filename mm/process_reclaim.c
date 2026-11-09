@@ -191,6 +191,19 @@ static void swap_fn(struct work_struct *work)
 	rcu_read_unlock();
 
 	while (si--) {
+		tsk = selected[si].p;
+		/* App state may have changed since selection. */
+		task_lock(tsk);
+		if (!tsk->mm || (tsk->flags & PF_EXITING) ||
+		    test_tsk_thread_flag(tsk, TIF_MEMDIE)) {
+			task_unlock(tsk);
+			goto next_task;
+		}
+		selected[si].oom_score_adj = tsk->signal->oom_score_adj;
+		task_unlock(tsk);
+		if (selected[si].oom_score_adj < min_score_adj)
+			goto next_task;
+
 		nr_to_reclaim =
 			(selected[si].tasksize * per_swap_size) / total_sz;
 		/* scan atleast a page */
@@ -205,6 +218,7 @@ static void swap_fn(struct work_struct *work)
 				nr_to_reclaim);
 		total_scan += rp.nr_scanned;
 		total_reclaimed += rp.nr_reclaimed;
+next_task:
 		put_task_struct(selected[si].p);
 	}
 
