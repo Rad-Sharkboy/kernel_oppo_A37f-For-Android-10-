@@ -668,7 +668,7 @@ static int lis3dh_acc_device_power_on(struct lis3dh_acc_data *acc)
 
 	if (!acc->hw_initialized) {
 		err = lis3dh_acc_hw_init(acc);
-		if (acc->hw_working == 1 && err < 0) {
+		if (err < 0) {
 			lis3dh_acc_set_regulator(acc, false);
 			return err;
 		}
@@ -1188,13 +1188,13 @@ static int lis3dh_acc_enable(struct lis3dh_acc_data *acc)
 		err = lis3dh_acc_device_power_on(acc);
 		if (err < 0) {
 			atomic_set(&acc->enabled, 0);
-			return err;
+			goto err_pin_sleep;
 		}
 		err = lis3dh_acc_update_odr(acc, acc->delay_ms);
 		if (err) {
 			atomic_set(&acc->enabled, 0);
 			dev_err(&acc->client->dev, "update_odr err=%d\n", err);
-			return err;
+			goto err_power_off;
 		}
 		if (!acc->pdata->enable_int && !acc->use_batch) {
 			queue_delayed_work(acc->data_wq, &acc->input_work,
@@ -1207,7 +1207,7 @@ static int lis3dh_acc_enable(struct lis3dh_acc_data *acc)
 				atomic_set(&acc->enabled, 0);
 				dev_err(&acc->client->dev,
 					"enable batch err=%d\n", err);
-				return err;
+				goto err_power_off;
 			}
 		} else {
 			err = lis3dh_enable_DRDY_int(acc);
@@ -1215,12 +1215,19 @@ static int lis3dh_acc_enable(struct lis3dh_acc_data *acc)
 				atomic_set(&acc->enabled, 0);
 				dev_err(&acc->client->dev,
 					"enable interrupt err=%d\n", err);
-				return err;
+				goto err_power_off;
 			}
 		}
 	}
 
 	return 0;
+
+err_power_off:
+	lis3dh_acc_device_power_off(acc);
+err_pin_sleep:
+	if (pinctrl_select_state(acc->pinctrl, acc->pin_sleep))
+		dev_err(&acc->client->dev, "can't select pinctrl sleep state\n");
+	return err;
 }
 
 static int lis3dh_acc_disable(struct lis3dh_acc_data *acc)
