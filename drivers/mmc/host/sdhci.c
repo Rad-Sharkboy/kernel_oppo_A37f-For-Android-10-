@@ -1536,18 +1536,13 @@ static int sdhci_set_power(struct sdhci_host *host, unsigned short power)
 	return power;
 }
 
-static void sdhci_pm_qos_remove_work(struct work_struct *work)
+static void sdhci_pm_qos_unvote(struct sdhci_host *host)
 {
-	struct sdhci_host *host = container_of(work, struct sdhci_host,
-						pm_qos_work.work);
 	struct sdhci_host_qos *host_qos = host->host_qos;
 	int vote;
 
-	if (unlikely(host->last_qos_policy == -EINVAL)) {
-		WARN_ONCE(1, "Invalid qos policy (%d)\n",
-				host->last_qos_policy);
+	if (host->last_qos_policy == -EINVAL)
 		return;
-	}
 	vote = host->last_qos_policy;
 	if (unlikely(!host_qos[vote].cpu_dma_latency_us))
 		return;
@@ -1557,6 +1552,14 @@ static void sdhci_pm_qos_remove_work(struct work_struct *work)
 				PM_QOS_DEFAULT_VALUE);
 
 	host->last_qos_policy = -EINVAL;
+}
+
+static void sdhci_pm_qos_remove_work(struct work_struct *work)
+{
+	struct sdhci_host *host = container_of(work, struct sdhci_host,
+						pm_qos_work.work);
+
+	sdhci_pm_qos_unvote(host);
 }
 
 static inline int sdhci_get_host_qos_index(struct mmc_host *mmc,
@@ -1763,6 +1766,7 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
 		mrq->cmd->error = -EIO;
 		if (mrq->data)
 			mrq->data->error = -EIO;
+		sdhci_pm_qos_unvote(host);
 		mmc_request_done(host->mmc, mrq);
 		sdhci_runtime_pm_put(host);
 		return;
@@ -2817,7 +2821,9 @@ static void sdhci_tasklet_finish(unsigned long param)
 		delay = host->pm_qos_timeout_us / 2;
 	else
 		delay = 2 * host->pm_qos_timeout_us;
-	schedule_delayed_work(&host->pm_qos_work, msecs_to_jiffies(delay));
+	if (host->last_qos_policy != -EINVAL)
+		schedule_delayed_work(&host->pm_qos_work,
+				      msecs_to_jiffies(delay));
 
 	mmc_request_done(host->mmc, mrq);
 	sdhci_runtime_pm_put(host);
@@ -4021,6 +4027,7 @@ int sdhci_add_host(struct sdhci_host *host)
 
 	setup_timer(&host->timer, sdhci_timeout_timer, (unsigned long)host);
 
+	host->last_qos_policy = -EINVAL;
 	INIT_DELAYED_WORK(&host->pm_qos_work, sdhci_pm_qos_remove_work);
 	if (host->version >= SDHCI_SPEC_300) {
 		init_waitqueue_head(&host->buf_ready_int);
@@ -4148,6 +4155,8 @@ void sdhci_remove_host(struct sdhci_host *host, int dead)
 
 	sdhci_update_power_policy(host, SDHCI_POWER_SAVE_MODE);
 	sdhci_disable_card_detection(host);
+	mmc_remove_host(host->mmc);
+	cancel_delayed_work_sync(&host->pm_qos_work);
 	if (host->host_qos[SDHCI_QOS_READ_WRITE].cpu_dma_latency_us) {
 		if (host->host_use_default_qos)
 			pm_qos_remove_request(
@@ -4159,7 +4168,6 @@ void sdhci_remove_host(struct sdhci_host *host, int dead)
 			&(host->host_qos[SDHCI_QOS_WRITE].pm_qos_req_dma));
 		}
 	}
-	mmc_remove_host(host->mmc);
 
 #ifdef SDHCI_USE_LEDS_CLASS
 	if (!(host->quirks2 & SDHCI_QUIRK2_BROKEN_LED_CONTROL))
