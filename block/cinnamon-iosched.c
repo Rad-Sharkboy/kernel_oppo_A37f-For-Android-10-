@@ -84,6 +84,7 @@ struct cinnamon_data {
 	/* Pressure & read-ahead */
 	int pressure;
 	int last_ra_pressure;
+	unsigned long last_ra_update;
 	unsigned long last_pressure_change_jiffies;
 	unsigned long last_manual_param_change_jiffies;
 
@@ -188,40 +189,35 @@ static void cinnamon_clamp_for_emmc(struct cinnamon_data *cd)
 				    EMMC_MAX_PRESSURE_THRES);
 }
 
-/* Update read-ahead based on global pressure with smoothing */
+/* Queue-locked, rate-limited convergence; no idle worker. */
 static void cinnamon_update_ra(struct cinnamon_data *cd)
 {
-	int curr_press = cd->pressure;
-	if (curr_press != cd->last_ra_pressure) {
-		unsigned int ra_kb;
-		unsigned long target_ra_pages;
-		unsigned long current_ra = cd->q->backing_dev_info.ra_pages;
+	unsigned long current_ra = cd->q->backing_dev_info.ra_pages;
+	unsigned long target, next;
+	unsigned int ra_kb;
 
-		switch (curr_press) {
-		case 3:
-			ra_kb = 128;
-			break;
-		case 2:
-			ra_kb = 512;
-			break;
-		case 1:
-			ra_kb = 1024;
-			break;
-		default:
-			ra_kb = 2048;
-			break;
-		}
-		target_ra_pages = ra_kb >> (PAGE_SHIFT - 10);
-
-		/* Smooth transition: adjust by at most 16 pages per step */
-		if (current_ra < target_ra_pages)
-			current_ra = min(current_ra + 16, target_ra_pages);
-		else if (current_ra > target_ra_pages)
-			current_ra = max(current_ra - 16, target_ra_pages);
-
-		cd->q->backing_dev_info.ra_pages = current_ra;
-		cd->last_ra_pressure = curr_press;
+	if (cd->last_ra_pressure >= 0 &&
+	    time_before(jiffies, cd->last_ra_update + msecs_to_jiffies(50)))
+		return;
+	switch (cd->pressure) {
+	case 3: ra_kb = 128; break;
+	case 2: ra_kb = 512; break;
+	case 1: ra_kb = 1024; break;
+	default:
+		ra_kb = cd->predicted_sector && cd->last_read_direction ? 1024 : 256;
+		break;
 	}
+	target = ra_kb >> (PAGE_SHIFT - 10);
+	if (current_ra < target)
+		next = current_ra + min(16UL, target - current_ra);
+	else if (current_ra > target)
+		next = current_ra - min(16UL, current_ra - target);
+	else
+		next = current_ra;
+	if (next != current_ra)
+		cd->q->backing_dev_info.ra_pages = next;
+	cd->last_ra_pressure = cd->pressure;
+	cd->last_ra_update = jiffies;
 }
 
 /* Queue lock protects pressure and saved parameters. */
@@ -255,7 +251,6 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 		cd->write_expire_ms = cd->saved_write_expire_ms;
 	}
 	cinnamon_clamp_for_emmc(cd);
-	cinnamon_update_ra(cd);
 }
 
 static int cinnamon_predict_history(sector_t *history, int index,
@@ -537,6 +532,7 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 		cinnamon_clamp_for_emmc(cd);
 	}
 	read_batch = cd->read_batch;
+	cinnamon_update_ra(cd);
 
 	/* Dynamic expiration based on pressure and queue depth */
 	if (unlikely(pressure == 3))
@@ -672,20 +668,6 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	if ((cd->empty_dispatch_count % 100) == 0)
 		cinnamon_adjust_params(cd);
 
-	/* Idle read-ahead adjustments */
-	if ((cd->empty_dispatch_count % 50) == 0) {
-		if (cd->predicted_sector != 0 &&
-		    cd->queue_counts[PRIO_READ_FG] == 0 &&
-		    cd->queue_counts[PRIO_READ_BG] == 0) {
-			unsigned long current_ra = cd->q->backing_dev_info.ra_pages;
-			unsigned long max_ra = min(current_ra * 2, 256UL);
-			unsigned long new_ra = clamp(current_ra + 16, 16UL, max_ra);
-			if (cd->last_read_direction != 0)
-				cd->q->backing_dev_info.ra_pages = new_ra;
-		} else if (cd->q->backing_dev_info.ra_pages > 64) {
-			cd->q->backing_dev_info.ra_pages = 64;
-		}
-	}
 	return 0;
 
 dispatch:

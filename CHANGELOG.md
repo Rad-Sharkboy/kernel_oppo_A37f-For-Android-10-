@@ -2,6 +2,10 @@
 
 ## Development
 
+### E013: Read Ahead Convergence (2026-11-09)
+
+- One per-queue path converges every50ms; retain pressure targets and idle256/1024KiB caps.
+
 ### E013: Read Batch Recovery (2026-11-09)
 
 - Refresh the local batch after starvation recovery restores queue settings.
