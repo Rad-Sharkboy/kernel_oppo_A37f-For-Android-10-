@@ -748,7 +748,7 @@ static int mux_div_clk_set_rate(struct clk *c, unsigned long rate)
 	unsigned long new_prate, old_prate;
 	struct clk *old_parent, *new_parent;
 	u32 new_div, old_div;
-	int rc;
+	int rc, restore_rc;
 
 	rc = safe_parent_init_once(c);
 	if (rc)
@@ -803,12 +803,12 @@ err_set_src_div:
 	/* Not switching to new_parent, so disable it */
 	__clk_post_reparent(c, new_parent, &flags);
 err_pre_reparent:
-	rc = clk_set_rate(old_parent, old_prate);
-	WARN(rc, "%s: error changing parent (%s) rate to %ld\n",
+	restore_rc = clk_set_rate(old_parent, old_prate);
+	WARN(restore_rc, "%s: error changing parent (%s) rate to %ld\n",
 		clk_name(c), clk_name(old_parent), old_prate);
 err_set_rate:
-	rc = set_src_div(md, old_parent, old_div);
-	WARN(rc, "%s: error changing back to original div (%d) and parent (%s)\n",
+	restore_rc = set_src_div(md, old_parent, old_div);
+	WARN(restore_rc, "%s: error changing back to original div (%d) and parent (%s)\n",
 		clk_name(c), old_div, clk_name(old_parent));
 
 	return rc;

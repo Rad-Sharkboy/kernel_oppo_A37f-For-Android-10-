@@ -2,6 +2,10 @@
 
 ## Development
 
+### E014: Clock Failure Reporting (2026-11-09)
+
+- Keep the original mux/rate failure through rollback; do not report success or cache an unapplied frequency.
+
 ### E013: CPU Policy Ownership (2026-11-09)
 
 - Remove only delayed CPU governor writers; ROM init and native Power HAL own them. Keep I/O, VM, USB and other startup work.
