@@ -782,7 +782,7 @@ static int synaptics_enable_interrupt_for_gesture(struct synaptics_ts_data *ts, 
 	} else {
 		status_int = (ret & 0xF8) | 0x00;//report mode 0
 	}
-	printk("%s:status_int = 0x%x\n", __func__, status_int);
+	TPD_DEBUG("%s:status_int = 0x%x\n", __func__, status_int);
 
 	ret = i2c_smbus_write_byte_data(ts->client, F11_2D_CTRL00, status_int);
 	if(ret < 0) {
@@ -847,7 +847,7 @@ static int synaptics_glove_mode_enable(struct synaptics_ts_data *ts)
 			TPD_DEBUG("i2c_smbus_write_byte_data failed for page select\n");
 			goto GLOVE_ENABLE_END;
 		}
-		printk("glove mode disable\n");
+		TPD_DEBUG("glove mode disable\n");
 		ret = i2c_smbus_write_byte_data(ts->client, F51_CUSTOM_CTRL00,0x02 ); 
 		if (ret < 0) {
 			TPD_ERR("i2c_smbus_write_byte_data failed for mode select\n");
@@ -3371,7 +3371,7 @@ static int synaptics_ts_suspend(struct device *dev)
 {
 	int ret;
 	struct synaptics_ts_data *ts = dev_get_drvdata(dev);
-	TPDTM_DMESG("%s: is called\n", __func__);	
+	TPD_DEBUG("%s: is called\n", __func__);
 	
 	if(ts->input_dev == NULL) {
 		ret = -ENOMEM;
@@ -3457,7 +3457,7 @@ static void speedup_synaptics_resume(struct work_struct *work)
 {
 	int ret;
 	struct synaptics_ts_data *ts = ts_g;
-	TPD_ERR("%s is called\n", __func__);
+	TPD_DEBUG("%s is called\n", __func__);
 /***********report Up key when resume********/	
 	if(ts->input_dev == NULL) {
 		ret = -ENOMEM;
@@ -3522,7 +3522,7 @@ static void speedup_synaptics_resume(struct work_struct *work)
 		TPD_ERR("%s:can't  enable interrupt!\n", __func__);
 		goto ERR_RESUME;
 	}	
-    TPD_ERR("%s:normal end!\n", __func__);	
+	TPD_DEBUG("%s:normal end!\n", __func__);
 ERR_RESUME:
 	mutex_unlock(&ts->mutex);
 	return;
