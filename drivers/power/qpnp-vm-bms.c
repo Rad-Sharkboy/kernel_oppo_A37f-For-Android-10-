@@ -454,7 +454,7 @@ int opchg_backup_ocv_soc(int soc)
 	{
 		if(soc_temp != soc )
 		{
-			pr_err("%s is back soc=%d,last_ocv_uv=%d\n",__func__,soc,the_chip->last_ocv_uv);
+			pr_debug("%s is back soc=%d,last_ocv_uv=%d\n",__func__,soc,the_chip->last_ocv_uv);
 			soc_temp = soc;
 		}
 	}
