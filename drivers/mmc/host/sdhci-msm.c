@@ -2119,15 +2119,22 @@ static int sdhci_msm_vreg_enable(struct sdhci_msm_reg_data *vreg)
 		ret = sdhci_msm_vreg_set_voltage(vreg, vreg->high_vol_level,
 						vreg->high_vol_level);
 		if (ret)
-			return ret;
+			goto restore_load;
+
+		ret = regulator_enable(vreg->reg);
+		if (ret) {
+			pr_err("%s: regulator_enable(%s) failed. ret=%d\n",
+					__func__, vreg->name, ret);
+			sdhci_msm_vreg_set_voltage(vreg, 0,
+						vreg->high_vol_level);
+			goto restore_load;
+		}
+		vreg->is_enabled = true;
 	}
-	ret = regulator_enable(vreg->reg);
-	if (ret) {
-		pr_err("%s: regulator_enable(%s) failed. ret=%d\n",
-				__func__, vreg->name, ret);
-		return ret;
-	}
-	vreg->is_enabled = true;
+	return 0;
+
+restore_load:
+	sdhci_msm_vreg_set_optimum_mode(vreg, 0);
 	return ret;
 }
 
