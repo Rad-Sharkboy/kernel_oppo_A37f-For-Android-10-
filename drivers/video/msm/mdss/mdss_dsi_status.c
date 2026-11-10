@@ -215,6 +215,7 @@ int __init mdss_dsi_status_init(void)
 		return -ENOMEM;
 	}
 
+	INIT_DELAYED_WORK(&pstatus_data->check_status, check_dsi_ctrl_status);
 	pstatus_data->fb_notifier.notifier_call = fb_event_callback;
 
 	rc = fb_register_client(&pstatus_data->fb_notifier);
@@ -226,8 +227,6 @@ int __init mdss_dsi_status_init(void)
 	}
 
 	pr_info("%s: DSI status check interval:%d\n", __func__,	interval);
-
-	INIT_DELAYED_WORK(&pstatus_data->check_status, check_dsi_ctrl_status);
 
 	pr_debug("%s: DSI ctrl status work queue initialized\n", __func__);
 
