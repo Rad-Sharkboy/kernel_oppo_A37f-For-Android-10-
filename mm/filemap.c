@@ -9,6 +9,7 @@
  * most "normal" filesystems (but you don't /have/ to use this:
  * the NFS filesystem used to do this differently, for example)
  */
+#include <linux/workingset.h>
 #include <linux/export.h>
 #include <linux/compiler.h>
 #include <linux/fs.h>
@@ -503,8 +504,12 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 	int ret;
 
 	ret = add_to_page_cache(page, mapping, offset, gfp_mask);
-	if (ret == 0)
-		lru_cache_add_file(page);
+	if (ret == 0) {
+		if (workingset_refault(mapping, page))
+			lru_cache_add_lru(page, LRU_ACTIVE_FILE);
+		else
+			lru_cache_add_file(page);
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(add_to_page_cache_lru);

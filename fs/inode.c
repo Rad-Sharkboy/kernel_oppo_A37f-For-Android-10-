@@ -2,6 +2,7 @@
  * (C) 1997 Linus Torvalds
  * (C) 1999 Andrea Arcangeli <andrea@suse.de> (dynamic inode allocation)
  */
+#include <linux/workingset.h>
 #include <linux/export.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -168,6 +169,7 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	mapping->private_data = NULL;
 	mapping->backing_dev_info = &default_backing_dev_info;
 	mapping->writeback_index = 0;
+	workingset_forget(mapping);
 
 	/*
 	 * If the block_device provides a backing_dev_info for client
@@ -344,6 +346,7 @@ EXPORT_SYMBOL(inc_nlink);
 
 void address_space_init_once(struct address_space *mapping)
 {
+	workingset_forget(mapping);
 	memset(mapping, 0, sizeof(*mapping));
 	INIT_RADIX_TREE(&mapping->page_tree, GFP_ATOMIC);
 	spin_lock_init(&mapping->tree_lock);

@@ -13,6 +13,7 @@
  * Buffermem limits added 12.3.98, Rik van Riel.
  */
 
+#include <linux/workingset.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/kernel_stat.h>
@@ -435,6 +436,7 @@ static void __activate_page(struct page *page, struct lruvec *lruvec,
 		lru += LRU_ACTIVE;
 		add_page_to_lru_list(page, lruvec, lru);
 
+		workingset_activation(page);
 		__count_vm_event(PGACTIVATE);
 		update_page_reclaim_stat(lruvec, file, 1);
 	}

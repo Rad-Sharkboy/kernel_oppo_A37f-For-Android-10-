@@ -615,3 +615,12 @@ config PGTABLE_MAPPING
 
 	  You can check speed with zsmalloc benchmark[1].
 	  [1] https://github.com/spartacus06/zsmalloc
+
+config WORKINGSET_REFAULT
+	bool "Bounded file-cache refault tracking"
+	depends on MMU && !MEMCG && !MEMORY_HOTPLUG
+	help
+	  Protect clean file pages that are read back soon after reclaim.
+	  Fixed history uses roughly 620 KiB on ARM64 and retains no pages
+	  or inodes. Runtime control: workingset.enabled; counters are in
+	  /proc/workingset_refault. This is a cache-policy experiment.

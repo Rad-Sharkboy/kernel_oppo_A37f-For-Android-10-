@@ -7,6 +7,7 @@
  *		Initial version.
  */
 
+#include <linux/workingset.h>
 #include <linux/kernel.h>
 #include <linux/backing-dev.h>
 #include <linux/gfp.h>
@@ -213,8 +214,10 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	int i;
 
 	cleancache_invalidate_inode(mapping);
-	if (mapping->nrpages == 0)
+	if (mapping->nrpages == 0) {
+		workingset_forget(mapping);
 		return;
+	}
 
 	BUG_ON((lend & (PAGE_CACHE_SIZE - 1)) != (PAGE_CACHE_SIZE - 1));
 	end = (lend >> PAGE_CACHE_SHIFT);
@@ -292,6 +295,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 		index++;
 	}
 	cleancache_invalidate_inode(mapping);
+	workingset_forget(mapping);
 }
 EXPORT_SYMBOL(truncate_inode_pages_range);
 
