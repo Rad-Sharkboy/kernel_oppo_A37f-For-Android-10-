@@ -1368,7 +1368,7 @@ static void *cinnamon_create(void *dev_private)
 {
 	struct cinnamon_ctx *ctx;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kzalloc(sizeof(*ctx), GFP_NOIO);
 	if (!ctx)
 		return NULL;
 	return ctx;
