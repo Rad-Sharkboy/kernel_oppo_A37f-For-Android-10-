@@ -1582,7 +1582,7 @@ static inline int venus_hfi_power_off(struct venus_hfi_device *device)
 	rc = venus_hfi_halt_axi(device);
 	if (rc) {
 		dprintk(VIDC_WARN, "Failed to halt AXI\n");
-		return 0;
+		return rc;
 	}
 
 	dprintk(VIDC_DBG, "Entering power collapse\n");
@@ -1853,15 +1853,10 @@ static int venus_hfi_iface_cmdq_write_nolock(struct venus_hfi_device *device,
 
 		if (device->res->sw_power_collapsible) {
 			dprintk(VIDC_DBG,
-				"Cancel and queue delayed work again\n");
-			cancel_delayed_work(&venus_hfi_pm_work);
-			if (!queue_delayed_work(device->venus_pm_workq,
+				"Update power-collapse deadline\n");
+			mod_delayed_work(device->venus_pm_workq,
 				&venus_hfi_pm_work,
-				msecs_to_jiffies(
-				msm_vidc_pwr_collapse_delay))) {
-				dprintk(VIDC_DBG,
-				"PM work already scheduled\n");
-			}
+				msecs_to_jiffies(msm_vidc_pwr_collapse_delay));
 		}
 		result = 0;
 	} else {
@@ -3243,8 +3238,7 @@ skip_power_off:
 	* normal execution.
 	*/
 
-	/* Cancel pending delayed works if any */
-	cancel_delayed_work(&venus_hfi_pm_work);
+	/* Keep the deadline queued by activity that raced with collapse. */
 	dprintk(VIDC_WARN, "Power off skipped (0x%x, 0x%x)\n",
 		device->last_packet_type, ctrl_status);
 
@@ -3386,13 +3380,10 @@ static void venus_hfi_core_work_handler(struct work_struct *work)
 		return;
 	}
 	if (device->res->sw_power_collapsible) {
-		dprintk(VIDC_DBG, "Cancel and queue delayed work again.\n");
-		cancel_delayed_work(&venus_hfi_pm_work);
-		if (!queue_delayed_work(device->venus_pm_workq,
+		dprintk(VIDC_DBG, "Update power-collapse deadline.\n");
+		mod_delayed_work(device->venus_pm_workq,
 			&venus_hfi_pm_work,
-			msecs_to_jiffies(msm_vidc_pwr_collapse_delay))) {
-			dprintk(VIDC_DBG, "PM work already scheduled\n");
-		}
+			msecs_to_jiffies(msm_vidc_pwr_collapse_delay));
 	}
 	venus_hfi_core_clear_interrupt(device);
 	venus_hfi_response_handler(device);
@@ -4124,7 +4115,7 @@ static void venus_hfi_unload_fw(void *dev)
 	}
 	if (device->resources.fw.cookie) {
 		flush_workqueue(device->vidc_workq);
-		cancel_delayed_work(&venus_hfi_pm_work);
+		cancel_delayed_work_sync(&venus_hfi_pm_work);
 		flush_workqueue(device->venus_pm_workq);
 		subsystem_put(device->resources.fw.cookie);
 		venus_hfi_interface_queues_release(dev);
