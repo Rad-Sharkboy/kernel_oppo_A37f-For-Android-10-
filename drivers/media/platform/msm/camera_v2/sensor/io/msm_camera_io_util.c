@@ -158,12 +158,14 @@ int msm_cam_clk_enable(struct device *dev, struct msm_cam_clk_info *clk_info,
 			if (IS_ERR(clk_ptr[i])) {
 				pr_err("%s get failed\n", clk_info[i].clk_name);
 				rc = PTR_ERR(clk_ptr[i]);
+				clk_ptr[i] = NULL;
 				goto cam_clk_get_err;
 			}
 			if (clk_info[i].clk_rate > 0) {
 				clk_rate = clk_round_rate(clk_ptr[i],
 					clk_info[i].clk_rate);
 				if (clk_rate < 0) {
+					rc = clk_rate;
 					pr_err("%s round failed\n",
 						   clk_info[i].clk_name);
 					goto cam_clk_set_err;
@@ -182,6 +184,7 @@ int msm_cam_clk_enable(struct device *dev, struct msm_cam_clk_info *clk_info,
 					clk_rate =
 						  clk_round_rate(clk_ptr[i], 0);
 					if (clk_rate < 0) {
+						rc = clk_rate;
 						pr_err("%s round rate failed\n",
 							  clk_info[i].clk_name);
 						goto cam_clk_set_err;
@@ -223,6 +226,7 @@ int msm_cam_clk_enable(struct device *dev, struct msm_cam_clk_info *clk_info,
 				clk_disable(clk_ptr[i]);
 				clk_unprepare(clk_ptr[i]);
 				clk_put(clk_ptr[i]);
+				clk_ptr[i] = NULL;
 			}
 		}
 	}
@@ -234,12 +238,14 @@ cam_clk_enable_err:
 cam_clk_prepare_err:
 cam_clk_set_err:
 	clk_put(clk_ptr[i]);
+	clk_ptr[i] = NULL;
 cam_clk_get_err:
 	for (i--; i >= 0; i--) {
 		if (clk_ptr[i] != NULL) {
 			clk_disable(clk_ptr[i]);
 			clk_unprepare(clk_ptr[i]);
 			clk_put(clk_ptr[i]);
+			clk_ptr[i] = NULL;
 		}
 	}
 	return rc;
