@@ -677,6 +677,10 @@ int mdss_iommu_ctrl(int enable)
 		if (mdata->iommu_ref_cnt == 0) {
 			mdss_bus_scale_set_quota(MDSS_IOMMU_RT, SZ_1M, SZ_1M);
 			rc = mdss_iommu_attach(mdata);
+			if (rc) {
+				mdss_bus_scale_set_quota(MDSS_IOMMU_RT, 0, 0);
+				goto unlock;
+			}
 		}
 		mdata->iommu_ref_cnt++;
 	} else {
@@ -690,6 +694,8 @@ int mdss_iommu_ctrl(int enable)
 			pr_err("unbalanced iommu ref\n");
 		}
 	}
+
+unlock:
 	mutex_unlock(&mdp_iommu_lock);
 
 	if (IS_ERR_VALUE(rc))
@@ -979,7 +985,9 @@ static int mdss_iommu_attach(struct mdss_data_type *mdata)
 			WARN(1, "mdp::iommu device attach failed rc:%d\n", rc);
 			for (i--; i >= 0; i--) {
 				iomap = mdata->iommu_map + i;
-				iommu_detach_device(domain, iomap->ctx);
+				domain = msm_get_iommu_domain(iomap->domain_idx);
+				if (domain)
+					iommu_detach_device(domain, iomap->ctx);
 			}
 			goto end;
 		}
