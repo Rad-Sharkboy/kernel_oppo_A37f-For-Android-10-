@@ -640,7 +640,7 @@ static int apds9921_check_intr(struct i2c_client *client)
 		return main_status;
 	}
 
-	printk(KERN_ERR"%s , main_status = 0x%x\n",__func__, main_status);
+	printk_x(SHOW_LOG,"%s , main_status = 0x%x\n",__func__, main_status);
 
 	if((main_status == 0)||(main_status == 0x20))
 		apds9921_esd_handle(client,1);  // 1 means : intFlag err
@@ -650,7 +650,7 @@ static int apds9921_check_intr(struct i2c_client *client)
 	else
 		data->ps_detection = 1; // near
 
-	printk(KERN_ERR"%s , ps_detection = %d\n",__func__, data->ps_detection);
+	printk_x(SHOW_LOG,"%s , ps_detection = %d\n",__func__, data->ps_detection);
 
 	return main_status;
 }
@@ -679,7 +679,7 @@ static void apds9921_change_ps_threshold(struct i2c_client *client)
 		apds9921_report_abs_ts(data->input_dev_ps, ABS_DISTANCE, data->ps_detection ? 0 : 1);
 		wake_lock_timeout(&data->ps_wakelock, 2*HZ);
 
-		printk(KERN_ERR"%s:ps_data = %d, th_l = %d, th_h = %d, ps_interrutp_state is : %d %s\n",
+		printk_x(SHOW_LOG,"%s:ps_data = %d, th_l = %d, th_h = %d, ps_interrutp_state is : %d %s\n",
 				__func__,data->ps_data, data->pilt, data->piht,data->ps_detection, data->ps_detection?"near":"far");
 	}
 }
@@ -812,10 +812,10 @@ static int apds9921_enable_als_sensor(struct i2c_client *client, int val)
 	struct apds9921_data *data = i2c_get_clientdata(client);
 	int rc;
 
-	printk("%s: ( %d)\n", __func__, val);
+	printk_x(SHOW_LOG,"%s: ( %d)\n", __func__, val);
 
 	if ((val != APDS_DISABLE_ALS) && (val != APDS_ENABLE_ALS)) {
-		printk("%s: enable als sensor=%d\n", __func__, val);
+		printk_x(SHOW_LOG,"%s: enable als sensor=%d\n", __func__, val);
 		return -1;
 	}
 
@@ -849,7 +849,7 @@ static int apds9921_enable_als_sensor(struct i2c_client *client, int val)
 			data->enable_als_sensor = val;
 			if (data->enable_als_sensor == APDS_ENABLE_ALS) {
 
-				printk("%s: enable_als_sensor\n", __func__);
+				printk_x(SHOW_LOG,"%s: enable_als_sensor\n", __func__);
 
 				data->als_just_enable_flag = 1;
 
@@ -895,7 +895,7 @@ static int apds9921_set_als_poll_delay(struct i2c_client *client, unsigned int v
 {
 	struct apds9921_data *data = i2c_get_clientdata(client);
 
-	printk("%s : %d\n", __func__, val);
+	printk_x(SHOW_LOG,"%s : %d\n", __func__, val);
 
 	data->als_poll_delay = val;
 
@@ -994,7 +994,7 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 	int rc;
 	int init_client_time = 3;
 
-	printk(KERN_ERR"%s: ( %d)\n", __func__, val);
+	printk_x(SHOW_LOG,"%s: ( %d)\n", __func__, val);
 
 	if ((val != APDS_DISABLE_PS) && (val != APDS_ENABLE_PS)) {
 		printk("%s:invalid value=%d\n", __func__, val);
@@ -1068,7 +1068,7 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 			else
 				data->ps_detection = 0;
 
-			printk(KERN_ERR"%s:ps_data = %d, th_l = %d, th_h = %d, ps_original_state is : %d %s\n",
+			printk_x(SHOW_LOG,"%s:ps_data = %d, th_l = %d, th_h = %d, ps_original_state is : %d %s\n",
 					__func__,data->ps_data, data->pilt, data->piht,data->ps_detection, data->ps_detection?"near":"far");
 
 			apds9921_report_abs_ts(data->input_dev_ps, ABS_DISTANCE, data->ps_detection ? 0 : 1);
@@ -1161,7 +1161,7 @@ static ssize_t apds9921_store_proximity_enable(struct device *dev,
 	struct i2c_client *client = to_i2c_client(dev);
 	unsigned long val = simple_strtoul(buf, NULL, 10);
 
-	printk("%s: enable ps senosr ( %ld)\n", __func__, val);
+	printk_x(SHOW_LOG,"%s: enable ps senosr ( %ld)\n", __func__, val);
 
 	if ((val != APDS_DISABLE_PS) && (val != APDS_ENABLE_PS) ) {
 		printk("**%s:store invalid value=%ld\n", __func__, val);
@@ -1191,7 +1191,7 @@ static ssize_t apds9921_store_light_enable(struct device *dev,
 	struct i2c_client *client = to_i2c_client(dev);
 	unsigned long val = simple_strtoul(buf, NULL, 10);
 
-	printk("%s: enable als sensor ( %ld)\n", __func__, val);
+	printk_x(SHOW_LOG,"%s: enable als sensor ( %ld)\n", __func__, val);
 
 	if ((val != APDS_DISABLE_ALS) &&
 			(val != APDS_ENABLE_ALS)) {
@@ -1232,7 +1232,7 @@ static int apds9921_init_client(struct i2c_client *client)
 	int err;
 	int id;
 
-	printk(KERN_ERR"%s.\n", __func__);
+	printk_x(SHOW_LOG,"%s.\n", __func__);
 
 #if 0
 	{
@@ -1256,11 +1256,11 @@ static int apds9921_init_client(struct i2c_client *client)
 	id = i2c_smbus_read_byte_data(client, APDS9921_DD_PART_ID_ADDR);
 	if (id == 0xB1)
 	{
-		printk(KERN_EMERG"chip APDS-9921.\n");
+		printk_x(SHOW_LOG,"chip APDS-9921.\n");
 	}
 	else if (id == 0xB3)
 	{
-		printk(KERN_EMERG"chip APDS-9922.\n");
+		printk_x(SHOW_LOG,"chip APDS-9922.\n");
 	}
 	else {
 		printk(KERN_EMERG"Not chip APDS-9921 or APDS-9922.\n");
@@ -1324,7 +1324,7 @@ static int apds9921_sensor_regulator_configure(struct apds9921_data *data, bool 
 {
 	int rc;
 
-	printk(KERN_ERR"%s, on = %d\n", __func__, on);
+	printk_x(SHOW_LOG,"%s, on = %d\n", __func__, on);
 
 	if (!on) {
 		if (regulator_count_voltages(data->vdd) > 0)
@@ -1417,7 +1417,7 @@ static int apds9921_sensor_regulator_power_on(struct apds9921_data *data, bool o
 {
 	int rc = 0;
 
-	printk(KERN_ERR"%s, on = %d\n", __func__, on);
+	printk_x(SHOW_LOG,"%s, on = %d\n", __func__, on);
 
 	if (!on) {
 		rc = regulator_disable(data->vdd);
