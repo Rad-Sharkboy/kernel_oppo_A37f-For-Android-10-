@@ -609,8 +609,9 @@ int mdss_mdp_vsync_clk_enable(int enable)
 	pr_debug("clk enable=%d\n", enable);
 	mutex_lock(&mdp_clk_lock);
 	if (mdss_res->vsync_ena != enable) {
-		mdss_res->vsync_ena = enable;
 		ret = mdss_mdp_clk_update(MDSS_CLK_MDP_VSYNC, enable);
+		if (!ret)
+			mdss_res->vsync_ena = enable;
 	}
 	mutex_unlock(&mdp_clk_lock);
 	return ret;
