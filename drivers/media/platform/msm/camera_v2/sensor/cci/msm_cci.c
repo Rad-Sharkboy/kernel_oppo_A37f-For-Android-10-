@@ -766,6 +766,7 @@ static int32_t msm_cci_init(struct v4l2_subdev *sd,
 #endif
 	uint8_t i = 0;
 	int32_t rc = 0, ret = 0;
+	bool regulator_enabled = false;
 	struct cci_device *cci_dev;
 	enum cci_i2c_master_t master;
 
@@ -835,16 +836,16 @@ static int32_t msm_cci_init(struct v4l2_subdev *sd,
 	}
 	rc = msm_camera_request_gpio_table(cci_dev->cci_gpio_tbl,
 		cci_dev->cci_gpio_tbl_size, 1);
+	if (rc < 0) {
+		pr_err("%s: request gpio failed\n", __func__);
+		goto request_gpio_failed;
+	}
 	if (cci_dev->cci_pinctrl_status) {
 		ret = pinctrl_select_state(cci_dev->cci_pinctrl.pinctrl,
 				cci_dev->cci_pinctrl.gpio_state_active);
 		if (ret)
 			pr_err("%s:%d cannot set pin to active state\n",
 				__func__, __LINE__);
-	}
-	if (rc < 0) {
-		pr_err("%s: request gpio failed\n", __func__);
-		goto request_gpio_failed;
 	}
 	cci_dev->reg_ptr = regulator_get(&(cci_dev->pdev->dev),
 					 "qcom,gdscr-vdd");
@@ -858,6 +859,7 @@ static int32_t msm_cci_init(struct v4l2_subdev *sd,
 				__func__);
 			goto clk_enable_failed;
 		}
+		regulator_enabled = true;
 	}
 	rc = msm_cam_clk_enable(&cci_dev->pdev->dev, cci_clk_info,
 		cci_dev->cci_clk, cci_dev->num_clk, 1);
@@ -935,7 +937,8 @@ clk_enable_failed:
 		cci_dev->cci_gpio_tbl_size, 0);
 
 	if (!IS_ERR_OR_NULL(cci_dev->reg_ptr)) {
-		regulator_disable(cci_dev->reg_ptr);
+		if (regulator_enabled)
+			regulator_disable(cci_dev->reg_ptr);
 		regulator_put(cci_dev->reg_ptr);
 		cci_dev->reg_ptr = NULL;
 	}
