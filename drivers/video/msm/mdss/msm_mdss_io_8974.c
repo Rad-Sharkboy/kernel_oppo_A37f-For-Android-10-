@@ -1592,6 +1592,7 @@ int mdss_dsi_clk_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 	u8 clk_type, int enable)
 {
 	int rc = 0;
+	u32 bus_cnt, link_cnt, m_bus_cnt = 0, m_link_cnt = 0;
 	int link_changed = 0, bus_changed = 0;
 	int m_link_changed = 0, m_bus_changed = 0;
 	struct mdss_dsi_ctrl_pdata *mctrl = NULL;
@@ -1632,6 +1633,12 @@ int mdss_dsi_clk_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 		mctrl ? mctrl->link_clk_cnt : -1, enable);
 
 	mutex_lock(&dsi_clk_lock);
+	bus_cnt = ctrl->bus_clk_cnt;
+	link_cnt = ctrl->link_clk_cnt;
+	if (mctrl) {
+		m_bus_cnt = mctrl->bus_clk_cnt;
+		m_link_cnt = mctrl->link_clk_cnt;
+	}
 
 	if (clk_type & DSI_BUS_CLKS) {
 		bus_changed = __mdss_dsi_update_clk_cnt(&ctrl->bus_clk_cnt,
@@ -1659,12 +1666,14 @@ int mdss_dsi_clk_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 	if (link_changed && (!bus_changed && !ctrl->bus_clk_cnt)) {
 		pr_err("%s: Trying to enable link clks w/o enabling bus clks for ctrl%d",
 			__func__, ctrl->ndx);
+		rc = -EINVAL;
 		goto error_mctrl_bus_start;
 	}
 
 	if (m_link_changed && (!m_bus_changed && !mctrl->bus_clk_cnt)) {
 		pr_err("%s: Trying to enable link clks w/o enabling bus clks for ctrl%d",
 			__func__, ctrl->ndx);
+		rc = -EINVAL;
 		goto error_mctrl_bus_start;
 	}
 
@@ -1733,17 +1742,11 @@ error_ctrl_bus_start:
 	if (m_bus_changed && enable)
 		mdss_dsi_clk_ctrl_sub(mctrl, DSI_BUS_CLKS, 0);
 error_mctrl_bus_start:
-	if (clk_type & DSI_BUS_CLKS) {
-		if (mctrl)
-			__mdss_dsi_update_clk_cnt(&mctrl->bus_clk_cnt,
-				enable ? 0 : 1);
-		__mdss_dsi_update_clk_cnt(&ctrl->bus_clk_cnt, enable ? 0 : 1);
-	}
-	if (clk_type & DSI_LINK_CLKS) {
-		if (mctrl)
-			__mdss_dsi_update_clk_cnt(&mctrl->link_clk_cnt,
-				enable ? 0 : 1);
-		__mdss_dsi_update_clk_cnt(&ctrl->link_clk_cnt, enable ? 0 : 1);
+	ctrl->bus_clk_cnt = bus_cnt;
+	ctrl->link_clk_cnt = link_cnt;
+	if (mctrl) {
+		mctrl->bus_clk_cnt = m_bus_cnt;
+		mctrl->link_clk_cnt = m_link_cnt;
 	}
 
 no_error:
