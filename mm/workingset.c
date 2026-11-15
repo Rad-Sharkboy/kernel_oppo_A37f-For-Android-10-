@@ -50,7 +50,7 @@ static atomic_long_t evictions = ATOMIC_LONG_INIT(0);
 static atomic_long_t refaults = ATOMIC_LONG_INIT(0);
 static atomic_long_t activations = ATOMIC_LONG_INIT(0);
 static atomic_long_t replacements = ATOMIC_LONG_INIT(0);
-static bool ready;
+static unsigned int ready;
 static bool enabled = true;
 module_param(enabled, bool, 0644);
 MODULE_PARM_DESC(enabled, "Protect recently evicted file pages on refault");
@@ -62,10 +62,7 @@ static atomic_long_t *zone_age(struct zone *zone)
 
 static bool history_ready(void)
 {
-	if (!ACCESS_ONCE(ready))
-		return false;
-	smp_rmb();
-	return true;
+	return smp_load_acquire(&ready);
 }
 
 static unsigned int identity_hash(struct address_space *mapping)
@@ -219,7 +216,7 @@ unlock_identity:
 
 void workingset_activation(struct page *page)
 {
-	if (history_ready() && !PageSwapBacked(page))
+	if (!PageSwapBacked(page) && history_ready())
 		atomic_long_inc(zone_age(page_zone(page)));
 }
 
@@ -255,8 +252,7 @@ static int __init workingset_init(void)
 		spin_lock_init(&identity_locks[i]);
 		spin_lock_init(&history_locks[i]);
 	}
-	smp_wmb();
-	ACCESS_ONCE(ready) = true;
+	smp_store_release(&ready, 1);
 	return 0;
 }
 core_initcall(workingset_init);
