@@ -1319,6 +1319,7 @@ static int mdss_dsi_core_power_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 	int enable)
 {
 	int rc = 0;
+	bool core_power_enabled = false, ulps;
 	struct mdss_panel_data *pdata = NULL;
 
 	if (!ctrl) {
@@ -1332,6 +1333,7 @@ static int mdss_dsi_core_power_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 		return -EINVAL;
 	}
 
+	ulps = ctrl->ulps;
 	if (enable) {
 		if (!ctrl->core_power) {
 			/* enable mdss gdsc */
@@ -1346,6 +1348,7 @@ static int mdss_dsi_core_power_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 				goto error;
 			}
 			ctrl->core_power = true;
+			core_power_enabled = true;
 		}
 		/* Disable dynamic clock gating*/
 		if (ctrl->mdss_util->dyn_clk_gating_ctrl)
@@ -1390,13 +1393,14 @@ static int mdss_dsi_core_power_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 			if (rc) {
 				pr_err("%s: Failed to start esc clocks. rc=%d\n",
 					   __func__, rc);
-				goto error_bus_clk_start;
+				goto error_ulps;
 			}
 			ctrl->ulps = false;
 			rc = mdss_dsi_ulps_config(ctrl, 1);
 			if (rc) {
 				pr_err("%s: Failed to enter ULPS. rc=%d\n",
 					__func__, rc);
+				mdss_dsi_ulp_escclk_stop(ctrl);
 				goto error_ulps;
 			}
 			mdss_dsi_ulp_escclk_stop(ctrl);
@@ -1450,6 +1454,10 @@ static int mdss_dsi_core_power_ctrl(struct mdss_dsi_ctrl_pdata *ctrl,
 error_ulps:
 	mdss_dsi_bus_clk_stop(ctrl);
 error_bus_clk_start:
+	/* Retry the clamped PHY's previous ULPS state. */
+	ctrl->ulps = ulps;
+	if (!core_power_enabled)
+		return rc;
 	if (msm_dss_enable_vreg(ctrl->power_data[DSI_CORE_PM].vreg_config,
 		ctrl->power_data[DSI_CORE_PM].num_vreg, 0))
 		pr_warn("%s: failed to disable vregs for %s\n",
