@@ -539,7 +539,8 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 	struct request *rq = NULL;
-	u64 now_ns = ktime_to_ns(ktime_get());
+	u64 now_ns = 0;
+	bool timestamp_valid = false;
 	int target_pressure = 0;
 	int pressure = cd->pressure;
 	unsigned long write_expire_ns = cd->write_expire_ms * 1000000ULL;
@@ -607,7 +608,11 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	if (!list_empty(&cd->queues[PRIO_WRITE_FG])) {
 		struct request *wrq = list_first_entry(&cd->queues[PRIO_WRITE_FG],
 							struct request, queuelist);
-		u64 wait_time = now_ns - get_req_time(wrq);
+		u64 wait_time;
+
+		now_ns = ktime_to_ns(ktime_get());
+		timestamp_valid = true;
+		wait_time = now_ns - get_req_time(wrq);
 		if (wait_time > write_expire_ns) {
 			if (wait_time > WRITE_STARVE_THRESH_NS) {
 				cd->write_starved_count++;
@@ -702,7 +707,11 @@ dispatch:
 
 		/* Latency tracking */
 		if ((cd->dispatch_seq % ((rq_data_dir(rq) == READ) ? 8 : 16)) == 0) {
-			u64 lat = now_ns - get_req_time(rq);
+			u64 lat;
+
+			if (!timestamp_valid)
+				now_ns = ktime_to_ns(ktime_get());
+			lat = now_ns - get_req_time(rq);
 			cinnamon_update_latency(cd, lat);
 		}
 
