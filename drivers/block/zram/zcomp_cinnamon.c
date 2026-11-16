@@ -795,11 +795,16 @@ set_mode:
 
 	/* Update statistics */
 	atomic_inc(&cinnamon_pages_compressed);
-	atomic_add(local_zero, &cinnamon_zero_blocks);
-	atomic_add(local_match, &cinnamon_match_blocks);
-	atomic_add(local_partial, &cinnamon_partial_blocks);
-	atomic_add(local_delta, &cinnamon_delta_blocks);
-	atomic_add(local_raw, &cinnamon_raw_blocks);
+	if (local_zero)
+		atomic_add(local_zero, &cinnamon_zero_blocks);
+	if (local_match)
+		atomic_add(local_match, &cinnamon_match_blocks);
+	if (local_partial)
+		atomic_add(local_partial, &cinnamon_partial_blocks);
+	if (local_delta)
+		atomic_add(local_delta, &cinnamon_delta_blocks);
+	if (local_raw)
+		atomic_add(local_raw, &cinnamon_raw_blocks);
 
 	return 0;
 
@@ -1139,11 +1144,16 @@ set_mode:
 
 	/* Batch update statistics */
 	atomic_inc(&cinnamon_pages_compressed);
-	atomic_add(local_zero, &cinnamon_zero_blocks);
-	atomic_add(local_match, &cinnamon_match_blocks);
-	atomic_add(local_partial, &cinnamon_partial_blocks);
-	atomic_add(local_delta, &cinnamon_delta_blocks);
-	atomic_add(local_raw, &cinnamon_raw_blocks);
+	if (local_zero)
+		atomic_add(local_zero, &cinnamon_zero_blocks);
+	if (local_match)
+		atomic_add(local_match, &cinnamon_match_blocks);
+	if (local_partial)
+		atomic_add(local_partial, &cinnamon_partial_blocks);
+	if (local_delta)
+		atomic_add(local_delta, &cinnamon_delta_blocks);
+	if (local_raw)
+		atomic_add(local_raw, &cinnamon_raw_blocks);
 
 	final_checksum = cinnamon_checksum(dst, out_len);
 	if (likely(out_len + sizeof(u64) <= *dst_len)) {
