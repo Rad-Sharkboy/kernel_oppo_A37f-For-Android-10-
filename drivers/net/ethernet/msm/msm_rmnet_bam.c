@@ -232,23 +232,6 @@ static void bam_recv_notify(void *dev, struct sk_buff *skb)
 			((struct net_device *)dev)->name, __func__);
 }
 
-static struct sk_buff *_rmnet_add_headroom(struct sk_buff **skb,
-					   struct net_device *dev)
-{
-	struct sk_buff *skbn;
-
-	if (skb_headroom(*skb) < dev->needed_headroom) {
-		msm_rmnet_bam_headroom_check_failure++;
-		skbn = skb_realloc_headroom(*skb, dev->needed_headroom);
-		kfree_skb(*skb);
-		*skb = skbn;
-	} else {
-		skbn = *skb;
-	}
-
-	return skbn;
-}
-
 static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct rmnet_private *p = netdev_priv(dev);
@@ -257,7 +240,10 @@ static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 	u32 opmode;
 	unsigned long flags;
 
-	if (unlikely(!_rmnet_add_headroom(&skb, dev))) {
+	if (skb_headroom(skb) < dev->needed_headroom)
+		msm_rmnet_bam_headroom_check_failure++;
+	if (unlikely(skb_cow_head(skb, dev->needed_headroom))) {
+		dev_kfree_skb_any(skb);
 		dev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
