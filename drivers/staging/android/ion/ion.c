@@ -589,6 +589,8 @@ static struct ion_handle *__ion_alloc(struct ion_client *client, size_t len,
 	 * request of the caller allocate from it.  Repeat until allocate has
 	 * succeeded or all heaps have been tried
 	 */
+	if (len > SIZE_MAX - (PAGE_SIZE - 1))
+		return ERR_PTR(-EOVERFLOW);
 	len = PAGE_ALIGN(len);
 
 	if (!len)
