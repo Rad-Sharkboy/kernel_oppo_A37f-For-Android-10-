@@ -306,6 +306,8 @@ struct lis3dh_acc_data {
 	unsigned int flush_count;
 	int irq1;
 	int irq2;
+	bool irq1_requested;
+	bool irq2_requested;
 
 #ifdef DEBUG
 	u8 reg_addr;
@@ -471,14 +473,15 @@ static int lis3dh_acc_i2c_read(struct lis3dh_acc_data *acc,
 				u8 *buf, int len)
 {
 	int err;
-	int tries = 0;
+	int tries;
 
-	struct i2c_msg	msgs[] = {
+	u8 reg = buf[0];
+	struct i2c_msg msgs[] = {
 		{
 			.addr = acc->client->addr,
 			.flags = acc->client->flags & I2C_M_TEN,
 			.len = 1,
-			.buf = buf,
+			.buf = &reg,
 		},
 		{
 			.addr = acc->client->addr,
@@ -488,26 +491,22 @@ static int lis3dh_acc_i2c_read(struct lis3dh_acc_data *acc,
 		},
 	};
 
-	do {
+	for (tries = 0; tries < I2C_RETRIES; tries++) {
 		err = i2c_transfer(acc->client->adapter, msgs, 2);
-		if (err != 2)
+		if (err == 2)
+			return 0;
+		if (tries + 1 < I2C_RETRIES)
 			msleep_interruptible(I2C_RETRY_DELAY);
-	} while ((err != 2) && (++tries < I2C_RETRIES));
-
-	if (err != 2) {
-		dev_err(&acc->client->dev, "read transfer error\n");
-		err = -EIO;
-	} else {
-		err = 0;
 	}
 
-	return err;
+	dev_err(&acc->client->dev, "read transfer failed: %d\n", err);
+	return err < 0 ? err : -EIO;
 }
 
 static int lis3dh_acc_i2c_write(struct lis3dh_acc_data *acc, u8 *buf, int len)
 {
 	int err;
-	int tries = 0;
+	int tries;
 
 	struct i2c_msg msgs[] = {
 		{
@@ -518,30 +517,26 @@ static int lis3dh_acc_i2c_write(struct lis3dh_acc_data *acc, u8 *buf, int len)
 		 },
 	};
 
-	do {
+	for (tries = 0; tries < I2C_RETRIES; tries++) {
 		err = i2c_transfer(acc->client->adapter, msgs, 1);
-		if (err != 1)
+		if (err == 1)
+			return 0;
+		if (tries + 1 < I2C_RETRIES)
 			msleep_interruptible(I2C_RETRY_DELAY);
-	} while ((err != 1) && (++tries < I2C_RETRIES));
-
-	if (err != 1) {
-		dev_err(&acc->client->dev, "write transfer error\n");
-		err = -EIO;
-	} else {
-		err = 0;
 	}
 
-	return err;
+	dev_err(&acc->client->dev, "write transfer failed: %d\n", err);
+	return err < 0 ? err : -EIO;
 }
 
 static int lis3dh_acc_hw_init(struct lis3dh_acc_data *acc)
 {
 	int err = -1;
 	int i = 0;
-	u8 buf[7];
+	u8 buf[7] = { 0 };
 
-	buf[0] = WHO_AM_I;
 	for (i = 0; i < 3; i++) {
+		buf[0] = WHO_AM_I;
 		err = lis3dh_acc_i2c_read(acc, buf, 1);
 		if (err >= 0)
 			break;
@@ -557,7 +552,7 @@ static int lis3dh_acc_hw_init(struct lis3dh_acc_data *acc)
 		dev_err(&acc->client->dev,
 		"device unknown. Expected: 0x%x, Replies: 0x%x\n",
 		WHOAMI_LIS3DH_ACC, buf[0]);
-		err = -1; /* choose the right coded error */
+		err = -ENODEV;
 		goto err_unknown_device;
 	}
 
@@ -634,23 +629,20 @@ static void lis3dh_acc_device_power_off(struct lis3dh_acc_data *acc)
 	int err;
 	u8 buf[2] = { CTRL_REG1, LIS3DH_ACC_PM_OFF };
 
+	if (!acc->hw_initialized)
+		return;
+
+	if (acc->irq1_requested)
+		disable_irq(acc->irq1);
+	if (acc->irq2_requested)
+		disable_irq(acc->irq2);
+
 	err = lis3dh_acc_i2c_write(acc, buf, 1);
 	if (err < 0)
 		dev_err(&acc->client->dev, "soft power off failed: %d\n", err);
 
 	lis3dh_acc_set_regulator(acc, false);
-
-	if (acc->hw_initialized) {
-		if (gpio_is_valid(acc->pdata->gpio_int1)
-				&& acc->pdata->enable_int)
-			disable_irq_nosync(acc->irq1);
-
-		if (gpio_is_valid(acc->pdata->gpio_int2)
-				&& acc->pdata->enable_int)
-			disable_irq_nosync(acc->irq2);
-
-		acc->hw_initialized = 0;
-	}
+	acc->hw_initialized = 0;
 }
 
 static int lis3dh_acc_device_power_on(struct lis3dh_acc_data *acc)
@@ -674,14 +666,10 @@ static int lis3dh_acc_device_power_on(struct lis3dh_acc_data *acc)
 		}
 	}
 
-	if (acc->hw_initialized) {
-		if (gpio_is_valid(acc->pdata->gpio_int1)
-			&& acc->pdata->enable_int)
-			enable_irq(acc->irq1);
-		if (gpio_is_valid(acc->pdata->gpio_int2)
-			&& acc->pdata->enable_int)
-			enable_irq(acc->irq2);
-	}
+	if (acc->irq1_requested)
+		enable_irq(acc->irq1);
+	if (acc->irq2_requested)
+		enable_irq(acc->irq2);
 	return 0;
 }
 
@@ -1029,16 +1017,16 @@ static int lis3dh_acc_set_waterwark(struct lis3dh_acc_data *acc,
 	return error;
 }
 
-static int lis3dh_acc_enable_batch(struct lis3dh_acc_data *acc, bool en)
+static int lis3dh_acc_configure_batch(struct lis3dh_acc_data *acc, bool en,
+				      unsigned int timeout_ms)
 {
 	struct i2c_client *client = acc->client;
 	int watermark;
 	int err;
 
-	mutex_lock(&acc->lock);
 	if (en) {
 		watermark = lis3dh_acc_calc_watermark(acc,
-					acc->fifo_timeout_ms);
+					timeout_ms);
 		if (watermark <= 0) {
 			dev_err(&acc->client->dev,
 				"enable batch: cannot calculate watermark, ret=%d\n",
@@ -1082,8 +1070,17 @@ static int lis3dh_acc_enable_batch(struct lis3dh_acc_data *acc, bool en)
 	}
 
 exit:
-	mutex_unlock(&acc->lock);
 	return err;
+}
+
+static int lis3dh_acc_enable_batch(struct lis3dh_acc_data *acc, bool en)
+{
+	int ret;
+
+	mutex_lock(&acc->lock);
+	ret = lis3dh_acc_configure_batch(acc, en, acc->fifo_timeout_ms);
+	mutex_unlock(&acc->lock);
+	return ret;
 }
 
 static int lis3dh_acc_register_write(struct lis3dh_acc_data *acc, u8 *buf,
@@ -1271,6 +1268,9 @@ static irqreturn_t lis3dh_acc_isr1(int irq, void *dev)
 	u32 time_ms;
 	struct lis3dh_acc_data *acc = dev;
 
+	if (!atomic_read(&acc->enabled))
+		return IRQ_HANDLED;
+
 	err = lis3dh_interrupt_status(acc, &status);
 	if (err) {
 		dev_err(&acc->client->dev, "read status error\n");
@@ -1280,6 +1280,8 @@ static irqreturn_t lis3dh_acc_isr1(int irq, void *dev)
 		time_ms = lis3dh_acc_odr_to_interval(acc,
 			(acc->resume_state[RES_CTRL_REG1] >> 4));
 		fifo_cnt = lis3dh_acc_get_fifo_lvl(acc);
+		if (fifo_cnt < 0)
+			goto exit;
 		dev_dbg(&acc->client->dev, "TS: base=%lld, interval=%d fifo_cnt=%d\n",
 			ktime_to_ns(timestamp), time_ms, fifo_cnt);
 		timestamp = ktime_sub_us(timestamp, time_ms * fifo_cnt * 1000);
@@ -1333,6 +1335,10 @@ static irqreturn_t lis3dh_acc_isr2(int irq, void *dev)
 	ktime_t timestamp = ktime_get_boottime();
 	int err;
 	int xyz[3] = { 0 };
+
+	if (!atomic_read(&acc->enabled))
+		return IRQ_HANDLED;
+
 	err = lis3dh_acc_get_acceleration_data(acc, xyz, 0);
 	if (err < 0)
 		dev_err(&acc->client->dev, "get_acceleration_data failed\n");
@@ -1962,6 +1968,8 @@ static int lis3dh_acc_flush(struct sensors_classdev *sensors_cdev)
 	time_ms = lis3dh_acc_odr_to_interval(acc,
 			(acc->resume_state[RES_CTRL_REG1] >> 4));
 	fifo_cnt = lis3dh_acc_get_fifo_lvl(acc);
+	if (fifo_cnt < 0)
+		return fifo_cnt;
 	dev_dbg(&acc->client->dev, "TS: base=%lld, interval=%d fifo_cnt=%d\n",
 			ktime_to_ns(timestamp), time_ms, fifo_cnt);
 	timestamp = ktime_sub_us(timestamp, time_ms * fifo_cnt * 1000);
@@ -2072,16 +2080,19 @@ static int lis3dh_latency_set(struct sensors_classdev *cdev,
 		return -EPERM;
 	}
 
-	acc->fifo_timeout_ms = max_latency;
-	acc->use_batch = max_latency ? true : false;
-
-	ret = lis3dh_acc_enable_batch(acc, max_latency);
-	if (ret) {
-		dev_err(&client->dev, "enable batch:%d failed\n", max_latency);
-		return ret;
+	mutex_lock(&acc->lock);
+	ret = 0;
+	if (atomic_read(&acc->enabled))
+		ret = lis3dh_acc_configure_batch(acc, !!max_latency, max_latency);
+	if (!ret) {
+		acc->fifo_timeout_ms = max_latency;
+		acc->use_batch = !!max_latency;
 	}
+	mutex_unlock(&acc->lock);
 
-	return 0;
+	if (ret)
+		dev_err(&client->dev, "enable batch:%u failed\n", max_latency);
+	return ret;
 }
 
 /* Work function for polling mode */
@@ -2479,7 +2490,7 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 		goto exit_check_functionality_failed;
 	}
 
-	acc = kzalloc(sizeof(struct lis3dh_acc_data), GFP_KERNEL);
+	acc = devm_kzalloc(&client->dev, sizeof(*acc), GFP_KERNEL);
 	if (acc == NULL) {
 		err = -ENOMEM;
 		dev_err(&client->dev,
@@ -2488,14 +2499,13 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 		goto exit_check_functionality_failed;
 	}
 
-	memset(acc, 0, sizeof(struct lis3dh_acc_data));
 	mutex_init(&acc->lock);
 	mutex_lock(&acc->lock);
 
 	acc->client = client;
 	i2c_set_clientdata(client, acc);
 
-	acc->pdata = kmalloc(sizeof(*acc->pdata), GFP_KERNEL);
+	acc->pdata = devm_kzalloc(&client->dev, sizeof(*acc->pdata), GFP_KERNEL);
 	if (acc->pdata == NULL) {
 		err = -ENOMEM;
 		dev_err(&client->dev,
@@ -2503,7 +2513,6 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 				err);
 		goto err_mutexunlock;
 	}
-	memset(acc->pdata, 0 , sizeof(*acc->pdata));
 
 	if (client->dev.of_node) {
 		err = lis3dh_parse_dt(&client->dev, acc->pdata);
@@ -2679,7 +2688,8 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 					"request irq1 failed: %d\n", err);
 			goto err_unreg_sensor_class;
 		}
-		disable_irq_nosync(acc->irq1);
+		disable_irq(acc->irq1);
+		acc->irq1_requested = true;
 	}
 
 	if (gpio_is_valid(acc->pdata->gpio_int2) && acc->pdata->enable_int) {
@@ -2692,7 +2702,8 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 					"request irq2 failed: %d\n", err);
 			goto err_free_irq1;
 		}
-		disable_irq_nosync(acc->irq2);
+		disable_irq(acc->irq2);
+		acc->irq2_requested = true;
 	}
 
 	if (acc->pdata->enable_int)
@@ -2713,8 +2724,8 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 	lis3dh_ftm.attrs = lis3dh_attrs;
 	err = register_single_dev_ftm(&lis3dh_ftm);
 	if (err) {
-		dev_dbg(&client->dev, "register_single_dev_ftm failed\n");
-		goto err_unreg_sensor_class;
+		g_acc_data = NULL;
+		dev_warn(&client->dev, "Factory controls unavailable: %d\n", err);
 	}
 #endif
 
@@ -2723,8 +2734,10 @@ static int lis3dh_acc_probe(struct i2c_client *client,
 	return 0;
 
 err_free_irq1:
-if (gpio_is_valid(acc->pdata->gpio_int1) && acc->pdata->enable_int)
-	free_irq(acc->irq1, acc);
+	if (acc->irq1_requested) {
+		free_irq(acc->irq1, acc);
+		acc->irq1_requested = false;
+	}
 err_unreg_sensor_class:
 	sensors_classdev_unregister(&acc->cdev);
 err_remove_sysfs_int:
@@ -2740,10 +2753,9 @@ err_pdata_init:
 	if (acc->pdata->exit)
 		acc->pdata->exit();
 exit_kfree_pdata:
-	kfree(acc->pdata);
 err_mutexunlock:
+	atomic_set(&acc->enabled, 0);
 	mutex_unlock(&acc->lock);
-	kfree(acc);
 exit_check_functionality_failed:
 	dev_err(&client->dev, "%s: Driver Init failed\n", LIS3DH_ACC_DEV_NAME);
 	return err;
@@ -2753,23 +2765,34 @@ static int lis3dh_acc_remove(struct i2c_client *client)
 {
 	struct lis3dh_acc_data *acc = i2c_get_clientdata(client);
 
-	lis3dh_acc_device_power_off(acc);
-	if (gpio_is_valid(acc->pdata->gpio_int1) && acc->pdata->enable_int)
-		free_irq(acc->irq1, acc);
-
-	if (gpio_is_valid(acc->pdata->gpio_int2) && acc->pdata->enable_int)
-		free_irq(acc->irq2, acc);
-
+#ifdef CONFIG_MACH_OPPO
+	if (g_acc_data == acc) {
+		unregister_single_dev_ftm(&lis3dh_ftm);
+		g_acc_data = NULL;
+	}
+#endif
 	sensors_classdev_unregister(&acc->cdev);
-	lis3dh_acc_config_regulator(acc, false);
 	remove_sysfs_interfaces(&client->dev);
-	if (acc->data_wq)
+	input_unregister_device(acc->input_dev);
+	atomic_set(&acc->enabled, 0);
+	if (acc->data_wq) {
+		cancel_delayed_work_sync(&acc->input_work);
 		destroy_workqueue(acc->data_wq);
-
+	}
+	if (acc->irq1_requested) {
+		free_irq(acc->irq1, acc);
+		acc->irq1_requested = false;
+	}
+	if (acc->irq2_requested) {
+		free_irq(acc->irq2, acc);
+		acc->irq2_requested = false;
+	}
+	if (acc->pdata->enable_int)
+		device_init_wakeup(&client->dev, 0);
+	lis3dh_acc_device_power_off(acc);
+	lis3dh_acc_config_regulator(acc, false);
 	if (acc->pdata->exit)
 		acc->pdata->exit();
-	kfree(acc->pdata);
-	kfree(acc);
 
 	return 0;
 }
