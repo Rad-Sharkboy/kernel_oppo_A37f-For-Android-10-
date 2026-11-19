@@ -961,7 +961,8 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	hdr->ch_id = id;
 	hdr->pkt_len = skb->len - sizeof(struct bam_mux_hdr);
 	if (skb->len & 0x3)
-		skb_put(skb, 4 - (skb->len & 0x3));
+		memset(skb_put(skb, 4 - (skb->len & 0x3)), 0,
+		       4 - (hdr->pkt_len & 0x3));
 
 	hdr->pad_len = skb->len - (sizeof(struct bam_mux_hdr) + hdr->pkt_len);
 
