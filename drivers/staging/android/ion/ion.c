@@ -1639,14 +1639,11 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	}
 	case ION_IOC_CLEAN_CACHES:
-		return client->dev->custom_ioctl(client,
-						ION_IOC_CLEAN_CACHES, arg);
 	case ION_IOC_INV_CACHES:
-		return client->dev->custom_ioctl(client,
-						ION_IOC_INV_CACHES, arg);
 	case ION_IOC_CLEAN_INV_CACHES:
-		return client->dev->custom_ioctl(client,
-						ION_IOC_CLEAN_INV_CACHES, arg);
+		if (!dev->custom_ioctl)
+			return -ENOTTY;
+		return dev->custom_ioctl(client, cmd, arg);
 	default:
 		return -ENOTTY;
 	}
