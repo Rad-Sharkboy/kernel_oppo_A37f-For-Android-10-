@@ -660,9 +660,9 @@ static struct ion_handle *__ion_alloc(struct ion_client *client, size_t len,
 		return handle;
 
 	mutex_lock(&client->lock);
-	if (grab_handle)
-		ion_handle_get(handle);
 	ret = ion_handle_add(client, handle);
+	if (!ret && grab_handle)
+		ion_handle_get(handle);
 	mutex_unlock(&client->lock);
 	if (ret) {
 		ion_handle_put(handle);
