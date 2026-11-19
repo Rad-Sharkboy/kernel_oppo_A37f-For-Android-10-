@@ -364,6 +364,8 @@ struct sdhci_msm_host {
 	bool en_auto_cmd21;
 	struct device_attribute auto_cmd21_attr;
 	bool is_sdiowakeup_enabled;
+	bool sdio_wake_armed;
+	bool host_irq_masked;
 	atomic_t controller_clock;
 	bool use_cdclp533;
 };
@@ -3371,10 +3373,12 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		msm_host->pdata = sdhci_msm_populate_pdata(&pdev->dev, host);
 		if (!msm_host->pdata) {
 			dev_err(&pdev->dev, "DT parsing error\n");
+			ret = -EINVAL;
 			goto pltfm_free;
 		}
 	} else {
 		dev_err(&pdev->dev, "No device tree node\n");
+		ret = -ENODEV;
 		goto pltfm_free;
 	}
 
@@ -3450,18 +3454,13 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 
 #ifdef CONFIG_MACH_OPPO
 	if (gpio_is_valid(msm_host->pdata->sd_vdd_en)) {
-		ret = gpio_request(msm_host->pdata->sd_vdd_en,
-				"sdcard_vdd_enable");
-		if (ret)
-			dev_err(&pdev->dev,
-				"%s: Failed to request sdcard vdd gpio ret=%d\n",
-				__func__, ret);
-
-		ret = gpio_direction_output(msm_host->pdata->sd_vdd_en, 0);
-		if (ret)
-			dev_err(&pdev->dev,
-				"%s: Failed to set sdcard vdd gpio ret=%d\n",
-				__func__, ret);
+		ret = devm_gpio_request_one(&pdev->dev, msm_host->pdata->sd_vdd_en,
+					    GPIOF_OUT_INIT_LOW, "sdcard_vdd_enable");
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to acquire SD supply GPIO: %d\n",
+				ret);
+			goto bus_unregister;
+		}
 	}
 #endif
 
@@ -3477,6 +3476,7 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 				IORESOURCE_MEM, "core_mem");
 	if (!core_memres) {
 		dev_err(&pdev->dev, "Failed to get iomem resource\n");
+		ret = -ENODEV;
 		goto vreg_deinit;
 	}
 	msm_host->core_mem = devm_ioremap(&pdev->dev, core_memres->start,
@@ -3736,7 +3736,8 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	}
 
 	device_enable_async_suspend(&pdev->dev);
-	/* Successful initialization */
+	/* Optional sysfs setup may fail without invalidating the host. */
+	ret = 0;
 	goto out;
 
 remove_max_bus_bw_file:
@@ -3815,10 +3816,6 @@ static int sdhci_msm_remove(struct platform_device *pdev)
 		sdhci_msm_bus_cancel_work_and_set_vote(host, 0);
 		sdhci_msm_bus_unregister(msm_host);
 	}
-#ifdef CONFIG_MACH_OPPO
-	if (gpio_is_valid(msm_host->pdata->sd_vdd_en))
-		gpio_free(msm_host->pdata->sd_vdd_en);
-#endif
 	sdhci_pltfm_free(pdev);
 	return 0;
 }
@@ -3831,7 +3828,7 @@ static int sdhci_msm_cfg_sdio_wakeup(struct sdhci_host *host, bool enable)
 	unsigned long flags;
 	int ret = 0;
 
-	if (!(host->mmc->card && mmc_card_sdio(host->mmc->card) &&
+	if (enable && !(host->mmc->card && mmc_card_sdio(host->mmc->card) &&
 	      (sdhci_is_valid_mpm_wakeup_int(msm_host) ||
 	      sdhci_is_valid_gpio_wakeup_int(msm_host)) &&
 	      mmc_card_wake_sdio_irq(host->mmc))) {
@@ -3883,16 +3880,14 @@ static int sdhci_msm_runtime_suspend(struct device *dev)
 	struct sdhci_host *host = dev_get_drvdata(dev);
 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 	struct sdhci_msm_host *msm_host = pltfm_host->priv;
-	int ret;
 
-	ret = sdhci_msm_cfg_sdio_wakeup(host, true);
-	/* pwr_irq is not monitored by mpm on suspend, hence disable it */
-	if (!ret)
-		goto skip_disable_host_irq;
+	msm_host->sdio_wake_armed = !sdhci_msm_cfg_sdio_wakeup(host, true);
+	if (!msm_host->sdio_wake_armed) {
+		disable_irq(host->irq);
+		msm_host->host_irq_masked = true;
+	}
 
-	disable_irq(host->irq);
-
-skip_disable_host_irq:
+	/* pwr_irq is not monitored by mpm on suspend. */
 	disable_irq(msm_host->pwr_irq);
 
 	/*
@@ -3913,15 +3908,15 @@ static int sdhci_msm_runtime_resume(struct device *dev)
 	struct sdhci_host *host = dev_get_drvdata(dev);
 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 	struct sdhci_msm_host *msm_host = pltfm_host->priv;
-	int ret;
 
-	ret = sdhci_msm_cfg_sdio_wakeup(host, false);
-	if (!ret)
-		goto skip_enable_host_irq;
-
-	enable_irq(host->irq);
-
-skip_enable_host_irq:
+	if (msm_host->sdio_wake_armed) {
+		sdhci_msm_cfg_sdio_wakeup(host, false);
+		msm_host->sdio_wake_armed = false;
+	}
+	if (msm_host->host_irq_masked) {
+		enable_irq(host->irq);
+		msm_host->host_irq_masked = false;
+	}
 	enable_irq(msm_host->pwr_irq);
 
 	return 0;
