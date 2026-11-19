@@ -359,10 +359,15 @@ int opchg_get_prop_batt_capacity_from_bms_bq24157(struct opchg_charger *chip)
 				rc = msmrtc_alarm_read_time(&soc_update_rtc_time);
 				if (rc < 0) {
 					pr_err("%s: failed to read soc update time\n", __func__);
+				} else {
+					rtc_tm_to_time(&soc_update_rtc_time, &chip->soc_update_time);
+					if (chip->bat_volt_check_point > 1 &&
+					    chip->soc_update_pre_time &&
+					    chip->soc_update_time >= chip->soc_update_pre_time &&
+					    chip->soc_update_time - chip->soc_update_pre_time >=
+					    EIGHT_MINUTES)
+						chip->bat_volt_check_point--;
 				}
-				rtc_tm_to_time(&soc_update_rtc_time, &chip->soc_update_time);
-				if((chip->soc_update_time - chip->soc_update_pre_time) >= EIGHT_MINUTES)		//if soc don't update for 8min
-					chip->bat_volt_check_point--;
 			}
 
 			if(chip->bat_volt_check_point == 100)
