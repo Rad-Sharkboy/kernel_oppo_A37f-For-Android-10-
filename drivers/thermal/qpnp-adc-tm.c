@@ -2048,6 +2048,18 @@ int32_t qpnp_adc_tm_disable_chan_meas(struct qpnp_adc_tm_chip *chip,
 
 	mutex_lock(&chip->adc->adc_lock);
 
+	channel = param->channel;
+	while (dt_index < chip->max_channels_available &&
+	       chip->adc->adc_channels[dt_index].channel_num != channel)
+		dt_index++;
+
+	if (dt_index >= chip->max_channels_available) {
+		pr_err("not a valid ADC_TMN channel\n");
+		rc = -EINVAL;
+		goto fail;
+	}
+
+
 	/* Set measurement in single measurement mode */
 	mode_ctl = ADC_OP_NORMAL_MODE << QPNP_OP_MODE_SHIFT;
 	rc = qpnp_adc_tm_mode_select(chip, mode_ctl);
@@ -2070,16 +2082,6 @@ int32_t qpnp_adc_tm_disable_chan_meas(struct qpnp_adc_tm_chip *chip,
 		goto fail;
 	}
 
-	channel = param->channel;
-	while ((chip->adc->adc_channels[dt_index].channel_num
-		!= channel) && (dt_index < chip->max_channels_available))
-		dt_index++;
-
-	if (dt_index >= chip->max_channels_available) {
-		pr_err("not a valid ADC_TMN channel\n");
-		rc = -EINVAL;
-		goto fail;
-	}
 
 	btm_chan_num = chip->sensor[dt_index].btm_channel_num;
 	sensor_mask = 1 << chip->sensor[dt_index].sensor_num;
