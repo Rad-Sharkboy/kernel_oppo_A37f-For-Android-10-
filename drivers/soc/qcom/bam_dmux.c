@@ -2446,7 +2446,7 @@ register_bam_failed:
 	if (!skip_iounmap)
 		iounmap(a2_virt_addr);
 ioremap_failed:
-	/*destroy_workqueue(bam_mux_workqueue);*/
+	unvote_dfab();
 	return ret;
 }
 
@@ -2497,7 +2497,10 @@ static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 	} else if (new_state & SMSM_A2_POWER_CONTROL) {
 		BAM_DMUX_LOG("%s: init\n", __func__);
 		grab_wakelock();
-		bam_init();
+		if (bam_init()) {
+			release_wakelock();
+			last_processed_state = 0;
+		}
 	} else {
 		BAM_DMUX_LOG("%s: bad state change\n", __func__);
 		pr_err("%s: unsupported state change\n", __func__);
