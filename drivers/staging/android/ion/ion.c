@@ -1450,6 +1450,17 @@ struct ion_handle *ion_import_dma_buf(struct ion_client *client, int fd)
 		goto end;
 
 	mutex_lock(&client->lock);
+	{
+		struct ion_handle *existing = ion_handle_lookup(client, buffer);
+
+		if (!IS_ERR(existing)) {
+			existing = ion_handle_get_check_overflow(existing);
+			ion_handle_put_nolock(handle);
+			handle = existing;
+			mutex_unlock(&client->lock);
+			goto end;
+		}
+	}
 	ret = ion_handle_add(client, handle);
 	mutex_unlock(&client->lock);
 	if (ret) {
