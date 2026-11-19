@@ -1240,6 +1240,20 @@ unsigned long zs_get_total_pages(struct zs_pool *pool)
 }
 EXPORT_SYMBOL_GPL(zs_get_total_pages);
 
+/* Maximum payload whose class packs multiple objects into a zspage. */
+size_t zs_max_packed_size(struct zs_pool *pool)
+{
+	int i;
+
+	for (i = zs_size_classes - 1; i >= 0; i--) {
+		if (!pool->size_class[i]->huge)
+			return ZS_MIN_ALLOC_SIZE + i * ZS_SIZE_CLASS_DELTA -
+				ZS_HANDLE_SIZE;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(zs_max_packed_size);
+
 /**
  * zs_map_object - get address of allocated object from handle.
  * @pool: pool from which the object was allocated
@@ -1388,7 +1402,7 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size)
 {
 	unsigned long handle, obj;
 	struct size_class *class;
-	struct page *first_page;
+	struct page *first_page, *new_page = NULL;
 
 	if (unlikely(!size || size > ZS_MAX_ALLOC_SIZE))
 		return 0;
@@ -1406,19 +1420,24 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size)
 
 	if (!first_page) {
 		spin_unlock(&class->lock);
-		first_page = alloc_zspage(class, pool->flags);
-		if (unlikely(!first_page)) {
-			free_handle(pool, handle);
-			return 0;
-		}
-
-		set_zspage_mapping(first_page, class->index, ZS_EMPTY);
-		atomic_long_add(class->pages_per_zspage,
-					&pool->pages_allocated);
+		new_page = alloc_zspage(class, pool->flags);
 
 		spin_lock(&class->lock);
-		zs_stat_inc(class, OBJ_ALLOCATED, get_maxobj_per_zspage(
-				class->size, class->pages_per_zspage));
+		first_page = find_get_zspage(class);
+		if (!first_page) {
+			if (!new_page) {
+				spin_unlock(&class->lock);
+				free_handle(pool, handle);
+				return 0;
+			}
+			first_page = new_page;
+			new_page = NULL;
+			set_zspage_mapping(first_page, class->index, ZS_EMPTY);
+			atomic_long_add(class->pages_per_zspage,
+					&pool->pages_allocated);
+			zs_stat_inc(class, OBJ_ALLOCATED, get_maxobj_per_zspage(
+					class->size, class->pages_per_zspage));
+		}
 	}
 
 	obj = obj_malloc(first_page, class, handle);
@@ -1426,6 +1445,8 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size)
 	fix_fullness_group(class, first_page);
 	record_obj(handle, obj);
 	spin_unlock(&class->lock);
+	if (new_page)
+		free_zspage(new_page);
 
 	return handle;
 }
