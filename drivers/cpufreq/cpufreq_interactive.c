@@ -1068,7 +1068,11 @@ static ssize_t store_timer_rate(struct cpufreq_interactive_tunables *tunables,
 	if (ret < 0)
 		return ret;
 
+	if (!val || val > UINT_MAX)
+		return -ERANGE;
 	val_round = jiffies_to_usecs(usecs_to_jiffies(val));
+	if (val_round < val)
+		return -ERANGE;
 	if (val != val_round)
 		pr_warn("timer_rate not aligned to jiffy. Rounded up to %lu\n",
 			val_round);
@@ -1097,12 +1101,14 @@ static ssize_t store_timer_slack(struct cpufreq_interactive_tunables *tunables,
 		const char *buf, size_t count)
 {
 	int ret;
-	unsigned long val;
+	long val;
 
 	ret = kstrtol(buf, 10, &val);
 	if (ret < 0)
 		return ret;
 
+	if (val < INT_MIN || val > INT_MAX)
+		return -ERANGE;
 	tunables->timer_slack_val = val;
 	return count;
 }
