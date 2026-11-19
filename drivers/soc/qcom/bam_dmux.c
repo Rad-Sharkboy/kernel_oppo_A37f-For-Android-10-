@@ -1002,10 +1002,10 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 		kfree(pkt);
 		goto restore_skb;
 	} else {
-		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
-		spin_lock_irqsave(&bam_ch[id].lock, flags);
+		spin_lock(&bam_ch[id].lock);
 		bam_ch[id].num_tx_pkts++;
-		spin_unlock_irqrestore(&bam_ch[id].lock, flags);
+		spin_unlock(&bam_ch[id].lock);
+		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
 		if (new_skb)
 			dev_kfree_skb_any(original_skb);
 	}
