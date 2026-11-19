@@ -266,7 +266,8 @@ static int wait_for_ack;
 static struct wake_lock bam_wakelock;
 static int a2_pc_disabled;
 static DEFINE_MUTEX(dfab_status_lock);
-static int dfab_is_on;
+static bool dfab_clk_voted;
+static bool xo_clk_voted;
 static int wait_for_dfab;
 static struct completion dfab_unvote_completion;
 static DEFINE_SPINLOCK(wakelock_reference_lock);
@@ -2110,24 +2111,20 @@ static void vote_dfab(void)
 
 	BAM_DMUX_LOG("%s\n", __func__);
 	mutex_lock(&dfab_status_lock);
-	if (dfab_is_on) {
-		BAM_DMUX_LOG("%s: dfab is already on\n", __func__);
-		mutex_unlock(&dfab_status_lock);
-		return;
-	}
-	if (dfab_clk) {
+	if (dfab_clk && !dfab_clk_voted) {
 		rc = clk_prepare_enable(dfab_clk);
 		if (rc)
-			DMUX_LOG_KERR("bam_dmux vote for dfab failed rc = %d\n",
-									rc);
+			DMUX_LOG_KERR("bam_dmux vote for dfab failed rc = %d\n", rc);
+		else
+			dfab_clk_voted = true;
 	}
-	if (xo_clk) {
+	if (xo_clk && !xo_clk_voted) {
 		rc = clk_prepare_enable(xo_clk);
 		if (rc)
-			DMUX_LOG_KERR("bam_dmux vote for xo failed rc = %d\n",
-									rc);
+			DMUX_LOG_KERR("bam_dmux vote for xo failed rc = %d\n", rc);
+		else
+			xo_clk_voted = true;
 	}
-	dfab_is_on = 1;
 	mutex_unlock(&dfab_status_lock);
 }
 
@@ -2135,17 +2132,14 @@ static void unvote_dfab(void)
 {
 	BAM_DMUX_LOG("%s\n", __func__);
 	mutex_lock(&dfab_status_lock);
-	if (!dfab_is_on) {
-		DMUX_LOG_KERR("%s: dfab is already off\n", __func__);
-		dump_stack();
-		mutex_unlock(&dfab_status_lock);
-		return;
-	}
-	if (dfab_clk)
+	if (dfab_clk_voted) {
 		clk_disable_unprepare(dfab_clk);
-	if (xo_clk)
+		dfab_clk_voted = false;
+	}
+	if (xo_clk_voted) {
 		clk_disable_unprepare(xo_clk);
-	dfab_is_on = 0;
+		xo_clk_voted = false;
+	}
 	mutex_unlock(&dfab_status_lock);
 }
 
