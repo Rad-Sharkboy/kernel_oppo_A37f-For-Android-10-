@@ -263,12 +263,12 @@ static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 	dev->trans_start = jiffies;
 	/* if write() succeeds, skb access is unsafe in this process */
 	bam_ret = msm_bam_dmux_write(p->ch_id, skb);
+	if (bam_ret && RMNET_IS_MODE_QOS(opmode))
+		skb_pull(skb, sizeof(struct QMI_QOS_HDR_S));
 
 	if (bam_ret != 0 && bam_ret != -EAGAIN && bam_ret != -EFAULT) {
 		pr_err("[%s] %s: write returned error %d",
 			dev->name, __func__, bam_ret);
-		if (RMNET_IS_MODE_QOS(opmode))
-			skb_pull(skb, sizeof(struct QMI_QOS_HDR_S));
 		return -EPERM;
 	}
 
