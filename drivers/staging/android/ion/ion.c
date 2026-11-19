@@ -1531,6 +1531,8 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct ion_client *client = filp->private_data;
 	struct ion_device *dev = client->dev;
 	struct ion_handle *cleanup_handle = NULL;
+	struct dma_buf *shared = NULL;
+	int fd = -1;
 	int ret = 0;
 	unsigned int dir;
 
@@ -1590,10 +1592,16 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		handle = ion_handle_get_by_id(client, data.handle.handle);
 		if (IS_ERR(handle))
 			return PTR_ERR(handle);
-		data.fd.fd = ion_share_dma_buf_fd(client, handle);
+		shared = ion_share_dma_buf(client, handle);
 		ion_handle_put(handle);
-		if (data.fd.fd < 0)
-			ret = data.fd.fd;
+		if (IS_ERR(shared))
+			return PTR_ERR(shared);
+		fd = get_unused_fd_flags(O_CLOEXEC);
+		if (fd < 0) {
+			dma_buf_put(shared);
+			return fd;
+		}
+		data.fd.fd = fd;
 		break;
 	}
 	case ION_IOC_IMPORT:
@@ -1645,9 +1653,15 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ion_handle_put_nolock(cleanup_handle);
 				mutex_unlock(&client->lock);
 			}
+			if (shared) {
+				put_unused_fd(fd);
+				dma_buf_put(shared);
+			}
 			return -EFAULT;
 		}
 	}
+	if (shared)
+		fd_install(fd, shared->file);
 	if (cleanup_handle)
 		ion_handle_put(cleanup_handle);
 	return ret;
