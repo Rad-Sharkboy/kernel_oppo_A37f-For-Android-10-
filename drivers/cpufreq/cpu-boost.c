@@ -509,15 +509,14 @@ static int cpu_boost_init(void)
 		init_waitqueue_head(&s->sync_wq);
 		spin_lock_init(&s->lock);
 		INIT_DELAYED_WORK(&s->boost_rem, do_boost_rem);
-		s->thread = kthread_create(boost_mig_sync_thread,
+		s->thread = kthread_run(boost_mig_sync_thread,
 				(void *)(long)cpu, "boost_sync/%d", cpu);
 		if (IS_ERR(s->thread)) {
 			ret = PTR_ERR(s->thread);
 			s->thread = NULL;
 			goto stop_threads;
 		}
-		kthread_bind(s->thread, cpu);
-		wake_up_process(s->thread);
+		set_cpus_allowed(s->thread, *cpumask_of(cpu));
 	}
 	ret = cpufreq_register_notifier(&boost_adjust_nb, CPUFREQ_POLICY_NOTIFIER);
 	if (ret)
