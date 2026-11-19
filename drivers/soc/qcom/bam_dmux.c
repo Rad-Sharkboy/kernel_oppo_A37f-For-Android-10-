@@ -776,8 +776,8 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 	pkt = kmalloc(sizeof(struct tx_pkt_info), GFP_ATOMIC);
 	if (pkt == NULL) {
 		pr_err("%s: mem alloc for tx_pkt_info failed\n", __func__);
-		rc = -ENOMEM;
-		return rc;
+		kfree(data);
+		return -ENOMEM;
 	}
 
 	dma_address = dma_map_single(dma_dev, data, len,
@@ -785,8 +785,8 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 	if (!dma_address) {
 		pr_err("%s: dma_map_single() failed\n", __func__);
 		kfree(pkt);
-		rc = -ENOMEM;
-		return rc;
+		kfree(data);
+		return -ENOMEM;
 	}
 	pkt->skb = (struct sk_buff *)(data);
 	pkt->len = len;
@@ -809,6 +809,7 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 					pkt->len,
 					bam_ops->dma_to);
 		kfree(pkt);
+		kfree(data);
 	} else {
 		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
 	}
