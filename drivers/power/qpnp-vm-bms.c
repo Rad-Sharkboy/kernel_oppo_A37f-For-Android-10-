@@ -4002,12 +4002,9 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 	}
 #else
 	if (rc == (-EPROBE_DEFER)) {
-		if (is_project(OPPO_15109)) {
+		if (is_project(OPPO_15109))
 			pr_err("Unable to read battery data %d\n", rc);
-			goto fail_init;
-		} else {
-			return -EPROBE_DEFER;
-		}
+		goto fail_init;
 	} else if (rc) {
 		pr_err("Unable to read battery data %d\n", rc);
 		goto fail_init;
@@ -4148,6 +4145,8 @@ fail_setup:
 	wakeup_source_trash(&chip->vbms_cv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_soc_wake_source.source);
 fail_init:
+	device_init_wakeup(&spmi->dev, 0);
+	dev_set_drvdata(&spmi->dev, NULL);
 	mutex_destroy(&chip->bms_data_mutex);
 	mutex_destroy(&chip->last_soc_mutex);
 	mutex_destroy(&chip->state_change_mutex);
@@ -4177,6 +4176,7 @@ static int qpnp_vm_bms_remove(struct spmi_device *spmi)
 	mutex_destroy(&chip->state_change_mutex);
 	mutex_destroy(&chip->bms_device_mutex);
 	power_supply_unregister(&chip->bms_psy);
+	device_init_wakeup(&spmi->dev, 0);
 	dev_set_drvdata(&spmi->dev, NULL);
 	the_chip = NULL;
 
