@@ -887,6 +887,8 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	struct bam_mux_hdr *hdr;
 	unsigned long flags;
 	struct sk_buff *new_skb = NULL;
+	struct sk_buff *original_skb = skb;
+	unsigned int original_len = skb->len;
 	dma_addr_t dma_address;
 	struct tx_pkt_info *pkt;
 	int rcu_id;
@@ -945,7 +947,6 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 			pr_err("%s: cannot allocate skb\n", __func__);
 			goto write_fail;
 		}
-		dev_kfree_skb_any(skb);
 		skb = new_skb;
 		DBG_INC_WRITE_CPY(skb->len);
 	}
@@ -999,13 +1000,14 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 		dma_unmap_single(dma_dev, pkt->dma_address,
 					pkt->skb->len,	bam_ops->dma_to);
 		kfree(pkt);
-		if (new_skb)
-			dev_kfree_skb_any(new_skb);
+		goto restore_skb;
 	} else {
 		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
 		spin_lock_irqsave(&bam_ch[id].lock, flags);
 		bam_ch[id].num_tx_pkts++;
 		spin_unlock_irqrestore(&bam_ch[id].lock, flags);
+		if (new_skb)
+			dev_kfree_skb_any(original_skb);
 	}
 	read_unlock(&ul_wakeup_lock);
 	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
@@ -1014,9 +1016,17 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 write_fail3:
 	kfree(pkt);
 write_fail2:
-	skb_pull(skb, sizeof(struct bam_mux_hdr));
-	if (new_skb)
+	rc = -ENOMEM;
+restore_skb:
+	if (new_skb) {
 		dev_kfree_skb_any(new_skb);
+	} else {
+		skb_pull(skb, sizeof(struct bam_mux_hdr));
+		skb_trim(skb, original_len);
+	}
+	read_unlock(&ul_wakeup_lock);
+	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
+	return rc;
 write_fail:
 	read_unlock(&ul_wakeup_lock);
 	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
