@@ -207,13 +207,14 @@ static void cinnamon_apply_params(struct cinnamon_data *cd)
 /* Queue-locked, rate-limited convergence; no idle worker. */
 static void cinnamon_update_ra(struct cinnamon_data *cd)
 {
-	unsigned long current_ra = cd->q->backing_dev_info.ra_pages;
-	unsigned long target, next;
+	unsigned long now = jiffies;
+	unsigned long current_ra, target, next;
 	unsigned int ra_kb;
 
 	if (cd->last_ra_pressure >= 0 &&
-	    time_before(jiffies, cd->last_ra_update + msecs_to_jiffies(50)))
+	    time_before(now, cd->last_ra_update + msecs_to_jiffies(50)))
 		return;
+	current_ra = cd->q->backing_dev_info.ra_pages;
 	switch (cd->pressure) {
 	case 3: ra_kb = 128; break;
 	case 2: ra_kb = 512; break;
@@ -232,7 +233,7 @@ static void cinnamon_update_ra(struct cinnamon_data *cd)
 	if (next != current_ra)
 		cd->q->backing_dev_info.ra_pages = next;
 	cd->last_ra_pressure = cd->pressure;
-	cd->last_ra_update = jiffies;
+	cd->last_ra_update = now;
 }
 
 /* Queue lock protects pressure and saved parameters. */
@@ -259,7 +260,7 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 static int cinnamon_predict_history(sector_t *history, int index,
 				    int count, sector_t *prediction)
 {
-	s64 average = 0, minimum = 0, maximum = 0;
+	int average = 0, minimum = 0, maximum = 0;
 	int i, consistent = 0, total = 0;
 	int latest = (index - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 	sector_t position = history[latest];
@@ -271,26 +272,27 @@ static int cinnamon_predict_history(sector_t *history, int index,
 		int cur = (index - i + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 		int prev = (cur - 1 + CINNAMON_HISTORY_SIZE) % CINNAMON_HISTORY_SIZE;
 		sector_t distance;
-		s64 delta;
+		int delta;
 
 		distance = history[cur] >= history[prev] ?
 			history[cur] - history[prev] : history[prev] - history[cur];
 		if (distance >= 1048576)
 			return 0;
-		delta = history[cur] >= history[prev] ? (s64)distance : -(s64)distance;
+		delta = history[cur] >= history[prev] ? (int)distance : -(int)distance;
 		if (i == 1) {
 			minimum = maximum = average = delta;
 		} else {
 			minimum = min(minimum, delta);
 			maximum = max(maximum, delta);
-			average = div_s64(average * (i - 1) + delta, i);
+			if (maximum - minimum >= 2048)
+				return 0;
+			average = (average * (i - 1) + delta) / i;
 		}
 		total++;
 		if (abs(delta - average) < 1024)
 			consistent++;
 	}
-	if (consistent * 100 / total < 80 || maximum - minimum >= 2048 ||
-	    !average || abs(average) >= 1048576)
+	if (consistent * 5 < total * 4 || !average)
 		return 0;
 	if (average < 0) {
 		if (position < -average)
