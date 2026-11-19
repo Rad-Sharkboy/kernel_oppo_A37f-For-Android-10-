@@ -1608,15 +1608,21 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	{
 		struct ion_handle *handle;
 		handle = ion_import_dma_buf(client, data.fd.fd);
-		if (IS_ERR(handle)) {
-			ret = PTR_ERR(handle);
-		} else {
-			handle = pass_to_user(handle);
-			if (IS_ERR(handle))
-				ret = PTR_ERR(handle);
-			else
-				data.handle.handle = handle->id;
+		if (IS_ERR(handle))
+			return PTR_ERR(handle);
+		mutex_lock(&client->lock);
+		cleanup_handle = ion_handle_get_check_overflow(handle);
+		mutex_unlock(&client->lock);
+		if (IS_ERR(cleanup_handle)) {
+			ion_handle_put(handle);
+			return PTR_ERR(cleanup_handle);
 		}
+		handle = pass_to_user(handle);
+		if (IS_ERR(handle)) {
+			ion_handle_put(cleanup_handle);
+			return PTR_ERR(handle);
+		}
+		data.handle.handle = handle->id;
 		break;
 	}
 	case ION_IOC_SYNC:
