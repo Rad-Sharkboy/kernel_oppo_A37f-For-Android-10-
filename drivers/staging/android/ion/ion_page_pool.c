@@ -126,7 +126,7 @@ static int ion_page_pool_total(struct ion_page_pool *pool, bool high)
 int ion_page_pool_shrink(struct ion_page_pool *pool, gfp_t gfp_mask,
 				int nr_to_scan)
 {
-	int i;
+	unsigned long scanned;
 	bool high;
 
 	if (current_is_kswapd())
@@ -134,7 +134,8 @@ int ion_page_pool_shrink(struct ion_page_pool *pool, gfp_t gfp_mask,
 	else
 		high = !!(gfp_mask & __GFP_HIGHMEM);
 
-	for (i = 0; i < nr_to_scan; i++) {
+	for (scanned = 0; nr_to_scan > 0 && scanned < nr_to_scan;
+	     scanned += 1UL << pool->order) {
 		struct page *page;
 
 		mutex_lock(&pool->mutex);
