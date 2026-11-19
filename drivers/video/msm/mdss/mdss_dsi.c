@@ -101,7 +101,7 @@ static int mdss_dsi_panel_power_off(struct mdss_panel_data *pdata)
 		if (qpnp_ibb_enable(false))
 			pr_err("Unable to disable bias vreg\n");
 		/* Add delay recommended by panel specs */
-		udelay(2000);
+		usleep_range(2000, 2100);
 	}
 
 	for (i = DSI_MAX_PM - 1; i >= 0; i--) {
@@ -128,6 +128,7 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 	int ret = 0;
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
 	int i = 0;
+	bool bias_enabled = false;
 
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
@@ -150,19 +151,18 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 		if (ret) {
 			pr_err("%s: failed to enable vregs for %s\n",
 				__func__, __mdss_dsi_pm_name(i));
-			goto error;
+			goto disable_vregs;
 		}
 	}
 	if (ctrl_pdata->panel_bias_vreg) {
 		pr_debug("%s: Enable panel bias vreg. ndx = %d\n",
 		       __func__, ctrl_pdata->ndx);
-		if (qpnp_ibb_enable(true))
+		bias_enabled = !qpnp_ibb_enable(true);
+		if (!bias_enabled)
 			pr_err("Unable to configure bias vreg\n");
 		/* Add delay recommended by panel specs */
-		udelay(2000);
+		usleep_range(2000, 2100);
 	}
-
-	i--;
 
 	/*
 	 * If continuous splash screen feature is enabled, then we need to
@@ -176,21 +176,28 @@ static int mdss_dsi_panel_power_on(struct mdss_panel_data *pdata)
 			pr_debug("reset enable: pinctrl not enabled\n");
 
 		ret = mdss_dsi_panel_reset(pdata, 1);
-		if (ret)
-			pr_err("%s: Panel reset failed. rc=%d\n",
-					__func__, ret);
+		if (ret) {
+			pr_err("%s: Panel reset failed. rc=%d\n", __func__, ret);
+			mdss_dsi_pinctrl_set_state(ctrl_pdata, false);
+			if (bias_enabled) {
+				if (qpnp_ibb_enable(false))
+					pr_err("Unable to disable bias vreg\n");
+				usleep_range(2000, 2100);
+			}
+			goto disable_vregs;
+		}
 	}
+	return 0;
 
-error:
-	if (ret) {
-		for (; i >= 0; i--)
-			msm_dss_enable_vreg(
-				ctrl_pdata->power_data[i].vreg_config,
-				ctrl_pdata->power_data[i].num_vreg, 0);
+disable_vregs:
+	for (i--; i >= 0; i--) {
+		if (i == DSI_CORE_PM)
+			continue;
+		msm_dss_enable_vreg(ctrl_pdata->power_data[i].vreg_config,
+				    ctrl_pdata->power_data[i].num_vreg, 0);
 	}
 	return ret;
 }
-
 static int mdss_dsi_panel_power_lp(struct mdss_panel_data *pdata, int enable)
 {
 	/* Panel power control when entering/exiting lp mode */
@@ -486,8 +493,11 @@ static int mdss_dsi_off(struct mdss_panel_data *pdata, int power_state)
 		goto panel_power_ctrl;
 	}
 
-	if (pdata->panel_info.type == MIPI_CMD_PANEL)
-		mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+	if (pdata->panel_info.type == MIPI_CMD_PANEL) {
+		ret = mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+		if (ret)
+			goto end;
+	}
 
 	if (!pdata->panel_info.ulps_suspend_enabled) {
 		/* disable DSI controller */
@@ -587,7 +597,9 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 	 * Phy. Phy and ctrl setup need to be done before enabling the link
 	 * clocks.
 	 */
-	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_BUS_CLKS, 1);
+	ret = mdss_dsi_clk_ctrl(ctrl_pdata, DSI_BUS_CLKS, 1);
+	if (ret)
+		goto power_off;
 
 	/*
 	 * If ULPS during suspend feature is enabled, then DSI PHY was
@@ -603,7 +615,11 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 	}
 
 	/* DSI link clocks need to be on prior to ctrl sw reset */
-	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_LINK_CLKS, 1);
+	ret = mdss_dsi_clk_ctrl(ctrl_pdata, DSI_LINK_CLKS, 1);
+	if (ret) {
+		mdss_dsi_clk_ctrl(ctrl_pdata, DSI_BUS_CLKS, 0);
+		goto power_off;
+	}
 	mdss_dsi_sw_reset(ctrl_pdata, true);
 
 	/*
@@ -613,7 +629,11 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 	if (mipi->lp11_init) {
 		if (mdss_dsi_pinctrl_set_state(ctrl_pdata, true))
 			pr_debug("reset enable: pinctrl not enabled\n");
-		mdss_dsi_panel_reset(pdata, 1);
+		ret = mdss_dsi_panel_reset(pdata, 1);
+		if (ret) {
+			mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 0);
+			goto power_off;
+		}
 	}
 
 	if (mipi->init_delay)
@@ -634,6 +654,10 @@ int mdss_dsi_on(struct mdss_panel_data *pdata)
 end:
 	pr_debug("%s-:\n", __func__);
 	return 0;
+
+power_off:
+	mdss_dsi_panel_power_ctrl(pdata, MDSS_PANEL_POWER_OFF);
+	return ret;
 }
 
 static int mdss_dsi_pinctrl_set_state(
@@ -707,7 +731,9 @@ static int mdss_dsi_unblank(struct mdss_panel_data *pdata)
 	pr_debug("%s+: ctrl=%pK ndx=%d cur_blank_state=%d\n", __func__,
 		ctrl_pdata, ctrl_pdata->ndx, pdata->panel_info.blank_state);
 
-	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+	ret = mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+	if (ret)
+		return ret;
 
 	if (pdata->panel_info.blank_state == MDSS_PANEL_BLANK_LOW_POWER) {
 		pr_debug("%s: dsi_unblank with panel always on\n", __func__);
@@ -763,7 +789,9 @@ static int mdss_dsi_blank(struct mdss_panel_data *pdata, int power_state)
 	pr_debug("%s+: ctrl=%pK ndx=%d power_state=%d\n",
 		__func__, ctrl_pdata, ctrl_pdata->ndx, power_state);
 
-	mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+	ret = mdss_dsi_clk_ctrl(ctrl_pdata, DSI_ALL_CLKS, 1);
+	if (ret)
+		return ret;
 
 	if (mdss_panel_is_power_on_lp(power_state)) {
 		pr_debug("%s: low power state requested\n", __func__);
@@ -796,7 +824,7 @@ static int mdss_dsi_blank(struct mdss_panel_data *pdata, int power_state)
 		if (mdss_dsi_is_te_based_esd(ctrl_pdata)) {
 				disable_irq(gpio_to_irq(
 					ctrl_pdata->disp_te_gpio));
-				atomic_dec(&ctrl_pdata->te_irq_ready);
+				atomic_set(&ctrl_pdata->te_irq_ready, 0);
 		}
 		mdss_dsi_set_tear_off(ctrl_pdata);
 	}
@@ -1283,8 +1311,9 @@ static int mdss_dsi_event_handler(struct mdss_panel_data *pdata,
 		break;
 	case MDSS_EVENT_LINK_READY:
 		rc = mdss_dsi_on(pdata);
-		mdss_dsi_op_mode_config(pdata->panel_info.mipi.mode,
-							pdata);
+		if (!rc)
+			mdss_dsi_op_mode_config(pdata->panel_info.mipi.mode,
+						pdata);
 		break;
 	case MDSS_EVENT_UNBLANK:
 		if (ctrl_pdata->refresh_clk_rate)
