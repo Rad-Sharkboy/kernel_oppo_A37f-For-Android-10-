@@ -236,6 +236,7 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 					} else {
 						rtc_tm_to_time(&soc_update_rtc_time, &chip->soc_update_time);
 						if (chip->bat_volt_check_point > 1 &&
+							chip->soc_update_pre_time &&
 							chip->soc_update_time >= chip->soc_update_pre_time &&
 							(chip->soc_update_time - chip->soc_update_pre_time) >= EIGHT_MINUTES)
 							chip->bat_volt_check_point--;
