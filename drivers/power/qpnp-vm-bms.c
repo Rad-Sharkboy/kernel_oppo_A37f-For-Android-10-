@@ -3900,17 +3900,27 @@ static int register_bms_char_device(struct qpnp_bms_chip *chip)
 					NULL, "vm_bms");
 	if (IS_ERR(chip->bms_device)) {
 		pr_err("Fail to create bms_device device\n");
-		rc = -EINVAL;
-		goto delete_cdev;
+		rc = PTR_ERR(chip->bms_device);
+		goto destroy_class;
 	}
 
 	return 0;
 
+destroy_class:
+	class_destroy(chip->bms_class);
 delete_cdev:
 	cdev_del(&chip->bms_cdev);
 unregister_chrdev:
 	unregister_chrdev_region(chip->dev_no, 1);
 	return rc;
+}
+
+static void unregister_bms_char_device(struct qpnp_bms_chip *chip)
+{
+	device_destroy(chip->bms_class, chip->dev_no);
+	class_destroy(chip->bms_class);
+	cdev_del(&chip->bms_cdev);
+	unregister_chrdev_region(chip->dev_no, 1);
 }
 
 static int qpnp_vm_bms_probe(struct spmi_device *spmi)
@@ -4133,9 +4143,7 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 fail_get_vtg:
 	power_supply_unregister(&chip->bms_psy);
 fail_psy:
-	device_destroy(chip->bms_class, chip->dev_no);
-	cdev_del(&chip->bms_cdev);
-	unregister_chrdev_region(chip->dev_no, 1);
+	unregister_bms_char_device(chip);
 fail_bms_device:
 	chip->bms_psy_registered = false;
 fail_irq:
@@ -4164,9 +4172,7 @@ static int qpnp_vm_bms_remove(struct spmi_device *spmi)
 	cancel_delayed_work_sync(&chip->voltage_soc_timeout_work);
 	cancel_delayed_work_sync(&chip->monitor_soc_work);
 	debugfs_remove_recursive(chip->debug_root);
-	device_destroy(chip->bms_class, chip->dev_no);
-	cdev_del(&chip->bms_cdev);
-	unregister_chrdev_region(chip->dev_no, 1);
+	unregister_bms_char_device(chip);
 	reset_vbat_monitoring(chip);
 	wakeup_source_trash(&chip->vbms_lv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_cv_wake_source.source);
