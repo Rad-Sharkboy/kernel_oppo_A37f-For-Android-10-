@@ -1218,14 +1218,20 @@ static int ion_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	int ret;
 
 	mutex_lock(&buffer->lock);
+	if (!buffer->pages || vmf->pgoff >= buffer->size >> PAGE_SHIFT ||
+	    !buffer->pages[vmf->pgoff]) {
+		mutex_unlock(&buffer->lock);
+		return VM_FAULT_SIGBUS;
+	}
 	ion_buffer_page_dirty(buffer->pages + vmf->pgoff);
-	BUG_ON(!buffer->pages || !buffer->pages[vmf->pgoff]);
 
 	pfn = page_to_pfn(ion_buffer_page(buffer->pages[vmf->pgoff]));
 	ret = vm_insert_pfn(vma, (unsigned long)vmf->virtual_address, pfn);
 	mutex_unlock(&buffer->lock);
-	if (ret)
-		return VM_FAULT_ERROR;
+	if (ret == -ENOMEM)
+		return VM_FAULT_OOM;
+	if (ret && ret != -EBUSY)
+		return VM_FAULT_SIGBUS;
 
 	return VM_FAULT_NOPAGE;
 }
