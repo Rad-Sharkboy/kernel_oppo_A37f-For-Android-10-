@@ -325,7 +325,7 @@ struct apds9921_data {
 	struct i2c_client *client;
 
 	//struct mutex update_lock;
-	struct delayed_work	dwork;		/* for interrupt */
+	struct work_struct irq_work;
 	struct delayed_work	als_dwork;	/* for ALS polling */
 	struct input_dev *input_dev_als;
 	struct input_dev *input_dev_ps;
@@ -343,7 +343,9 @@ struct apds9921_data {
 	struct regulator *vdd;
 	struct regulator *vio;
 
+	int irq_gpio;
 	int irq;
+	bool irq_wake;
 	int als_suspended;
 	int ps_suspended;
 	unsigned int main_ctrl_suspended_value;	/* suspend_resume usage */
@@ -744,16 +746,6 @@ static void apds9921_change_als_threshold(struct i2c_client *client)
 	printk_x(SHOW_LOG,"apds9921 report to HAL, Lux = %d\n", luxValue);
 }
 
-static void apds9921_reschedule_work(struct apds9921_data *data,unsigned long delay)
-{
-	/*
-	 * If work is already scheduled then subsequent schedules will not
-	 * change the scheduled time that's why we have to cancel it first.
-	 */
-	cancel_delayed_work(&data->dwork);
-	queue_delayed_work(apds_workqueue, &data->dwork, delay);
-}
-
 /* ALS polling routine */
 static void apds9921_als_polling_work_handler(struct work_struct *work)
 {
@@ -775,36 +767,36 @@ static void apds9921_als_polling_work_handler(struct work_struct *work)
 	queue_delayed_work(apds_workqueue, &data->als_dwork, msecs_to_jiffies(data->als_poll_delay));	// restart timer
 }
 
-/* Interrupt Service Routine */
-static void apds9921_work_handler(struct work_struct *work)
+static void apds9921_irq_work(struct work_struct *work)
 {
-	struct apds9921_data *data = container_of(work, struct apds9921_data, dwork.work);
-	struct i2c_client *client=data->client;
+	struct apds9921_data *data = container_of(work, struct apds9921_data,
+						irq_work);
+	struct i2c_client *client = data->client;
 	int status;
 
-	if(data->enable_ps_sensor > 0)
-	{
+	if (data->enable_ps_sensor) {
 		status = apds9921_check_intr(client);
-
 		if (status >= 0 && (status & APDS9921_DD_PRX_INT_STATUS))
-		{
 			apds9921_change_ps_threshold(client);
-		}
 	}
-
-	enable_irq(data->irq);
 }
 
-/* assume this is ISR */
-static irqreturn_t apds9921_interrupt(int vec, void *info)
+static irqreturn_t apds9921_interrupt(int irq, void *info)
 {
-	struct i2c_client *client=(struct i2c_client *)info;
+	struct i2c_client *client = info;
 	struct apds9921_data *data = i2c_get_clientdata(client);
 
-	disable_irq_nosync(data->irq);
-	apds9921_reschedule_work(data, 0);
-
+	/* Keep the wake line unmasked while the workqueue is frozen. */
+	queue_work(apds_workqueue, &data->irq_work);
 	return IRQ_HANDLED;
+}
+
+static void apds9921_release_irq(struct apds9921_data *data)
+{
+	if (data->irq_wake)
+		irq_set_irq_wake(data->irq, 0);
+	free_irq(data->irq, data->client);
+	cancel_work_sync(&data->irq_work);
 }
 
 static int apds9921_enable_als_sensor(struct i2c_client *client, int val)
@@ -1496,16 +1488,8 @@ static int apds_parse_dt(struct device *dev, struct apds9921_data *data)
 	data->exit = sensor_platform_hw_exit;
 	data->power_on = sensor_platform_hw_power_on;
 
-	data->irq = of_get_named_gpio_flags(np, "apds,irq-gpio", 0, NULL);
-	if (data->irq < 0)
-	{
-		dev_err(dev, "Unable to read irq-gpio\n");
-		return -1;
-	}
-
-	printk("%s, irq = %d\n", __func__, data->irq);
-
-	return 0;
+	data->irq_gpio = of_get_named_gpio_flags(np, "apds,irq-gpio", 0, NULL);
+	return data->irq_gpio < 0 ? data->irq_gpio : 0;
 }
 
 #ifdef APDS9921_ALSPS_DYNAMIC_THRESHOLD
@@ -1978,7 +1962,7 @@ static int apds9921_probe(struct i2c_client *client,
 {
 	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
 	struct apds9921_data *data;
-	int err = 0, irq = 0;
+	int err = 0;
 
 	printk("%s start.\n", __func__);
 
@@ -2021,7 +2005,9 @@ static int apds9921_probe(struct i2c_client *client,
 	data->main_ctrl_suspended_value = 0;	/* suspend_resume usage */
 
 	//mutex_init(&data->update_lock);
-	apds_parse_dt(&client->dev, data);
+	err = apds_parse_dt(&client->dev, data);
+	if (err)
+		goto free_data;
 
 	wake_lock_init(&data->ps_wakelock,WAKE_LOCK_SUSPEND, "apds_input_wakelock");
 
@@ -2050,37 +2036,29 @@ static int apds9921_probe(struct i2c_client *client,
 	if (err)
 		goto exit_init_client_fail;
 
-	err = gpio_request(data->irq, "apds_irq");
+	err = gpio_request(data->irq_gpio, "apds_irq");
 	if (err)
-	{
-		printk("Unable to request GPIO.\n");
-		goto exit_kfree;
+		goto exit_init_client_fail;
+	err = gpio_direction_input(data->irq_gpio);
+	if (err)
+		goto exit_free_gpio;
+	data->irq = gpio_to_irq(data->irq_gpio);
+	if (data->irq < 0) {
+		err = data->irq;
+		goto exit_free_gpio;
 	}
 
-	gpio_direction_input(data->irq);
-	irq = gpio_to_irq(data->irq);
-	if (irq < 0)
-	{
-		printk("Unable to request gpio irq. int pin = %d, irq = %d, err=%d\n", data->irq, irq, err);
-		gpio_free(data->irq);
-
-		goto exit_kfree;
-	}
-
-	if (request_irq(irq, apds9921_interrupt, IRQF_TRIGGER_FALLING, APDS9921_DRV_NAME, (void *)client))
-	{
-		printk("%s Could not allocate APDS9950_INT !\n", __func__);
-		goto exit_kfree;
-	}
-
-	irq_set_irq_wake(client->irq, 1);
-
-	// interrupt
-	INIT_DELAYED_WORK(&data->dwork, apds9921_work_handler);
-	// polling : ALS
+	INIT_WORK(&data->irq_work, apds9921_irq_work);
 	INIT_DELAYED_WORK(&data->als_dwork, apds9921_als_polling_work_handler);
+	err = request_irq(data->irq, apds9921_interrupt, IRQF_TRIGGER_FALLING,
+			  APDS9921_DRV_NAME, client);
+	if (err)
+		goto exit_free_gpio;
 
-	printk("%s interrupt is hooked\n", __func__);
+	err = irq_set_irq_wake(data->irq, 1);
+	data->irq_wake = !err;
+	if (err)
+		dev_warn(&client->dev, "Failed to enable sensor IRQ wake: %d\n", err);
 
 	/* Register to Input Device */
 	data->input_dev_als = devm_input_allocate_device(&client->dev);
@@ -2094,7 +2072,7 @@ static int apds9921_probe(struct i2c_client *client,
 	if (!data->input_dev_ps) {
 		err = -ENOMEM;
 		printk("Failed to allocate input device ps\n");
-		goto exit_free_dev_als;
+		goto exit_free_irq;
 	}
 
 	set_bit(EV_ABS, data->input_dev_als->evbit);
@@ -2111,7 +2089,7 @@ static int apds9921_probe(struct i2c_client *client,
 		err = -ENOMEM;
 		printk("Unable to register input device als: %s\n",
 				data->input_dev_als->name);
-		goto exit_free_dev_ps;
+		goto exit_free_irq;
 	}
 
 	err = input_register_device(data->input_dev_ps);
@@ -2119,14 +2097,16 @@ static int apds9921_probe(struct i2c_client *client,
 		err = -ENOMEM;
 		printk("Unable to register input device ps: %s\n",
 				data->input_dev_ps->name);
-		goto exit_free_dev_ps;
+		goto exit_free_irq;
+	}
+
+	if (data->power_on) {
+		err = data->power_on(false);
+		if (err)
+			goto exit_free_irq;
 	}
 
 #ifdef APDS9921_ALSPS_DYNAMIC_THRESHOLD
-	INIT_DELAYED_WORK(&sample_ps_work, sample_work_func);
-
-	queue_delayed_work(apds_workqueue,&sample_ps_work, msecs_to_jiffies(5000));
-
 	init_waitqueue_head(&enable_wq);
 #endif
 
@@ -2140,7 +2120,7 @@ static int apds9921_probe(struct i2c_client *client,
 	err = sensors_classdev_register(&data->input_dev_als->dev, &data->als_cdev);
 	if (err) {
 		pr_err("%s: Unable to register to sensors class: %d\n",__func__, err);
-		goto exit_free_dev_ps;
+		goto exit_free_irq;
 	}
 
 	err = sensors_classdev_register(&data->input_dev_ps->dev, &data->ps_cdev);
@@ -2160,8 +2140,10 @@ static int apds9921_probe(struct i2c_client *client,
 	apds9921_ftm.priv_data = data;
 	register_single_dev_ftm(&apds9921_ftm);
 
-	if (data->power_on)
-		err = data->power_on(false);
+#ifdef APDS9921_ALSPS_DYNAMIC_THRESHOLD
+	INIT_DELAYED_WORK(&sample_ps_work, sample_work_func);
+	queue_delayed_work(apds_workqueue, &sample_ps_work, msecs_to_jiffies(5000));
+#endif
 
 	printk("%s support ver. %s enabled\n", __func__, DRIVER_VERSION);
 
@@ -2171,19 +2153,23 @@ exit_unregister_ps_ioctl:
 	sensors_classdev_unregister(&data->ps_cdev);
 exit_unregister_als_ioctl:
 	sensors_classdev_unregister(&data->als_cdev);
-exit_free_dev_ps:
-exit_free_dev_als:
 exit_free_irq:
-	free_irq(data->irq, client);
-exit_kfree:
+	apds9921_release_irq(data);
+	data->enable_als_sensor = 0;
+	cancel_delayed_work_sync(&data->als_dwork);
+exit_free_gpio:
+	gpio_free(data->irq_gpio);
 exit_init_client_fail:
 	data->power_on(false);
 exit_data_power_on:
 	data->exit();
 exit_data_init:
 	wake_lock_destroy(&data->ps_wakelock);
-	kfree(data);
+free_data:
+	i2c_set_clientdata(client, NULL);
 	pdev_data = NULL;
+	apds9921_i2c_client = NULL;
+	kfree(data);
 exit:
 	return err;
 }
@@ -2192,19 +2178,30 @@ static int apds9921_remove(struct i2c_client *client)
 {
 	struct apds9921_data *data = i2c_get_clientdata(client);
 
-	/* Power down the device */
-	apds9921_dd_set_main_ctrl(client, 0);
-
+	unregister_single_dev_ftm(&apds9921_ftm);
 	sysfs_remove_group(&client->dev.kobj, &apds9921_attr_group);
+	sensors_classdev_unregister(&data->ps_cdev);
+	sensors_classdev_unregister(&data->als_cdev);
 
-	free_irq(data->irq, client);
+	apds9921_release_irq(data);
+	gpio_free(data->irq_gpio);
+#ifdef APDS9921_ALSPS_DYNAMIC_THRESHOLD
+	cancel_delayed_work_sync(&sample_ps_work);
+#endif
+	data->enable_als_sensor = 0;
+	cancel_delayed_work_sync(&data->als_dwork);
 
+	if (data->power_on_flag) {
+		apds9921_dd_set_main_ctrl(client, 0);
+		data->power_on(false);
+	}
+	data->exit();
 	wake_lock_destroy(&data->ps_wakelock);
 
-	kfree(data);
-
+	i2c_set_clientdata(client, NULL);
 	pdev_data = NULL;
-
+	apds9921_i2c_client = NULL;
+	kfree(data);
 	return 0;
 }
 
@@ -2225,9 +2222,10 @@ static int apds9921_suspend(struct device *dev)
 			dev_err(&data->client->dev,"Disable light sensor fail! rc=%d\n", rc);
 	}
 
-	if (data->irq && data->enable_ps_sensor)
-	{
+	/* Leave wake-capable proximity interrupts for the PM core. */
+	if (!data->irq_wake && data->enable_ps_sensor) {
 		disable_irq(data->irq);
+		data->ps_suspended = 1;
 	}
 
 	return 0;
@@ -2247,9 +2245,9 @@ static int apds9921_resume(struct device *dev)
 		if (rc)
 			dev_err(&data->client->dev,"Disable light sensor fail! rc=%d\n", rc);
 	}
-	if (data->irq && data->enable_ps_sensor)
-	{
+	if (data->ps_suspended) {
 		enable_irq(data->irq);
+		data->ps_suspended = 0;
 	}
 
 	return 0;
