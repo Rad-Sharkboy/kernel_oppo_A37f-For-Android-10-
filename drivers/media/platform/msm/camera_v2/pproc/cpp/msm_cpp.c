@@ -185,7 +185,9 @@ static int msm_cpp_init_bandwidth_mgr(struct cpp_device *cpp_dev)
 	rc = msm_bus_scale_client_update_request(cpp_dev->bus_client, 1);
 	if (rc < 0) {
 		pr_err("Fail bus scale update %d\n", rc);
-		return -EINVAL;
+		msm_bus_scale_unregister_client(cpp_dev->bus_client);
+		cpp_dev->bus_client = 0;
+		return rc;
 	}
 	cpp_dev->bus_idx = 1;
 
@@ -267,10 +269,10 @@ static void msm_enqueue(struct msm_device_queue *queue,
 
 static struct msm_cam_clk_info cpp_clk_info[CPP_CLK_INFO_MAX];
 
-static int get_clock_index(const char *clk_name)
+static int get_clock_index(struct cpp_device *cpp_dev, const char *clk_name)
 {
 	uint32_t i = 0;
-	for (i = 0; i < ARRAY_SIZE(cpp_clk_info); i++) {
+	for (i = 0; i < cpp_dev->num_clk; i++) {
 		if (!strcmp(clk_name, cpp_clk_info[i].clk_name))
 			return i;
 	}
@@ -633,26 +635,24 @@ void cpp_release_ion_client(struct kref *ref)
 {
 	struct cpp_device *cpp_dev = container_of(ref,
 		struct cpp_device, refcount);
-	pr_err("Calling ion_client_destroy\n");
 	ion_client_destroy(cpp_dev->client);
+	cpp_dev->client = NULL;
 }
 
 static int cpp_init_mem(struct cpp_device *cpp_dev)
 {
-	int rc = 0;
+	int rc;
 
-	kref_init(&cpp_dev->refcount);
-	kref_get(&cpp_dev->refcount);
+	if (!cpp_dev->domain)
+		return -ENODEV;
 	cpp_dev->client = msm_ion_client_create("cpp");
-
-	CPP_DBG("E\n");
-	if (!cpp_dev->domain) {
-		pr_err("domain / iommu context not found\n");
-		return  -ENODEV;
+	if (IS_ERR_OR_NULL(cpp_dev->client)) {
+		rc = cpp_dev->client ? PTR_ERR(cpp_dev->client) : -ENOMEM;
+		cpp_dev->client = NULL;
+		return rc;
 	}
-
-	CPP_DBG("X\n");
-	return rc;
+	kref_init(&cpp_dev->refcount);
+	return 0;
 }
 
 static void cpp_deinit_mem(struct cpp_device *cpp_dev)
@@ -816,9 +816,10 @@ static void cpp_get_clk_freq_tbl(struct clk *clk, struct cpp_hw_info *hw_info)
 static int cpp_init_hardware(struct cpp_device *cpp_dev)
 {
 	int rc = 0;
-	uint32_t msm_cpp_core_clk_idx;
-	uint32_t msm_micro_iface_idx;
+	int msm_cpp_core_clk_idx, msm_micro_iface_idx;
+	struct clk *micro_clk;
 	uint32_t vbif_version;
+	bool buf_mgr_ready = false;
 
 	if (cpp_dev->bus_master_flag)
 		rc = msm_cpp_init_bandwidth_mgr(cpp_dev);
@@ -848,51 +849,31 @@ static int cpp_init_hardware(struct cpp_device *cpp_dev)
 			goto fs_failed;
 		}
 	}
-	msm_micro_iface_idx = get_clock_index("micro_iface_clk");
-	if (msm_micro_iface_idx < 0)  {
-		pr_err("Fail to get clock index\n");
+	msm_micro_iface_idx = get_clock_index(cpp_dev, "micro_iface_clk");
+	if (msm_micro_iface_idx < 0) {
 		rc = msm_micro_iface_idx;
-		goto fs_failed;
+		goto clk_failed;
 	}
 
-	cpp_dev->cpp_clk[msm_micro_iface_idx] =
-		clk_get(&cpp_dev->pdev->dev,
-		cpp_clk_info[msm_micro_iface_idx].clk_name);
-	if (IS_ERR(cpp_dev->cpp_clk[msm_micro_iface_idx])) {
-		pr_err("%s get failed\n",
-		cpp_clk_info[msm_micro_iface_idx].clk_name);
-		rc = PTR_ERR(cpp_dev->cpp_clk[msm_micro_iface_idx]);
-		goto remap_failed;
+	micro_clk = clk_get(&cpp_dev->pdev->dev,
+			   cpp_clk_info[msm_micro_iface_idx].clk_name);
+	if (IS_ERR(micro_clk)) {
+		rc = PTR_ERR(micro_clk);
+		goto clk_failed;
 	}
 
-	rc = clk_reset(cpp_dev->cpp_clk[msm_micro_iface_idx],
-		CLK_RESET_ASSERT);
+	rc = clk_reset(micro_clk, CLK_RESET_ASSERT);
 	if (rc) {
-		pr_err("%s:micro_iface_clk assert failed\n",
-		__func__);
-		clk_put(cpp_dev->cpp_clk[msm_micro_iface_idx]);
-		goto remap_failed;
+		clk_put(micro_clk);
+		goto clk_failed;
 	}
-	/*Below usleep values are chosen based on experiments
-	and this was the smallest number which works. This
-	sleep is needed to leave enough time for Microcontroller
-	to resets all its registers.*/
+	/* Keep the hardware reset and settling times. */
 	usleep_range(10000, 12000);
-
-	rc = clk_reset(cpp_dev->cpp_clk[msm_micro_iface_idx],
-		CLK_RESET_DEASSERT);
-	if (rc) {
-		pr_err("%s:micro_iface_clk assert failed\n", __func__);
-		clk_put(cpp_dev->cpp_clk[msm_micro_iface_idx]);
-		goto remap_failed;
-	}
-	/*Below usleep values are chosen based on experiments and
-	this was the smallest number which works. This sleep is
-	needed to leave enough time for Microcontroller to
-	resets all its registers.*/
+	rc = clk_reset(micro_clk, CLK_RESET_DEASSERT);
+	clk_put(micro_clk);
+	if (rc)
+		goto clk_failed;
 	usleep_range(1000, 1200);
-
-	clk_put(cpp_dev->cpp_clk[msm_micro_iface_idx]);
 
 	rc = msm_cam_clk_enable(&cpp_dev->pdev->dev, cpp_clk_info,
 			cpp_dev->cpp_clk, cpp_dev->num_clk, 1);
@@ -925,12 +906,14 @@ static int cpp_init_hardware(struct cpp_device *cpp_dev)
 		goto cpp_hw_remap_failed;
 	}
 
+	cpp_dev->taskletq_idx = 0;
+	atomic_set(&cpp_dev->irq_cnt, 0);
 	if (cpp_dev->state != CPP_STATE_BOOT) {
 		rc = request_irq(cpp_dev->irq->start, msm_cpp_irq,
 			IRQF_TRIGGER_RISING, "cpp", cpp_dev);
 		if (rc < 0) {
 			pr_err("irq request fail\n");
-			goto req_irq_fail;
+			goto unmap_hw;
 		}
 		cpp_dev->buf_mgr_subdev = msm_buf_mngr_get_subdev();
 
@@ -938,9 +921,9 @@ static int cpp_init_hardware(struct cpp_device *cpp_dev)
 			VIDIOC_MSM_BUF_MNGR_INIT, NULL);
 		if (rc < 0) {
 			pr_err("buf mngr init failed\n");
-			free_irq(cpp_dev->irq->start, cpp_dev);
-			goto req_irq_fail;
+			goto runtime_failed;
 		}
+		buf_mgr_ready = true;
 	}
 
 	cpp_dev->hw_info.cpp_hw_version =
@@ -953,23 +936,21 @@ static int cpp_init_hardware(struct cpp_device *cpp_dev)
 	pr_info("CPP HW Version: 0x%x\n", cpp_dev->hw_info.cpp_hw_version);
 	cpp_dev->hw_info.cpp_hw_caps =
 		msm_camera_io_r(cpp_dev->cpp_hw_base + 0x4);
-	msm_cpp_core_clk_idx = get_clock_index("cpp_core_clk");
+	msm_cpp_core_clk_idx = get_clock_index(cpp_dev, "cpp_core_clk");
 	if (msm_cpp_core_clk_idx < 0)  {
 		pr_err("cpp_core_clk: fail to get clock index\n");
 		rc = msm_cpp_core_clk_idx;
-		goto req_irq_fail;
+		goto runtime_failed;
 	}
 	cpp_get_clk_freq_tbl(cpp_dev->cpp_clk[msm_cpp_core_clk_idx],
 		&cpp_dev->hw_info);
 	pr_debug("CPP HW Caps: 0x%x\n", cpp_dev->hw_info.cpp_hw_caps);
 	msm_camera_io_w(0x1, cpp_dev->vbif_base + 0x4);
-	cpp_dev->taskletq_idx = 0;
-	atomic_set(&cpp_dev->irq_cnt, 0);
 	rc = msm_cpp_create_buff_queue(cpp_dev, MSM_CPP_MAX_BUFF_QUEUE);
 	if (rc < 0) {
 		pr_err("%s: create buff queue failed with err %d\n",
 			__func__, rc);
-		goto req_irq_fail;
+		goto runtime_failed;
 	}
 	pr_err("stream_cnt:%d\n", cpp_dev->stream_cnt);
 	cpp_dev->stream_cnt = 0;
@@ -984,7 +965,14 @@ static int cpp_init_hardware(struct cpp_device *cpp_dev)
 	}
 
 	return rc;
-req_irq_fail:
+runtime_failed:
+	if (cpp_dev->state != CPP_STATE_BOOT) {
+		free_irq(cpp_dev->irq->start, cpp_dev);
+		tasklet_kill(&cpp_dev->cpp_tasklet);
+		if (buf_mgr_ready)
+			msm_cpp_buffer_ops(cpp_dev, VIDIOC_MSM_BUF_MNGR_DEINIT, NULL);
+	}
+unmap_hw:
 	iounmap(cpp_dev->cpp_hw_base);
 cpp_hw_remap_failed:
 	iounmap(cpp_dev->vbif_base);
@@ -996,6 +984,7 @@ remap_failed:
 clk_failed:
 	regulator_disable(cpp_dev->fs_cpp);
 	regulator_put(cpp_dev->fs_cpp);
+	cpp_dev->fs_cpp = NULL;
 fs_failed:
 		if (cpp_dev->bus_master_flag)
 			msm_cpp_deinit_bandwidth_mgr(cpp_dev);
@@ -1009,15 +998,13 @@ static void cpp_release_hardware(struct cpp_device *cpp_dev)
 {
 	int32_t rc;
 	if (cpp_dev->state != CPP_STATE_BOOT) {
-		rc = msm_cpp_buffer_ops(cpp_dev,
-			VIDIOC_MSM_BUF_MNGR_DEINIT, NULL);
-		if (rc < 0) {
-			pr_err("error in buf mngr deinit\n");
-			rc = -EINVAL;
-		}
 		free_irq(cpp_dev->irq->start, cpp_dev);
 		tasklet_kill(&cpp_dev->cpp_tasklet);
 		atomic_set(&cpp_dev->irq_cnt, 0);
+		rc = msm_cpp_buffer_ops(cpp_dev,
+			VIDIOC_MSM_BUF_MNGR_DEINIT, NULL);
+		if (rc < 0)
+			pr_err("error in buf mngr deinit: %d\n", rc);
 	}
 	msm_cpp_delete_buff_queue(cpp_dev);
 	iounmap(cpp_dev->base);
@@ -1169,20 +1156,25 @@ static int cpp_open_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	CPP_DBG("open %d %p\n", i, &fh->vfh);
 	cpp_dev->cpp_open_cnt++;
 	if (cpp_dev->cpp_open_cnt == 1) {
+		rc = cpp_init_mem(cpp_dev);
+		if (rc < 0)
+			goto open_failed;
 		rc = cpp_init_hardware(cpp_dev);
 		if (rc < 0) {
-			cpp_dev->cpp_open_cnt--;
-			cpp_dev->cpp_subscribe_list[i].active = 0;
-			cpp_dev->cpp_subscribe_list[i].vfh = NULL;
-			mutex_unlock(&cpp_dev->mutex);
-			return rc;
+			cpp_deinit_mem(cpp_dev);
+			goto open_failed;
 		}
-
-		cpp_init_mem(cpp_dev);
 		cpp_dev->state = CPP_STATE_IDLE;
 	}
 	mutex_unlock(&cpp_dev->mutex);
 	return 0;
+
+open_failed:
+	cpp_dev->cpp_open_cnt--;
+	cpp_dev->cpp_subscribe_list[i].active = 0;
+	cpp_dev->cpp_subscribe_list[i].vfh = NULL;
+	mutex_unlock(&cpp_dev->mutex);
+	return rc;
 }
 
 static int cpp_close_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
@@ -1214,7 +1206,8 @@ static int cpp_close_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	}
 
 	for (i = 0; i < MAX_ACTIVE_CPP_INSTANCE; i++) {
-		if (cpp_dev->cpp_subscribe_list[i].active == 1) {
+		if (cpp_dev->cpp_subscribe_list[i].active &&
+		    (!fh || cpp_dev->cpp_subscribe_list[i].vfh == &fh->vfh)) {
 			cpp_dev->cpp_subscribe_list[i].active = 0;
 			cpp_dev->cpp_subscribe_list[i].vfh = NULL;
 			break;
@@ -1261,6 +1254,7 @@ static int cpp_close_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 		msm_camera_io_w(0x0, cpp_dev->base + MSM_CPP_MICRO_CLKEN_CTL);
 		msm_cpp_clear_timer(cpp_dev);
 		cpp_release_hardware(cpp_dev);
+		del_timer_sync(&cpp_timer.cpp_timer);
 		if (cpp_dev->iommu_state == CPP_IOMMU_STATE_ATTACHED) {
 			iommu_detach_device(cpp_dev->domain,
 				cpp_dev->iommu_ctx);
@@ -1412,57 +1406,43 @@ static int msm_cpp_dump_frame_cmd(struct msm_cpp_frame_info_t *frame_info)
 
 static void msm_cpp_do_timeout_work(struct work_struct *work)
 {
+	struct msm_cpp_work_t *timeout = container_of(work, struct msm_cpp_work_t,
+						     my_work);
+	struct cpp_device *cpp_dev = timeout->cpp_dev;
+	struct msm_cpp_frame_info_t *frame;
 
-	pr_info("cpp_timer_callback called. (jiffies=%lu)\n",
-		jiffies);
-	if (!work || cpp_timer.data.cpp_dev->state != CPP_STATE_ACTIVE) {
-		pr_err("Invalid work:%p or state:%d\n", work,
-			cpp_timer.data.cpp_dev->state);
-		return;
-	}
-	if (!atomic_read(&cpp_timer.used)) {
-		pr_info("Delayed trigger, IRQ serviced\n");
-		return;
-	}
+	mutex_lock(&cpp_dev->mutex);
+	if (cpp_dev->state != CPP_STATE_ACTIVE ||
+	    !atomic_read(&cpp_timer.used) || timer_pending(&cpp_timer.cpp_timer))
+		goto unlock;
 
-	disable_irq(cpp_timer.data.cpp_dev->irq->start);
-	pr_err("Reloading firmware\n");
-	if (!atomic_read(&cpp_timer.used)) {
-		pr_err("Delayed trigger, IRQ serviced\n");
-		return;
-	}
-#ifdef VENDOR_EDIT
-/*Added by Jinshui.Liu@Camera 20150623 start for avoid multi init the timer*/
-	msm_cpp_clear_timer(cpp_timer.data.cpp_dev);
-#endif
-	atomic_set(&cpp_timer.used, 0);
-	cpp_load_fw(cpp_timer.data.cpp_dev,
-		cpp_timer.data.cpp_dev->fw_name_bin);
-	pr_info("Firmware loading done\n");
-	enable_irq(cpp_timer.data.cpp_dev->irq->start);
-	msm_camera_io_w_mb(0x8, cpp_timer.data.cpp_dev->base +
-		MSM_CPP_MICRO_IRQGEN_MASK);
-	msm_camera_io_w_mb(0xFFFF,
-		cpp_timer.data.cpp_dev->base +
-		MSM_CPP_MICRO_IRQGEN_CLR);
+	disable_irq(cpp_dev->irq->start);
+	tasklet_disable(&cpp_dev->cpp_tasklet);
+	if (!atomic_read(&cpp_timer.used))
+		goto resume_irq;
 
-	mutex_lock(&cpp_timer.data.cpp_dev->mutex);
-	msm_cpp_dump_frame_cmd(cpp_timer.data.processed_frame);
-	msm_cpp_notify_frame_done(cpp_timer.data.cpp_dev, 1);
-	atomic_set(&cpp_timer.used, 0);
-	cpp_timer.data.processed_frame = NULL;
-	cpp_timer.data.cpp_dev->timeout_trial_cnt = 0;
-	mutex_unlock(&cpp_timer.data.cpp_dev->mutex);
-	pr_info("exit\n");
-	return;
+	frame = cpp_timer.data.processed_frame;
+	msm_cpp_clear_timer(cpp_dev);
+	pr_err("CPP frame timeout: reloading firmware\n");
+	cpp_load_fw(cpp_dev, cpp_dev->fw_name_bin);
+	msm_camera_io_w_mb(0x8, cpp_dev->base + MSM_CPP_MICRO_IRQGEN_MASK);
+	msm_camera_io_w_mb(0xFFFF, cpp_dev->base + MSM_CPP_MICRO_IRQGEN_CLR);
+	if (frame)
+		msm_cpp_dump_frame_cmd(frame);
+	msm_cpp_notify_frame_done(cpp_dev, 1);
+
+resume_irq:
+	tasklet_enable(&cpp_dev->cpp_tasklet);
+	enable_irq(cpp_dev->irq->start);
+unlock:
+	mutex_unlock(&cpp_dev->mutex);
 }
 
 void cpp_timer_callback(unsigned long data)
 {
-	struct msm_cpp_work_t *work =
-		cpp_timer.data.cpp_dev->work;
-	queue_work(cpp_timer.data.cpp_dev->timer_wq,
-		(struct work_struct *)work);
+	struct cpp_device *cpp_dev = (struct cpp_device *)data;
+
+	queue_work(cpp_dev->timer_wq, &cpp_dev->work->my_work);
 }
 
 static int msm_cpp_send_frame_to_hardware(struct cpp_device *cpp_dev,
@@ -1470,7 +1450,6 @@ static int msm_cpp_send_frame_to_hardware(struct cpp_device *cpp_dev,
 {
 	uint32_t i;
 	int32_t rc = -EAGAIN;
-	int ret;
 	struct msm_cpp_frame_info_t *process_frame;
 
 	if (cpp_dev->processing_q.len < MAX_CPP_PROCESSING_FRAME) {
@@ -1480,17 +1459,8 @@ static int msm_cpp_send_frame_to_hardware(struct cpp_device *cpp_dev,
 
 		cpp_timer.data.processed_frame = process_frame;
 		atomic_set(&cpp_timer.used, 1);
-		/* install timer for cpp timeout */
-		init_timer(&cpp_timer.cpp_timer);
-		CPP_DBG("Installing cpp_timer\n");
-		setup_timer(&cpp_timer.cpp_timer,
-			cpp_timer_callback, (unsigned long)&cpp_timer);
-		CPP_DBG("Starting timer to fire in %d ms. (jiffies=%lu)\n",
-			CPP_CMD_TIMEOUT_MS, jiffies);
-		ret = mod_timer(&cpp_timer.cpp_timer,
-			jiffies + msecs_to_jiffies(CPP_CMD_TIMEOUT_MS));
-		if (ret)
-			pr_err("error in mod_timer\n");
+		mod_timer(&cpp_timer.cpp_timer,
+			  jiffies + msecs_to_jiffies(CPP_CMD_TIMEOUT_MS));
 		msm_cpp_write(0x6, cpp_dev->base);
 		msm_cpp_dump_frame_cmd(process_frame);
 		msm_cpp_poll_rx_empty(cpp_dev->base);
@@ -2178,7 +2148,7 @@ long msm_cpp_subdev_ioctl(struct v4l2_subdev *sd,
 		}
 
 		if (clock_settings.clock_rate > 0) {
-			msm_cpp_core_clk_idx = get_clock_index("cpp_core_clk");
+			msm_cpp_core_clk_idx = get_clock_index(cpp_dev, "cpp_core_clk");
 			if (msm_cpp_core_clk_idx < 0) {
 				pr_err(" Fail to get clock index\n");
 				return -EINVAL;
@@ -3025,8 +2995,9 @@ static int cpp_probe(struct platform_device *pdev)
 		goto iommu_err;
 	}
 
-	if (msm_cpp_get_clk_info(cpp_dev, pdev) < 0) {
-		pr_err("msm_cpp_get_clk_info() failed\n");
+	rc = msm_cpp_get_clk_info(cpp_dev, pdev);
+	if (rc < 0) {
+		pr_err("msm_cpp_get_clk_info() failed: %d\n", rc);
 		goto iommu_err;
 	}
 
@@ -3049,22 +3020,44 @@ static int cpp_probe(struct platform_device *pdev)
 	if (IS_ERR(cpp_dev->iommu_ctx)) {
 		pr_err("%s: cannot get iommu_ctx\n", __func__);
 		rc = -EPROBE_DEFER;
-		goto iommu_err;
+		goto release_hw;
 	}
 
-	media_entity_init(&cpp_dev->msm_sd.sd.entity, 0, NULL, 0);
+	msm_queue_init(&cpp_dev->eventData_q, "eventdata");
+	msm_queue_init(&cpp_dev->processing_q, "frame");
+	INIT_LIST_HEAD(&cpp_dev->tasklet_q);
+	tasklet_init(&cpp_dev->cpp_tasklet, msm_cpp_do_tasklet,
+		(unsigned long)cpp_dev);
+	cpp_dev->timer_wq = create_workqueue("msm_cpp_workqueue");
+	if (!cpp_dev->timer_wq) {
+		rc = -ENOMEM;
+		goto release_hw;
+	}
+	cpp_dev->work = kzalloc(sizeof(*cpp_dev->work), GFP_KERNEL);
+	if (!cpp_dev->work) {
+		rc = -ENOMEM;
+		goto destroy_timer_wq;
+	}
+	cpp_dev->work->cpp_dev = cpp_dev;
+	INIT_WORK(&cpp_dev->work->my_work, msm_cpp_do_timeout_work);
+	setup_timer(&cpp_timer.cpp_timer, cpp_timer_callback,
+		    (unsigned long)cpp_dev);
+	atomic_set(&cpp_timer.used, 0);
+	cpp_timer.data.cpp_dev = cpp_dev;
+	cpp_dev->iommu_state = CPP_IOMMU_STATE_DETACHED;
+
+	rc = media_entity_init(&cpp_dev->msm_sd.sd.entity, 0, NULL, 0);
+	if (rc < 0)
+		goto free_work;
 	cpp_dev->msm_sd.sd.entity.type = MEDIA_ENT_T_V4L2_SUBDEV;
 	cpp_dev->msm_sd.sd.entity.group_id = MSM_CAMERA_SUBDEV_CPP;
 	cpp_dev->msm_sd.sd.entity.name = pdev->name;
 	cpp_dev->msm_sd.close_seq = MSM_SD_CLOSE_3RD_CATEGORY;
-	msm_sd_register(&cpp_dev->msm_sd);
 	msm_cpp_v4l2_subdev_fops.owner = v4l2_subdev_fops.owner;
 	msm_cpp_v4l2_subdev_fops.open = v4l2_subdev_fops.open;
 	msm_cpp_v4l2_subdev_fops.release = v4l2_subdev_fops.release;
 	msm_cpp_v4l2_subdev_fops.poll = v4l2_subdev_fops.poll;
 
-	cpp_dev->msm_sd.sd.devnode->fops = &msm_cpp_v4l2_subdev_fops;
-	cpp_dev->msm_sd.sd.entity.revision = cpp_dev->msm_sd.sd.devnode->num;
 	cpp_dev->state = CPP_STATE_BOOT;
 
 	msm_camera_io_w(0x0, cpp_dev->base +
@@ -3074,41 +3067,28 @@ static int cpp_probe(struct platform_device *pdev)
 	msm_camera_io_w(0x80000000, cpp_dev->base + 0xF0);
 	cpp_release_hardware(cpp_dev);
 	cpp_dev->state = CPP_STATE_OFF;
+	rc = msm_sd_register(&cpp_dev->msm_sd);
+	if (rc < 0)
+		goto cleanup_entity;
+	cpp_dev->msm_sd.sd.devnode->fops = &msm_cpp_v4l2_subdev_fops;
+	cpp_dev->msm_sd.sd.entity.revision = cpp_dev->msm_sd.sd.devnode->num;
 	msm_cpp_enable_debugfs(cpp_dev);
+	return 0;
 
-	msm_queue_init(&cpp_dev->eventData_q, "eventdata");
-	msm_queue_init(&cpp_dev->processing_q, "frame");
-	INIT_LIST_HEAD(&cpp_dev->tasklet_q);
-	tasklet_init(&cpp_dev->cpp_tasklet, msm_cpp_do_tasklet,
-		(unsigned long)cpp_dev);
-	cpp_dev->timer_wq = create_workqueue("msm_cpp_workqueue");
-	cpp_dev->work = kmalloc(sizeof(struct msm_cpp_work_t),
-		GFP_KERNEL);
-
-	if (!cpp_dev->work) {
-		pr_err("no enough memory\n");
-		rc = -ENOMEM;
-		goto cpp_probe_init_error;
-	}
-
-	INIT_WORK((struct work_struct *)cpp_dev->work, msm_cpp_do_timeout_work);
-	cpp_dev->cpp_open_cnt = 0;
-	cpp_dev->is_firmware_loaded = 0;
-	cpp_dev->iommu_state = CPP_IOMMU_STATE_DETACHED;
-	cpp_timer.data.cpp_dev = cpp_dev;
-	atomic_set(&cpp_timer.used, 0);
-	cpp_dev->fw_name_bin = NULL;
-	if (rc == 0)
-		CPP_DBG("SUCCESS.");
-	else
-		CPP_DBG("FAILED.");
-	return rc;
-cpp_probe_init_error:
+cleanup_entity:
 	media_entity_cleanup(&cpp_dev->msm_sd.sd.entity);
-	msm_sd_unregister(&cpp_dev->msm_sd);
+free_work:
+	kfree(cpp_dev->work);
+destroy_timer_wq:
+	destroy_workqueue(cpp_dev->timer_wq);
+release_hw:
+	if (cpp_dev->state == CPP_STATE_BOOT)
+		cpp_release_hardware(cpp_dev);
+cpp_probe_init_error:
 iommu_err:
 	release_mem_region(cpp_dev->mem->start, resource_size(cpp_dev->mem));
 mem_err:
+	platform_set_drvdata(pdev, NULL);
 	kfree(cpp_dev->cpp_clk);
 clk_err:
 	kfree(cpp_dev);
@@ -3136,14 +3116,12 @@ static int cpp_device_remove(struct platform_device *dev)
 	}
 
 	msm_sd_unregister(&cpp_dev->msm_sd);
-	release_mem_region(cpp_dev->mem->start, resource_size(cpp_dev->mem));
-	release_mem_region(cpp_dev->vbif_mem->start,
-		resource_size(cpp_dev->vbif_mem));
-	release_mem_region(cpp_dev->cpp_hw_mem->start,
-		resource_size(cpp_dev->cpp_hw_mem));
-	mutex_destroy(&cpp_dev->mutex);
-	kfree(cpp_dev->work);
+	atomic_set(&cpp_timer.used, 0);
+	del_timer_sync(&cpp_timer.cpp_timer);
 	destroy_workqueue(cpp_dev->timer_wq);
+	release_mem_region(cpp_dev->mem->start, resource_size(cpp_dev->mem));
+	kfree(cpp_dev->work);
+	mutex_destroy(&cpp_dev->mutex);
 	kfree(cpp_dev->cpp_clk);
 	kfree(cpp_dev);
 	return 0;
