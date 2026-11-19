@@ -1281,7 +1281,11 @@ static struct vm_operations_struct ion_vma_ops = {
 static int ion_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 {
 	struct ion_buffer *buffer = dmabuf->priv;
+	unsigned long pages = buffer->size >> PAGE_SHIFT;
 	int ret = 0;
+
+	if (vma->vm_pgoff >= pages || vma_pages(vma) > pages - vma->vm_pgoff)
+		return -EINVAL;
 
 	if (!buffer->heap->ops->map_user) {
 		pr_err("%s: this heap does not define a method for mapping "
