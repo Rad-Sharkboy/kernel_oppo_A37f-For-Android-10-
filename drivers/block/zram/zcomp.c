@@ -305,10 +305,11 @@ void zcomp_strm_release(struct zcomp *comp, struct zcomp_strm *zstrm)
 }
 
 int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		const unsigned char *src, size_t *dst_len)
+		const unsigned char *src, size_t *dst_len, size_t max_size)
 {
+	*dst_len = PAGE_SIZE * 2;
 	return comp->backend->compress(src, zstrm->buffer, dst_len,
-			zstrm->private);
+			max_size, zstrm->private);
 }
 
 int zcomp_decompress(struct zcomp *comp, const unsigned char *src,

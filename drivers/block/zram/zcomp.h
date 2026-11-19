@@ -28,7 +28,7 @@ struct zcomp_strm {
 /* static compression backend */
 struct zcomp_backend {
 	int (*compress)(const unsigned char *src, unsigned char *dst,
-			size_t *dst_len, void *private);
+			size_t *dst_len, size_t max_size, void *private);
 
 	int (*decompress)(const unsigned char *src, size_t src_len,
 			unsigned char *dst, void *dev_private);  /* thêm dev_private */
@@ -63,7 +63,7 @@ struct zcomp_strm *zcomp_strm_find(struct zcomp *comp);
 void zcomp_strm_release(struct zcomp *comp, struct zcomp_strm *zstrm);
 
 int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		const unsigned char *src, size_t *dst_len);
+		const unsigned char *src, size_t *dst_len, size_t max_size);
 
 int zcomp_decompress(struct zcomp *comp, const unsigned char *src,
 		size_t src_len, unsigned char *dst);

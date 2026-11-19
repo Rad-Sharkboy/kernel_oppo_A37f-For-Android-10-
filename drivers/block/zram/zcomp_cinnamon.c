@@ -28,6 +28,9 @@
 #include <linux/moduleparam.h>
 #include <linux/string.h>
 #include <linux/mm.h>
+#include <linux/hash.h>
+#include <linux/lzo.h>
+#include <linux/math64.h>
 #include <asm/unaligned.h>
 #include <crypto/cinnamon.h>
 #include <linux/proc_fs.h>
@@ -48,6 +51,7 @@ atomic_t cinnamon_match_blocks = ATOMIC_INIT(0);
 atomic_t cinnamon_delta_blocks = ATOMIC_INIT(0);
 atomic_t cinnamon_raw_blocks = ATOMIC_INIT(0);
 atomic_t cinnamon_partial_blocks = ATOMIC_INIT(0);
+static atomic_t cinnamon_lzo_pages = ATOMIC_INIT(0);
 atomic_t cinnamon_fallback_pages = ATOMIC_INIT(0);        /* pages that fell back to raw */
 
 atomic64_t cinnamon_bytes_in = ATOMIC64_INIT(0);
@@ -65,6 +69,12 @@ static bool use_neon = true;
 module_param(use_neon, bool, 0644);
 MODULE_PARM_DESC(use_neon, "Use NEON optimizations if available and safe");
 #endif
+
+static bool cinnamon_lzo_rescue = true;
+module_param(cinnamon_lzo_rescue, bool, 0644);
+MODULE_PARM_DESC(cinnamon_lzo_rescue, "Try LZO once on dense, repetitive pages");
+
+#define CINNAMON_FORMAT_LZO 0
 
 #define SIG_THRESHOLD 32
 #define MIN_BLOCK_SIZE 16
@@ -790,8 +800,6 @@ set_mode:
 		goto fallback_raw;
 	}
 
-	atomic64_add(PAGE_SIZE, &cinnamon_bytes_in);
-	atomic64_add(*dst_len, &cinnamon_bytes_out);
 
 	/* Update statistics */
 	atomic_inc(&cinnamon_pages_compressed);
@@ -809,17 +817,12 @@ set_mode:
 	return 0;
 
 fallback_raw:
-	memcpy(dst, src, PAGE_SIZE);
-	*dst_len = PAGE_SIZE;
-	atomic_inc(&cinnamon_fallback_pages);
-	atomic64_add(PAGE_SIZE, &cinnamon_bytes_in);
-	atomic64_add(PAGE_SIZE, &cinnamon_bytes_out);
-	return 0;
+	return -ENOSPC;
 }
 #endif /* CONFIG_ARM64 */
 
 /* ---- Main compression function ---- */
-static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
+static int cinnamon_encode(const unsigned char *src, unsigned char *dst,
                              size_t *dst_len, void *private)
 {
 	/* C90: all declarations at the top */
@@ -1142,6 +1145,14 @@ set_mode:
 	}
 
 
+	final_checksum = cinnamon_checksum(dst, out_len);
+	if (likely(out_len + sizeof(u64) <= *dst_len)) {
+		put_unaligned_le64(final_checksum, dst_data);
+		*dst_len = out_len + sizeof(u64);
+	} else {
+		goto fallback_raw;
+	}
+
 	/* Batch update statistics */
 	atomic_inc(&cinnamon_pages_compressed);
 	if (local_zero)
@@ -1155,26 +1166,76 @@ set_mode:
 	if (local_raw)
 		atomic_add(local_raw, &cinnamon_raw_blocks);
 
-	final_checksum = cinnamon_checksum(dst, out_len);
-	if (likely(out_len + sizeof(u64) <= *dst_len)) {
-		put_unaligned_le64(final_checksum, dst_data);
-		*dst_len = out_len + sizeof(u64);
-	} else {
-		goto fallback_raw;
-	}
-
-	atomic64_add(PAGE_SIZE, &cinnamon_bytes_in);
-	atomic64_add(*dst_len, &cinnamon_bytes_out);
 	return 0;
 
 fallback_raw:
+	return -ENOSPC;
+}
 
-	memcpy(dst, src, PAGE_SIZE);
-	*dst_len = PAGE_SIZE;
-	atomic_inc(&cinnamon_fallback_pages);
-	atomic64_add(PAGE_SIZE, &cinnamon_bytes_in);
-	atomic64_add(PAGE_SIZE, &cinnamon_bytes_out);
-	return 0;
+/* Avoid a second codec on random-looking pages. Sample at most 128 words. */
+static bool cinnamon_lzo_candidate(const u8 *src)
+{
+	u32 words[32], seen = 0;
+	unsigned int i, matches = 0;
+
+	for (i = 0; i < PAGE_SIZE; i += PAGE_SIZE / 128) {
+		u32 word = get_unaligned_le32(src + i);
+		unsigned int bucket;
+		u32 bit;
+
+		/* Whole zero blocks are already cheap in the native codec. */
+		if (!word)
+			continue;
+		bucket = hash_32(word, 5);
+		bit = BIT(bucket);
+		if ((seen & bit) && words[bucket] == word && ++matches == 3)
+			return true;
+
+		words[bucket] = word;
+		seen |= bit;
+	}
+	return false;
+}
+
+static int cinnamon_compress(const unsigned char *src, unsigned char *dst,
+			     size_t *dst_len, size_t max_size, void *private)
+{
+	struct cinnamon_ctx *ctx = private;
+	size_t capacity = *dst_len;
+	size_t lzo_len;
+	int ret;
+
+	*dst_len = min(capacity, max_size);
+	ret = cinnamon_encode(src, dst, dst_len, ctx);
+	if (ret != -ENOSPC)
+		goto account;
+
+	/* The native stream cannot fit in a packed allocator class. */
+	if (ACCESS_ONCE(cinnamon_lzo_rescue) && ctx->lzo_workmem &&
+	    capacity >= 1 + lzo1x_worst_compress(PAGE_SIZE) + sizeof(u64) &&
+	    cinnamon_lzo_candidate(src) &&
+	    lzo1x_1_compress(src, PAGE_SIZE, dst + 1, &lzo_len,
+			    ctx->lzo_workmem) == LZO_E_OK &&
+	    lzo_len + 1 + sizeof(u64) <= min(capacity, max_size)) {
+		dst[0] = CINNAMON_FORMAT_LZO;
+		put_unaligned_le64(cinnamon_checksum(dst, lzo_len + 1),
+				   dst + lzo_len + 1);
+		*dst_len = lzo_len + 1 + sizeof(u64);
+		atomic_inc(&cinnamon_lzo_pages);
+		atomic_inc(&cinnamon_pages_compressed);
+	} else {
+		/* zRAM copies the original when the recorded size is PAGE_SIZE. */
+		*dst_len = PAGE_SIZE;
+		atomic_inc(&cinnamon_fallback_pages);
+	}
+	ret = 0;
+
+account:
+	if (!ret) {
+		atomic64_add(PAGE_SIZE, &cinnamon_bytes_in);
+		atomic64_add(*dst_len, &cinnamon_bytes_out);
+	}
+	return ret;
 }
 
 /* ---- Decompression ---- */
@@ -1198,7 +1259,10 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 	u8 *run_dst;
 	int run;
 	u8 repeat_value;
-	u8 prev_blocks[4][MAX_BLOCK_SIZE] __aligned(16);
+	static const u8 zero_block[MAX_BLOCK_SIZE];
+	const u8 *prev_blocks[4] = {
+		zero_block, zero_block, zero_block, zero_block,
+	};
 	int prev_index;
 	int j;
 
@@ -1208,6 +1272,20 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 	}
 	if (unlikely(src_len < 1 + sizeof(u64)))
 		return -EINVAL;
+
+	stored_checksum = get_unaligned_le64(src + src_len - sizeof(u64));
+	actual_checksum = cinnamon_checksum(src, src_len - sizeof(u64));
+	if (unlikely(stored_checksum != actual_checksum))
+		return -EIO;
+
+	if (src[0] == CINNAMON_FORMAT_LZO) {
+		size_t dst_len = PAGE_SIZE;
+		int ret;
+
+		ret = lzo1x_decompress_safe(src + 1, src_len - 1 - sizeof(u64),
+					   dst, &dst_len);
+		return ret == LZO_E_OK && dst_len == PAGE_SIZE ? 0 : -EIO;
+	}
 
 	block_size = src[0];
 	if (block_size < MIN_BLOCK_SIZE || block_size > MAX_BLOCK_SIZE ||
@@ -1224,13 +1302,8 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 	src_data = header_ptr + header_size;
 	consumed_bytes = 1 + header_size;
 
-	memset(prev_blocks, 0, sizeof(prev_blocks));
 	prev_index = 0;
 
-	stored_checksum = get_unaligned_le64(src + src_len - sizeof(u64));
-	actual_checksum = cinnamon_checksum(src, src_len - sizeof(u64));
-	if (unlikely(stored_checksum != actual_checksum))
-		return -EIO;
 
 	for (i = 0; i < blocks_per_page; i++) {
 		current_dst = dst + (i * block_size);
@@ -1258,7 +1331,7 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			for (j = 0; j < run; j++) {
 				run_dst = dst + ((i + j) * block_size);
 				memset(run_dst, 0, block_size);
-				memcpy(prev_blocks[prev_index], run_dst, block_size);
+				prev_blocks[prev_index] = run_dst;
 				prev_index = (prev_index + 1) % 4;
 			}
 			i += run - 1;
@@ -1275,7 +1348,7 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			for (j = 0; j < run; j++) {
 				run_dst = dst + ((i + j) * block_size);
 				memset(run_dst, 0, block_size);
-				memcpy(prev_blocks[prev_index], run_dst, block_size);
+				prev_blocks[prev_index] = run_dst;
 				prev_index = (prev_index + 1) % 4;
 			}
 			i += run - 1;
@@ -1293,7 +1366,7 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 			for (j = 0; j < run; j++) {
 				run_dst = dst + ((i + j) * block_size);
 				memset(run_dst, repeat_value, block_size);
-				memcpy(prev_blocks[prev_index], run_dst, block_size);
+				prev_blocks[prev_index] = run_dst;
 				prev_index = (prev_index + 1) % 4;
 			}
 			i += run - 1;
@@ -1363,7 +1436,7 @@ static int cinnamon_decompress(const unsigned char *src, size_t src_len,
 		}
 
 		/* Update intra‑page history */
-		memcpy(prev_blocks[prev_index], current_dst, block_size);
+		prev_blocks[prev_index] = current_dst;
 		prev_index = (prev_index + 1) % 4;
 	}
 
@@ -1381,12 +1454,19 @@ static void *cinnamon_create(void *dev_private)
 	ctx = kzalloc(sizeof(*ctx), GFP_NOIO);
 	if (!ctx)
 		return NULL;
+
+	/* Optional workspace. A failed allocation must not disable zRAM. */
+	ctx->lzo_workmem = kmalloc(LZO1X_MEM_COMPRESS,
+				  GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY);
 	return ctx;
 }
 
 static void cinnamon_destroy(void *private)
 {
-	kfree(private);
+	struct cinnamon_ctx *ctx = private;
+
+	kfree(ctx->lzo_workmem);
+	kfree(ctx);
 }
 
 /* ---- Proc file interface ---- */
@@ -1415,11 +1495,12 @@ static int cinnamon_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "raw_blocks: %d\n",
 		   atomic_read(&cinnamon_raw_blocks));
 	seq_printf(m, "fallback_pages: %lu\n", fallback);
+	seq_printf(m, "lzo_rescue_pages: %d\n", atomic_read(&cinnamon_lzo_pages));
 	seq_printf(m, "bytes_in: %llu\n", bytes_in);
 	seq_printf(m, "bytes_out: %llu\n", bytes_out);
 
-	if (total_p > 0) {
-		unsigned int ratio = (unsigned int)((bytes_out * 100) / bytes_in);
+	if (bytes_in) {
+		unsigned int ratio = div64_u64(bytes_out * 100, bytes_in);
 		unsigned long long saved = (bytes_in > bytes_out) ? (bytes_in - bytes_out) : 0;
 		unsigned long long saved_mb = saved / (1024ULL * 1024ULL);
 
