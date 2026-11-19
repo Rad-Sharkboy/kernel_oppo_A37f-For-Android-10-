@@ -33,6 +33,7 @@
 
 static struct v4l2_device *msm_v4l2_dev;
 static struct list_head    ordered_sd_list;
+static DECLARE_RWSEM(ordered_sd_lock);
 
 static struct msm_queue_head *msm_session_q;
 
@@ -298,8 +299,7 @@ static inline int __msm_sd_register_subdev(struct v4l2_subdev *sd)
 	return 0;
 
 clean_up:
-	if (sd->devnode)
-		video_unregister_device(sd->devnode);
+	v4l2_device_unregister_subdev(sd);
 	return rc;
 }
 
@@ -319,14 +319,21 @@ static void msm_add_sd_in_position(struct msm_sd_subdev *msm_subdev,
 
 int msm_sd_register(struct msm_sd_subdev *msm_subdev)
 {
+	int rc;
+
 	if (WARN_ON(!msm_subdev))
 		return -EINVAL;
 
 	if (WARN_ON(!msm_v4l2_dev) || WARN_ON(!msm_v4l2_dev->dev))
 		return -EIO;
 
+	rc = __msm_sd_register_subdev(&msm_subdev->sd);
+	if (rc)
+		return rc;
+	down_write(&ordered_sd_lock);
 	msm_add_sd_in_position(msm_subdev, &ordered_sd_list);
-	return __msm_sd_register_subdev(&msm_subdev->sd);
+	up_write(&ordered_sd_lock);
+	return 0;
 }
 
 int msm_sd_unregister(struct msm_sd_subdev *msm_subdev)
@@ -334,6 +341,10 @@ int msm_sd_unregister(struct msm_sd_subdev *msm_subdev)
 	if (WARN_ON(!msm_subdev))
 		return -EINVAL;
 
+	down_write(&ordered_sd_lock);
+	if (msm_subdev->list.next)
+		list_del_init(&msm_subdev->list);
+	up_write(&ordered_sd_lock);
 	v4l2_device_unregister_subdev(&msm_subdev->sd);
 	return 0;
 }
@@ -628,10 +639,10 @@ static long msm_private_ioctl(struct file *file, void *fh,
 		break;
 
 	case MSM_CAM_V4L2_IOCTL_NOTIFY_FREEZE: {
-		if (!list_empty(&msm_v4l2_dev->subdevs)) {
-			list_for_each_entry(msm_sd, &ordered_sd_list, list)
-				__msm_sd_notify_freeze_subdevs(msm_sd);
-		}
+		down_read(&ordered_sd_lock);
+		list_for_each_entry(msm_sd, &ordered_sd_list, list)
+			__msm_sd_notify_freeze_subdevs(msm_sd);
+		up_read(&ordered_sd_lock);
 	}
 		break;
 
@@ -815,9 +826,10 @@ static int msm_close(struct file *filep)
 	struct msm_sd_subdev *msm_sd;
 
 	/*stop all hardware blocks immediately*/
-	if (!list_empty(&msm_v4l2_dev->subdevs))
-		list_for_each_entry(msm_sd, &ordered_sd_list, list)
-			__msm_sd_close_subdevs(msm_sd, &sd_close);
+	down_read(&ordered_sd_lock);
+	list_for_each_entry(msm_sd, &ordered_sd_list, list)
+		__msm_sd_close_subdevs(msm_sd, &sd_close);
+	up_read(&ordered_sd_lock);
 
 	/* send v4l2_event to HAL next*/
 	msm_queue_traverse_action(msm_session_q, struct msm_session, list,

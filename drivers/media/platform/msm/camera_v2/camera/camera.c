@@ -466,7 +466,12 @@ static int camera_v4l2_fh_open(struct file *filep)
 {
 	struct msm_video_device *pvdev = video_drvdata(filep);
 	struct camera_v4l2_private *sp;
+	unsigned long opened = atomic_read(&pvdev->opened);
 	unsigned int stream_id;
+
+	stream_id = find_first_zero_bit(&opened, MSM_CAMERA_STREAM_CNT_BITS);
+	if (stream_id >= MSM_CAMERA_STREAM_CNT_BITS)
+		return -EBUSY;
 
 	sp = kzalloc(sizeof(*sp), GFP_KERNEL);
 	if (!sp) {
@@ -476,10 +481,7 @@ static int camera_v4l2_fh_open(struct file *filep)
 
 	filep->private_data = &sp->fh;
 
-	/* stream_id = open id */
-	stream_id = atomic_read(&pvdev->opened);
-	sp->stream_id = find_first_zero_bit(
-		(const unsigned long *)&stream_id, MSM_CAMERA_STREAM_CNT_BITS);
+	sp->stream_id = stream_id;
 	pr_debug("%s: Found stream_id=%d\n", __func__, sp->stream_id);
 
 	v4l2_fh_init(&sp->fh, pvdev->vdev);
@@ -498,6 +500,7 @@ static int camera_v4l2_fh_release(struct file *filep)
 	}
 
 	kzfree(sp);
+	filep->private_data = NULL;
 	return 0;
 }
 
@@ -505,6 +508,7 @@ static int camera_v4l2_vb2_q_init(struct file *filep)
 {
 	struct camera_v4l2_private *sp = fh_to_private(filep->private_data);
 	struct vb2_queue *q = &sp->vb2_q;
+	int rc;
 
 	memset(q, 0, sizeof(struct vb2_queue));
 
@@ -525,15 +529,21 @@ static int camera_v4l2_vb2_q_init(struct file *filep)
 	q->io_flags = 0;
 	q->buf_struct_size = sizeof(struct msm_vb2_buffer);
 	q->timestamp_type = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	return vb2_queue_init(q);
+	rc = vb2_queue_init(q);
+	if (rc < 0) {
+		kfree(q->drv_priv);
+		q->drv_priv = NULL;
+	}
+	return rc;
 }
 
 static void camera_v4l2_vb2_q_release(struct file *filep)
 {
 	struct camera_v4l2_private *sp = filep->private_data;
 
-	kzfree(sp->vb2_q.drv_priv);
 	vb2_queue_release(&sp->vb2_q);
+	kfree(sp->vb2_q.drv_priv);
+	sp->vb2_q.drv_priv = NULL;
 }
 
 static int camera_v4l2_open(struct file *filep)
@@ -541,7 +551,8 @@ static int camera_v4l2_open(struct file *filep)
 	int rc = 0;
 	struct v4l2_event event;
 	struct msm_video_device *pvdev = video_drvdata(filep);
-	unsigned int opn_idx, idx;
+	struct camera_v4l2_private *sp;
+	unsigned int opn_idx;
 #ifdef VENDOR_EDIT
 /*Added by Jinshui.Liu@Camera 20150714 start for print camera time*/
 	struct timespec ts;
@@ -569,7 +580,7 @@ static int camera_v4l2_open(struct file *filep)
 	}
 
 	opn_idx = atomic_read(&pvdev->opened);
-	idx = opn_idx;
+	sp = fh_to_private(filep->private_data);
 	/* every stream has a vb2 queue */
 	rc = camera_v4l2_vb2_q_init(filep);
 	if (rc < 0) {
@@ -578,7 +589,7 @@ static int camera_v4l2_open(struct file *filep)
 		goto vb2_q_fail;
 	}
 
-	if (!atomic_read(&pvdev->opened)) {
+	if (!opn_idx) {
 		pm_stay_awake(&pvdev->vdev->dev);
 
 		/* create a new session when first opened */
@@ -589,9 +600,7 @@ static int camera_v4l2_open(struct file *filep)
 			goto session_fail;
 		}
 
-		rc = msm_create_command_ack_q(pvdev->vdev->num,
-			find_first_zero_bit((const unsigned long *)&opn_idx,
-				MSM_CAMERA_STREAM_CNT_BITS));
+		rc = msm_create_command_ack_q(pvdev->vdev->num, sp->stream_id);
 		if (rc < 0) {
 			pr_err("%s : creation of command_ack queue failed\n",
 					__func__);
@@ -615,28 +624,25 @@ static int camera_v4l2_open(struct file *filep)
 			goto post_fail;
 		}
 	} else {
-		rc = msm_create_command_ack_q(pvdev->vdev->num,
-			find_first_zero_bit((const unsigned long *)&opn_idx,
-				MSM_CAMERA_STREAM_CNT_BITS));
+		rc = msm_create_command_ack_q(pvdev->vdev->num, sp->stream_id);
 		if (rc < 0) {
 			pr_err("%s : creation of command_ack queue failed Line %d rc %d\n",
 					__func__, __LINE__, rc);
-			goto session_fail;
+			goto queue_release;
 		}
 	}
-	idx |= (1 << find_first_zero_bit((const unsigned long *)&opn_idx,
-				MSM_CAMERA_STREAM_CNT_BITS));
-	atomic_cmpxchg(&pvdev->opened, opn_idx, idx);
+	atomic_set(&pvdev->opened, opn_idx | BIT(sp->stream_id));
 	mutex_unlock(&pvdev->open_mutex);
 
 	return rc;
 
 post_fail:
-	msm_delete_command_ack_q(pvdev->vdev->num, 0);
+	msm_delete_command_ack_q(pvdev->vdev->num, sp->stream_id);
 command_ack_q_fail:
 	msm_destroy_session(pvdev->vdev->num);
 session_fail:
 	pm_relax(&pvdev->vdev->dev);
+queue_release:
 	camera_v4l2_vb2_q_release(filep);
 vb2_q_fail:
 	camera_v4l2_fh_release(filep);
@@ -677,7 +683,7 @@ static int camera_v4l2_close(struct file *filep)
 	mutex_lock(&pvdev->open_mutex);
 	opn_idx = atomic_read(&pvdev->opened);
 	pr_debug("%s: close stream_id=%d\n", __func__, sp->stream_id);
-	mask = (1 << sp->stream_id);
+	mask = BIT(sp->stream_id);
 	opn_idx &= ~mask;
 	atomic_set(&pvdev->opened, opn_idx);
 
@@ -693,7 +699,7 @@ static int camera_v4l2_close(struct file *filep)
 
 		/* Donot wait, imaging server may have crashed */
 		msm_post_event(&event, -1);
-		msm_delete_command_ack_q(pvdev->vdev->num, 0);
+		msm_delete_command_ack_q(pvdev->vdev->num, sp->stream_id);
 
 		/* This should take care of both normal close
 		 * and application crashes */
