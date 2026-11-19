@@ -1643,8 +1643,9 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 					CPUFREQ_TRANSITION_NOTIFIER);
 		}
 
-		if (tunables->use_sched_load)
-			cpufreq_interactive_enable_sched_input(tunables);
+		if (tunables->use_sched_load &&
+		    cpufreq_interactive_enable_sched_input(tunables))
+			tunables->use_sched_load = false;
 
 		break;
 
@@ -1658,6 +1659,8 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 
 			sysfs_remove_group(get_governor_parent_kobj(policy),
 					get_sysfs_attr());
+			if (tunables->use_sched_load)
+				cpufreq_interactive_disable_sched_input(tunables);
 			if (!have_governor_per_policy())
 				cpufreq_put_global_kobject();
 			common_tunables = NULL;
@@ -1665,8 +1668,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 
 		policy->governor_data = NULL;
 
-		if (tunables->use_sched_load)
-			cpufreq_interactive_disable_sched_input(tunables);
 
 		break;
 
