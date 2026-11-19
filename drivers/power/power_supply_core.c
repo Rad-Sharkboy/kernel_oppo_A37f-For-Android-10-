@@ -371,7 +371,7 @@ static int power_supply_check_supplies(struct power_supply *psy)
 	if (count < 0)
 		return count;
 
-	supplies = devm_kzalloc(psy->dev, sizeof(*supplies) * count, GFP_KERNEL);
+	supplies = devm_kcalloc(psy->dev, count, sizeof(*supplies), GFP_KERNEL);
 	if (!supplies)
 		return -ENOMEM;
 
