@@ -163,7 +163,7 @@ EXPORT_SYMBOL(kgsl_pwrscale_update);
 void kgsl_pwrscale_disable(struct kgsl_device *device)
 {
 	BUG_ON(!mutex_is_locked(&device->mutex));
-	if (device->pwrscale.devfreqptr)
+	if (device->pwrscale.devfreqptr && device->pwrscale.devfreq_wq)
 		queue_work(device->pwrscale.devfreq_wq,
 			&device->pwrscale.devfreq_suspend_ws);
 	device->pwrscale.enabled = false;
@@ -182,7 +182,7 @@ void kgsl_pwrscale_enable(struct kgsl_device *device)
 {
 	BUG_ON(!mutex_is_locked(&device->mutex));
 
-	if (device->pwrscale.devfreqptr) {
+	if (device->pwrscale.devfreqptr && device->pwrscale.devfreq_wq) {
 		queue_work(device->pwrscale.devfreq_wq,
 			&device->pwrscale.devfreq_resume_ws);
 		device->pwrscale.enabled = true;
@@ -509,7 +509,11 @@ int kgsl_busmon_target(struct device *dev, unsigned long *freq, u32 flags)
 
 int kgsl_busmon_get_cur_freq(struct device *dev, unsigned long *freq)
 {
-	return 0;
+	if (!freq)
+		return -EINVAL;
+
+	*freq = ACCESS_ONCE(last_status.current_frequency);
+	return *freq ? 0 : -EAGAIN;
 }
 
 
@@ -542,6 +546,14 @@ int kgsl_pwrscale_init(struct device *dev, const char *governor)
 	gpu_profile = &pwrscale->gpu_profile;
 	profile = &pwrscale->gpu_profile.profile;
 
+	pwrscale->enabled = false;
+	pwrscale->devfreq_wq = create_freezable_workqueue("kgsl_devfreq_wq");
+	if (!pwrscale->devfreq_wq)
+		return -ENOMEM;
+
+	INIT_WORK(&pwrscale->devfreq_suspend_ws, do_devfreq_suspend);
+	INIT_WORK(&pwrscale->devfreq_resume_ws, do_devfreq_resume);
+	INIT_WORK(&pwrscale->devfreq_notify_ws, do_devfreq_notify);
 	srcu_init_notifier_head(&pwrscale->nh);
 
 	profile->initial_freq =
@@ -588,7 +600,9 @@ int kgsl_pwrscale_init(struct device *dev, const char *governor)
 	devfreq = devfreq_add_device(dev, &pwrscale->gpu_profile.profile,
 			governor, pwrscale->gpu_profile.private_data);
 	if (IS_ERR(devfreq)) {
-		device->pwrscale.enabled = false;
+		destroy_workqueue(pwrscale->devfreq_wq);
+		pwrscale->devfreq_wq = NULL;
+		srcu_cleanup_notifier_head(&pwrscale->nh);
 		return PTR_ERR(devfreq);
 	}
 
@@ -610,13 +624,14 @@ int kgsl_pwrscale_init(struct device *dev, const char *governor)
 	ret = sysfs_create_link(&device->dev->kobj,
 			&devfreq->dev.kobj, "devfreq");
 
-	pwrscale->devfreq_wq = create_freezable_workqueue("kgsl_devfreq_wq");
-	INIT_WORK(&pwrscale->devfreq_suspend_ws, do_devfreq_suspend);
-	INIT_WORK(&pwrscale->devfreq_resume_ws, do_devfreq_resume);
-	INIT_WORK(&pwrscale->devfreq_notify_ws, do_devfreq_notify);
+	if (ret)
+		dev_warn(device->dev, "Cannot create devfreq link: %d\n", ret);
 
+	mutex_lock(&device->mutex);
 	pwrscale->next_governor_call = ktime_add_us(ktime_get(),
 			KGSL_GOVERNOR_CALL_INTERVAL);
+	pwrscale->enabled = true;
+	mutex_unlock(&device->mutex);
 
 	return 0;
 }
@@ -626,22 +641,31 @@ EXPORT_SYMBOL(kgsl_pwrscale_init);
  * kgsl_pwrscale_close - clean up pwrscale
  * @device: the device
  *
- * This function should be called with the device mutex locked.
+ * Work and governor callbacks can acquire the device mutex.
  */
 void kgsl_pwrscale_close(struct kgsl_device *device)
 {
-	struct kgsl_pwrscale *pwrscale;
+	struct kgsl_pwrscale *pwrscale = &device->pwrscale;
+	struct workqueue_struct *wq;
 
-	BUG_ON(!mutex_is_locked(&device->mutex));
+	mutex_lock(&device->mutex);
+	pwrscale->enabled = false;
+	wq = pwrscale->devfreq_wq;
+	pwrscale->devfreq_wq = NULL;
+	mutex_unlock(&device->mutex);
 
-	pwrscale = &device->pwrscale;
-	if (!pwrscale->devfreqptr)
+	if (!wq)
 		return;
-	flush_workqueue(pwrscale->devfreq_wq);
-	destroy_workqueue(pwrscale->devfreq_wq);
-	devfreq_remove_device(device->pwrscale.devfreqptr);
-	device->pwrscale.devfreqptr = NULL;
-	srcu_cleanup_notifier_head(&device->pwrscale.nh);
+
+	destroy_workqueue(wq);
+	sysfs_remove_link(&device->dev->kobj, "devfreq");
+	devfreq_remove_device(pwrscale->devfreqptr);
+	pwrscale->devfreqptr = NULL;
+	if (pwrscale->gpu_profile.bus_devfreq) {
+		devfreq_remove_device(pwrscale->gpu_profile.bus_devfreq);
+		pwrscale->gpu_profile.bus_devfreq = NULL;
+	}
+	srcu_cleanup_notifier_head(&pwrscale->nh);
 }
 EXPORT_SYMBOL(kgsl_pwrscale_close);
 

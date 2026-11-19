@@ -217,7 +217,10 @@ static void adreno_input_work(struct work_struct *work)
 	 * Don't schedule adreno_start in a high priority workqueue, we are
 	 * already in a workqueue which should be sufficient
 	 */
-	kgsl_pwrctrl_change_state(device, KGSL_STATE_ACTIVE);
+	if (kgsl_pwrctrl_change_state(device, KGSL_STATE_ACTIVE)) {
+		device->flags &= ~KGSL_FLAG_WAKE_ON_TOUCH;
+		goto unlock;
+	}
 
 	/*
 	 * When waking up from a touch event we want to stay active long enough
@@ -227,6 +230,7 @@ static void adreno_input_work(struct work_struct *work)
 	 */
 	mod_timer(&device->idle_timer,
 		jiffies + msecs_to_jiffies(_wake_timeout));
+unlock:
 	mutex_unlock(&device->mutex);
 }
 
@@ -1015,17 +1019,19 @@ int adreno_probe(struct platform_device *pdev)
 
 	adreno_init_sysfs(device);
 
-	kgsl_pwrscale_init(&pdev->dev, CONFIG_MSM_ADRENO_DEFAULT_GOVERNOR);
-
-	adreno_input_handler.private = device;
+	if (kgsl_pwrscale_init(&pdev->dev, CONFIG_MSM_ADRENO_DEFAULT_GOVERNOR))
+		KGSL_DRV_ERR(device, "GPU scaling setup failed\n");
 
 #ifdef CONFIG_INPUT
+	adreno_input_handler.private = device;
 	/*
 	 * It isn't fatal if we cannot register the input handler.  Sad,
 	 * perhaps, but not fatal
 	 */
-	if (input_register_handler(&adreno_input_handler))
+	if (input_register_handler(&adreno_input_handler)) {
+		adreno_input_handler.private = NULL;
 		KGSL_DRV_ERR(device, "Unable to register the input handler\n");
+	}
 #endif
 out:
 	if (status) {
@@ -1051,7 +1057,11 @@ static int adreno_remove(struct platform_device *pdev)
 		kgsl_free_global(&adreno_dev->cmdbatch_profile_buffer);
 
 #ifdef CONFIG_INPUT
-	input_unregister_handler(&adreno_input_handler);
+	if (adreno_input_handler.private == device) {
+		input_unregister_handler(&adreno_input_handler);
+		adreno_input_handler.private = NULL;
+		cancel_work_sync(&adreno_dev->input_work);
+	}
 #endif
 	adreno_uninit_sysfs(device);
 
@@ -1227,9 +1237,10 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 
 	kgsl_cffdump_open(device);
 
-	regulator_left_on = (regulator_is_enabled(device->pwrctrl.gpu_reg) ||
-				(device->pwrctrl.gpu_cx &&
-				regulator_is_enabled(device->pwrctrl.gpu_cx)));
+	regulator_left_on = (device->pwrctrl.gpu_reg &&
+			regulator_is_enabled(device->pwrctrl.gpu_reg) > 0) ||
+			(device->pwrctrl.gpu_cx &&
+			regulator_is_enabled(device->pwrctrl.gpu_cx) > 0);
 
 	/* Clear any GPU faults that might have been left over */
 	adreno_clear_gpu_fault(adreno_dev);
@@ -1277,7 +1288,7 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	if (status) {
 		KGSL_DRV_ERR(device,
 			"Unable to get perf counters for Bus DCVS\n");
-		goto error_mmu_off;
+		goto error_ocmem_free;
 	}
 
 	/* Restore performance counter registers with saved values */
@@ -1292,14 +1303,12 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	adreno_irqctrl(adreno_dev, 1);
 
 	status = adreno_perfcounter_start(adreno_dev);
-
 	if (status)
-		goto error_mmu_off;
+		goto error_irq_off;
 
 	status = adreno_ringbuffer_cold_start(adreno_dev);
-
 	if (status)
-		goto error_mmu_off;
+		goto error_irq_off;
 
 	/* Enable h/w power collapse feature */
 	if (gpudev->enable_pc)
@@ -1322,10 +1331,14 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 
 	return 0;
 
+error_irq_off:
+	adreno_irqctrl(adreno_dev, 0);
+error_ocmem_free:
+	adreno_ocmem_free(adreno_dev);
 error_mmu_off:
 	kgsl_mmu_stop(&device->mmu);
-
 error_pwr_off:
+	clear_bit(ADRENO_DEVICE_PWRON, &adreno_dev->priv);
 	kgsl_pwrctrl_change_state(device, KGSL_STATE_INIT);
 
 	if (pmqos_active_vote != pmqos_wakeup_vote)

@@ -1314,6 +1314,20 @@ void kgsl_thermal_timer(unsigned long data)
 	queue_work(device->work_queue, &device->pwrctrl.thermal_cycle_ws);
 }
 
+static void kgsl_pwrctrl_put_clocks(struct kgsl_device *device)
+{
+	struct kgsl_device_platform_data *pdata =
+		dev_get_platdata(&device->pdev->dev);
+	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
+	int i;
+
+	for (i = 0; i < KGSL_MAX_CLKS; i++) {
+		if ((pdata->clk_map & clks[i].map) && pwr->grp_clks[i])
+			clk_put(pwr->grp_clks[i]);
+		pwr->grp_clks[i] = NULL;
+	}
+}
+
 int kgsl_pwrctrl_init(struct kgsl_device *device)
 {
 	int i, k, m, set_bus = 1, n = 0, result = 0;
@@ -1418,12 +1432,13 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 		return result;
 
 	ocmem_bus_node = of_find_node_by_name(
-				device->pdev->dev.of_node,
+				of_node_get(pdev->dev.of_node),
 				"qcom,ocmem-bus-client");
 	/* If platform has splitted ocmem bus client - use it */
 	if (ocmem_bus_node) {
 		ocmem_scale_table = msm_bus_pdata_from_node
 				(device->pdev, ocmem_bus_node);
+		of_node_put(ocmem_bus_node);
 		if (ocmem_scale_table)
 			pwr->pcl = msm_bus_scale_register_client
 					(ocmem_scale_table);
@@ -1437,8 +1452,8 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 				"id %d table %pK %pK", device->id,
 				pdata->bus_scale_table,
 				ocmem_scale_table);
-		result = -EINVAL;
-		goto done;
+		kgsl_pwrctrl_close(device);
+		return -EINVAL;
 	}
 
 	/* Set if independent bus BW voting is supported */
@@ -1449,6 +1464,7 @@ int kgsl_pwrctrl_init(struct kgsl_device *device)
 					"qcom,gpubw-dev", 0);
 	if (gpubw_dev_node) {
 		p2dev = of_find_device_by_node(gpubw_dev_node);
+		of_node_put(gpubw_dev_node);
 		if (p2dev)
 			pwr->devbw = &p2dev->dev;
 	}
@@ -1532,13 +1548,13 @@ clk_err:
 				 clks[i].name, result);
 
 done:
+	kgsl_pwrctrl_put_clocks(device);
 	return result;
 }
 
 void kgsl_pwrctrl_close(struct kgsl_device *device)
 {
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
-	int i;
 
 	KGSL_PWR_INFO(device, "close device %d\n", device->id);
 
@@ -1559,13 +1575,12 @@ void kgsl_pwrctrl_close(struct kgsl_device *device)
 		pwr->gpu_cx = NULL;
 	}
 
-	for (i = 1; i < KGSL_MAX_CLKS; i++)
-		if (pwr->grp_clks[i]) {
-			clk_put(pwr->grp_clks[i]);
-			pwr->grp_clks[i] = NULL;
-		}
+	if (pwr->devbw) {
+		put_device(pwr->devbw);
+		pwr->devbw = NULL;
+	}
 
-	pwr->grp_clks[0] = NULL;
+	kgsl_pwrctrl_put_clocks(device);
 	pwr->power_flags = 0;
 }
 
