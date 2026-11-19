@@ -1986,7 +1986,8 @@ low_soc_exit:
 	mutex_unlock(&chip->state_change_mutex);
 }
 
-static int calculate_soc_from_voltage(struct qpnp_bms_chip *chip)
+static int calculate_soc_from_voltage(struct qpnp_bms_chip *chip,
+				      int instant_uv)
 {
 	int voltage_range_uv, voltage_remaining_uv, voltage_based_soc;
 	int rc, vbat_uv;
@@ -1994,6 +1995,8 @@ static int calculate_soc_from_voltage(struct qpnp_bms_chip *chip)
 	/* check if we have the averaged fifo data */
 	if (chip->voltage_soc_uv) {
 		vbat_uv = chip->voltage_soc_uv;
+	} else if (instant_uv > 0) {
+		vbat_uv = instant_uv;
 	} else {
 		rc = get_battery_voltage(chip, &vbat_uv);
 		if (rc < 0) {
@@ -2101,7 +2104,7 @@ static int clamp_soc_based_on_voltage(struct qpnp_bms_chip *chip, int soc)
 	}
 }
 
-static void battery_voltage_check(struct qpnp_bms_chip *chip)
+static int battery_voltage_check(struct qpnp_bms_chip *chip)
 {
 	int rc, vbat_uv = 0;
 
@@ -2112,6 +2115,8 @@ static void battery_voltage_check(struct qpnp_bms_chip *chip)
 		very_low_voltage_check(chip, vbat_uv);
 		cv_voltage_check(chip, vbat_uv);
 	}
+
+	return rc < 0 ? rc : vbat_uv;
 }
 
 #define UI_SOC_CATCHUP_TIME	(60)
@@ -2120,7 +2125,7 @@ static void monitor_soc_work(struct work_struct *work)
 	struct qpnp_bms_chip *chip = container_of(work,
 				struct qpnp_bms_chip,
 				monitor_soc_work.work);
-	int rc, new_soc = 0, batt_temp;
+	int rc, new_soc = 0, batt_temp, vbat_uv;
 
 	bms_stay_awake(&chip->vbms_soc_wake_source);
 
@@ -2136,10 +2141,10 @@ static void monitor_soc_work(struct work_struct *work)
 		chip->last_soc = -EINVAL;
 		new_soc = 100;
 	} else {
-		battery_voltage_check(chip);
+		vbat_uv = battery_voltage_check(chip);
 
 		if (chip->dt.cfg_use_voltage_soc) {
-			calculate_soc_from_voltage(chip);
+			calculate_soc_from_voltage(chip, vbat_uv);
 		} else {
 			rc = get_batt_therm(chip, &batt_temp);
 			if (rc < 0) {
@@ -2222,7 +2227,7 @@ static void voltage_soc_timeout_work(struct work_struct *work)
 		pr_warn("BMS device not opened, using voltage based SOC\n");
 
 		mutex_lock(&chip->last_soc_mutex);
-		calculate_soc_from_voltage(chip);
+		calculate_soc_from_voltage(chip, 0);
 		chip->dt.cfg_use_voltage_soc = true;
 		mutex_unlock(&chip->last_soc_mutex);
 
