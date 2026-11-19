@@ -1589,7 +1589,8 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 	else
 		tunables = common_tunables;
 
-	BUG_ON(!tunables && (event != CPUFREQ_GOV_POLICY_INIT));
+	if (!tunables && event != CPUFREQ_GOV_POLICY_INIT)
+		return -EINVAL;
 
 	switch (event) {
 	case CPUFREQ_GOV_POLICY_INIT:
@@ -1615,14 +1616,19 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 		tunables->usage_count = 1;
 		policy->governor_data = tunables;
 		if (!have_governor_per_policy()) {
-			WARN_ON(cpufreq_get_global_kobject());
+			rc = cpufreq_get_global_kobject();
+			if (rc) {
+				policy->governor_data = NULL;
+				tunables->usage_count = 0;
+				return rc;
+			}
 			common_tunables = tunables;
 		}
 
 		rc = sysfs_create_group(get_governor_parent_kobj(policy),
 				get_sysfs_attr());
 		if (rc) {
-			kfree(tunables);
+			tunables->usage_count = 0;
 			policy->governor_data = NULL;
 			if (!have_governor_per_policy()) {
 				common_tunables = NULL;
