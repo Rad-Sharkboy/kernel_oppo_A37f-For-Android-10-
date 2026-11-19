@@ -737,6 +737,8 @@ int power_supply_register(struct device *parent, struct power_supply *psy)
 	dev_set_drvdata(dev, psy);
 	psy->dev = dev;
 
+	spin_lock_init(&psy->changed_lock);
+	psy->changed = false;
 	INIT_WORK(&psy->changed_work, power_supply_changed_work);
 
 	rc = power_supply_check_supplies(psy);
@@ -753,7 +755,6 @@ int power_supply_register(struct device *parent, struct power_supply *psy)
 	if (rc)
 		goto device_add_failed;
 
-	spin_lock_init(&psy->changed_lock);
 	rc = device_init_wakeup(dev, true);
 	if (rc)
 		goto wakeup_init_failed;
