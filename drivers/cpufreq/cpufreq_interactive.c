@@ -1844,7 +1844,15 @@ static void __exit cpufreq_interactive_exit(void)
 
 	for_each_possible_cpu(cpu) {
 		pcpu = &per_cpu(cpuinfo, cpu);
-		kfree(pcpu->cached_tunables);
+		struct cpufreq_interactive_tunables *tunables = pcpu->cached_tunables;
+
+		if (!tunables)
+			continue;
+		if (tunables->target_loads != default_target_loads)
+			kfree(tunables->target_loads);
+		if (tunables->above_hispeed_delay != default_above_hispeed_delay)
+			kfree(tunables->above_hispeed_delay);
+		kfree(tunables);
 		pcpu->cached_tunables = NULL;
 	}
 }
