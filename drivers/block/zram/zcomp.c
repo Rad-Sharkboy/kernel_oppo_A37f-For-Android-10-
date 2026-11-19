@@ -205,7 +205,6 @@ static int zcomp_strm_multi_create(struct zcomp *comp, int max_strm)
 	if (!zs)
 		return -ENOMEM;
 
-	comp->stream = zs;
 	spin_lock_init(&zs->strm_lock);
 	INIT_LIST_HEAD(&zs->idle_strm);
 	init_waitqueue_head(&zs->strm_wait);
@@ -218,6 +217,7 @@ static int zcomp_strm_multi_create(struct zcomp *comp, int max_strm)
 		return -ENOMEM;
 	}
 	list_add(&zstrm->list, &zs->idle_strm);
+	comp->stream = zs;
 	return 0;
 }
 
@@ -260,13 +260,13 @@ static int zcomp_strm_single_create(struct zcomp *comp)
 	if (!zs)
 		return -ENOMEM;
 
-	comp->stream = zs;
 	mutex_init(&zs->strm_lock);
 	zs->zstrm = zcomp_strm_alloc(comp);
 	if (!zs->zstrm) {
 		kfree(zs);
 		return -ENOMEM;
 	}
+	comp->stream = zs;
 	return 0;
 }
 
@@ -336,6 +336,7 @@ struct zcomp *zcomp_create(const char *compress, int max_strm)
 {
 	struct zcomp *comp;
 	struct zcomp_backend *backend;
+	int ret;
 
 	backend = find_backend(compress);
 	if (!backend)
@@ -359,15 +360,15 @@ struct zcomp *zcomp_create(const char *compress, int max_strm)
 	}
 
 	if (max_strm > 1)
-		zcomp_strm_multi_create(comp, max_strm);
+		ret = zcomp_strm_multi_create(comp, max_strm);
 	else
-		zcomp_strm_single_create(comp);
+		ret = zcomp_strm_single_create(comp);
 
-	if (!comp->stream) {
+	if (ret) {
 		if (backend->dev_destroy && comp->dev_private)
 			backend->dev_destroy(comp->dev_private);
 		kfree(comp);
-		return ERR_PTR(-ENOMEM);
+		return ERR_PTR(ret);
 	}
 	return comp;
 }
