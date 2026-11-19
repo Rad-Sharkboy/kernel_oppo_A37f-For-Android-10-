@@ -434,7 +434,7 @@ static void __queue_rx(gfp_t alloc_flags)
 
 		info->dma_address = dma_map_single(dma_dev, ptr, info->len,
 							bam_ops->dma_from);
-		if (info->dma_address == 0 || info->dma_address == ~0) {
+		if (dma_mapping_error(dma_dev, info->dma_address)) {
 			DMUX_LOG_KERR("%s: dma_map_single failure %p for %p\n",
 				__func__, (void *)info->dma_address, ptr);
 			goto fail_skb;
@@ -782,7 +782,7 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 
 	dma_address = dma_map_single(dma_dev, data, len,
 					bam_ops->dma_to);
-	if (!dma_address) {
+	if (dma_mapping_error(dma_dev, dma_address)) {
 		pr_err("%s: dma_map_single() failed\n", __func__);
 		kfree(pkt);
 		kfree(data);
@@ -976,7 +976,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 
 	dma_address = dma_map_single(dma_dev, skb->data, skb->len,
 					bam_ops->dma_to);
-	if (!dma_address) {
+	if (dma_mapping_error(dma_dev, dma_address)) {
 		pr_err("%s: dma_map_single() failed\n", __func__);
 		goto write_fail3;
 	}
