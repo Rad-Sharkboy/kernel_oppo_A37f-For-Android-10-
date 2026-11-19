@@ -835,6 +835,8 @@ static unsigned int *get_tokenized_data(const char *buf, int *num_tokens)
 	unsigned int *tokenized_data;
 	int err = -EINVAL;
 
+	if (!*buf)
+		goto err;
 	cp = buf;
 	while ((cp = strpbrk(cp + 1, " :")))
 		ntokens++;
@@ -842,7 +844,7 @@ static unsigned int *get_tokenized_data(const char *buf, int *num_tokens)
 	if (!(ntokens & 0x1))
 		goto err;
 
-	tokenized_data = kmalloc(ntokens * sizeof(unsigned int), GFP_KERNEL);
+	tokenized_data = kcalloc(ntokens, sizeof(*tokenized_data), GFP_KERNEL);
 	if (!tokenized_data) {
 		err = -ENOMEM;
 		goto err;
@@ -862,6 +864,11 @@ static unsigned int *get_tokenized_data(const char *buf, int *num_tokens)
 
 	if (i != ntokens)
 		goto err_kfree;
+
+	for (i = 1; i < ntokens; i += 2)
+		if (!tokenized_data[i] ||
+		    (i > 1 && tokenized_data[i] <= tokenized_data[i - 2]))
+			goto err_kfree;
 
 	*num_tokens = ntokens;
 	return tokenized_data;
@@ -898,10 +905,18 @@ static ssize_t store_target_loads(
 	int ntokens;
 	unsigned int *new_target_loads = NULL;
 	unsigned long flags;
+	int i;
 
 	new_target_loads = get_tokenized_data(buf, &ntokens);
 	if (IS_ERR(new_target_loads))
 		return PTR_RET(new_target_loads);
+
+	for (i = 0; i < ntokens; i += 2) {
+		if (!new_target_loads[i] || new_target_loads[i] > 100) {
+			kfree(new_target_loads);
+			return -EINVAL;
+		}
+	}
 
 	spin_lock_irqsave(&tunables->target_loads_lock, flags);
 	if (tunables->target_loads != default_target_loads)
