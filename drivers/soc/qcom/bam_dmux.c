@@ -28,6 +28,7 @@
 #include <linux/wakelock.h>
 #include <linux/of.h>
 #include <linux/ipc_logging.h>
+#include <linux/jiffies.h>
 #include <linux/srcu.h>
 #include <linux/msm-sps.h>
 #include <linux/sizes.h>
@@ -254,7 +255,8 @@ static DEFINE_MUTEX(wakeup_lock);
 static struct completion ul_wakeup_ack_completion;
 static struct completion bam_connection_completion;
 static struct delayed_work ul_timeout_work;
-static int ul_packet_written;
+/* TX writers serialize updates with the TX pool lock. */
+static unsigned long ul_last_activity;
 static atomic_t ul_ondemand_vote = ATOMIC_INIT(0);
 static struct clk *dfab_clk, *xo_clk;
 static DEFINE_RWLOCK(ul_wakeup_lock);
@@ -795,6 +797,7 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 	list_add_tail(&pkt->list_node, &bam_tx_pool);
 	rc = bam_ops->sps_transfer_one_ptr(bam_tx_pipe, dma_address, len,
 				pkt, SPS_IOVEC_FLAG_EOT);
+	ul_last_activity = jiffies;
 	if (rc) {
 		DMUX_LOG_KERR("%s sps_transfer_one failed rc=%d\n",
 			__func__, rc);
@@ -809,7 +812,6 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
 	}
 
-	ul_packet_written = 1;
 	return rc;
 }
 
@@ -985,6 +987,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	list_add_tail(&pkt->list_node, &bam_tx_pool);
 	rc = bam_ops->sps_transfer_one_ptr(bam_tx_pipe, dma_address, skb->len,
 				pkt, SPS_IOVEC_FLAG_EOT);
+	ul_last_activity = jiffies;
 	if (rc) {
 		DMUX_LOG_KERR("%s sps_transfer_one failed rc=%d\n",
 			__func__, rc);
@@ -1002,7 +1005,6 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 		bam_ch[id].num_tx_pkts++;
 		spin_unlock_irqrestore(&bam_ch[id].lock, flags);
 	}
-	ul_packet_written = 1;
 	read_unlock(&ul_wakeup_lock);
 	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 	return rc;
@@ -1674,6 +1676,15 @@ static void notify_all(int event, unsigned long data)
 	}
 }
 
+static void record_ul_activity(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&bam_tx_pool_spinlock, flags);
+	ul_last_activity = jiffies;
+	spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
+}
+
 static void kickoff_ul_wakeup_func(struct work_struct *work)
 {
 	read_lock(&ul_wakeup_lock);
@@ -1683,7 +1694,7 @@ static void kickoff_ul_wakeup_func(struct work_struct *work)
 		if (unlikely(in_global_reset == 1))
 			return;
 		read_lock(&ul_wakeup_lock);
-		ul_packet_written = 1;
+		record_ul_activity();
 		notify_all(BAM_DMUX_UL_CONNECTED, (unsigned long)(NULL));
 	}
 	read_unlock(&ul_wakeup_lock);
@@ -1694,7 +1705,7 @@ int msm_bam_dmux_kickoff_ul_wakeup(void)
 	int is_connected;
 
 	read_lock(&ul_wakeup_lock);
-	ul_packet_written = 1;
+	record_ul_activity();
 	is_connected = bam_is_connected;
 	if (!is_connected)
 		queue_work(bam_mux_tx_workqueue, &kickoff_ul_wakeup);
@@ -1809,42 +1820,39 @@ int msm_bam_dmux_reg_notify(void *priv,
 
 static void ul_timeout(struct work_struct *work)
 {
-	unsigned long flags;
-	int ret;
+	unsigned long retry = msecs_to_jiffies(ul_timeout_delay);
+	unsigned long flags, now, expires, delay = 0;
 
 	if (in_global_reset)
 		return;
-	ret = write_trylock_irqsave(&ul_wakeup_lock, flags);
-	if (!ret) { /* failed to grab lock, reschedule and bail */
-		schedule_delayed_work(&ul_timeout_work,
-				msecs_to_jiffies(ul_timeout_delay));
+	if (!write_trylock_irqsave(&ul_wakeup_lock, flags)) {
+		schedule_delayed_work(&ul_timeout_work, retry);
 		return;
 	}
 	if (bam_is_connected) {
-		if (!ul_packet_written) {
-			spin_lock(&bam_tx_pool_spinlock);
-			if (!list_empty(&bam_tx_pool)) {
-				struct tx_pkt_info *info;
+		spin_lock(&bam_tx_pool_spinlock);
+		now = jiffies;
+		expires = ul_last_activity + retry;
+		if (time_before(now, expires)) {
+			delay = expires - now;
+		} else if (!list_empty(&bam_tx_pool)) {
+			struct tx_pkt_info *info;
 
-				info = list_first_entry(&bam_tx_pool,
+			info = list_first_entry(&bam_tx_pool,
 						struct tx_pkt_info, list_node);
-				DMUX_LOG_KERR("%s: UL delayed ts=%u.%09lu\n",
-					__func__, info->ts_sec, info->ts_nsec);
-				DBG_INC_TX_STALL_CNT();
-				ul_packet_written = 1;
-			}
-			spin_unlock(&bam_tx_pool_spinlock);
+			DMUX_LOG_KERR("%s: UL delayed ts=%u.%09lu\n",
+				      __func__, info->ts_sec, info->ts_nsec);
+			DBG_INC_TX_STALL_CNT();
+			delay = retry;
 		}
+		spin_unlock(&bam_tx_pool_spinlock);
 
-		if (ul_packet_written || atomic_read(&ul_ondemand_vote)) {
-			BAM_DMUX_LOG("%s: pkt written %d\n",
-				__func__, ul_packet_written);
-			ul_packet_written = 0;
-			schedule_delayed_work(&ul_timeout_work,
-					msecs_to_jiffies(ul_timeout_delay));
-		} else {
+		if (atomic_read(&ul_ondemand_vote))
+			delay = retry;
+		if (delay)
+			schedule_delayed_work(&ul_timeout_work, delay);
+		else
 			ul_powerdown();
-		}
 	}
 	write_unlock_irqrestore(&ul_wakeup_lock, flags);
 	ul_powerdown_finish();
@@ -1868,6 +1876,17 @@ static int ssrestart_check(void)
 	if (ret == -ENODEV)
 		panic("modem subsystem restart failed\n");
 	return 1;
+}
+
+static void ul_start_idle_timer(void)
+{
+	unsigned long flags;
+
+	write_lock_irqsave(&ul_wakeup_lock, flags);
+	ul_last_activity = jiffies;
+	bam_is_connected = 1;
+	schedule_delayed_work(&ul_timeout_work, msecs_to_jiffies(ul_timeout_delay));
+	write_unlock_irqrestore(&ul_wakeup_lock, flags);
 }
 
 static void ul_wakeup(void)
@@ -1927,9 +1946,7 @@ static void ul_wakeup(void)
 		}
 		if (likely(do_vote_dfab))
 			vote_dfab();
-		schedule_delayed_work(&ul_timeout_work,
-				msecs_to_jiffies(ul_timeout_delay));
-		bam_is_connected = 1;
+		ul_start_idle_timer();
 		mutex_unlock(&wakeup_lock);
 		return;
 	}
@@ -1970,10 +1987,8 @@ static void ul_wakeup(void)
 		return;
 	}
 
-	bam_is_connected = 1;
+	ul_start_idle_timer();
 	BAM_DMUX_LOG("%s complete\n", __func__);
-	schedule_delayed_work(&ul_timeout_work,
-				msecs_to_jiffies(ul_timeout_delay));
 	mutex_unlock(&wakeup_lock);
 }
 
