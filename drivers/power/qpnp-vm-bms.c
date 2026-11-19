@@ -281,6 +281,8 @@ struct qpnp_bms_chip {
 	struct qpnp_adc_tm_btm_param	vbat_monitor_params;
 	struct bms_irq			fifo_update_done_irq;
 	struct bms_irq			fsm_state_change_irq;
+	bool				irqs_requested;
+	bool				fifo_irq_wake;
 	struct power_supply		bms_psy;
 	struct power_supply		*batt_psy;
 	struct power_supply		*usb_psy;
@@ -3335,14 +3337,32 @@ static int bms_request_irqs(struct qpnp_bms_chip *chip)
 		return rc;
 
 	SPMI_REQUEST_IRQ(chip, rc, fsm_state_change);
-	if (rc < 0)
+	if (rc < 0) {
+		devm_free_irq(chip->dev, chip->fifo_update_done_irq.irq, chip);
 		return rc;
+	}
 
+	chip->irqs_requested = true;
 	/* Disable the state change IRQ */
 	disable_bms_irq(&chip->fsm_state_change_irq);
-	enable_irq_wake(chip->fifo_update_done_irq.irq);
+	rc = enable_irq_wake(chip->fifo_update_done_irq.irq);
+	chip->fifo_irq_wake = !rc;
+	if (rc)
+		dev_warn(chip->dev, "Could not enable FIFO IRQ wake: %d\n", rc);
 
 	return 0;
+}
+
+static void bms_free_irqs(struct qpnp_bms_chip *chip)
+{
+	if (!chip->irqs_requested)
+		return;
+
+	if (chip->fifo_irq_wake)
+		disable_irq_wake(chip->fifo_update_done_irq.irq);
+	devm_free_irq(chip->dev, chip->fsm_state_change_irq.irq, chip);
+	devm_free_irq(chip->dev, chip->fifo_update_done_irq.irq, chip);
+	chip->irqs_requested = false;
 }
 
 static int bms_find_irqs(struct qpnp_bms_chip *chip,
@@ -4141,12 +4161,15 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 	return rc;
 
 fail_get_vtg:
+	bms_free_irqs(chip);
+	chip->bms_psy_registered = false;
 	power_supply_unregister(&chip->bms_psy);
 fail_psy:
 	unregister_bms_char_device(chip);
 fail_bms_device:
 	chip->bms_psy_registered = false;
 fail_irq:
+	bms_free_irqs(chip);
 	reset_vbat_monitoring(chip);
 fail_setup:
 	wakeup_source_trash(&chip->vbms_lv_wake_source.source);
@@ -4171,7 +4194,10 @@ static int qpnp_vm_bms_remove(struct spmi_device *spmi)
 	/* Stop the fallback producer before draining its monitor work. */
 	cancel_delayed_work_sync(&chip->voltage_soc_timeout_work);
 	cancel_delayed_work_sync(&chip->monitor_soc_work);
+	bms_free_irqs(chip);
 	debugfs_remove_recursive(chip->debug_root);
+	chip->bms_psy_registered = false;
+	power_supply_unregister(&chip->bms_psy);
 	unregister_bms_char_device(chip);
 	reset_vbat_monitoring(chip);
 	wakeup_source_trash(&chip->vbms_lv_wake_source.source);
@@ -4181,7 +4207,6 @@ static int qpnp_vm_bms_remove(struct spmi_device *spmi)
 	mutex_destroy(&chip->last_soc_mutex);
 	mutex_destroy(&chip->state_change_mutex);
 	mutex_destroy(&chip->bms_device_mutex);
-	power_supply_unregister(&chip->bms_psy);
 	device_init_wakeup(&spmi->dev, 0);
 	dev_set_drvdata(&spmi->dev, NULL);
 	the_chip = NULL;
