@@ -498,7 +498,7 @@ static int cpu_boost_init(void)
 
 	cpu_boost_wq = alloc_workqueue("cpuboost_wq", WQ_HIGHPRI, 0);
 	if (!cpu_boost_wq)
-		return -EFAULT;
+		return -ENOMEM;
 
 	INIT_WORK(&input_boost_work, do_input_boost);
 	INIT_DELAYED_WORK(&input_boost_rem, do_input_boost_rem);
@@ -509,15 +509,40 @@ static int cpu_boost_init(void)
 		init_waitqueue_head(&s->sync_wq);
 		spin_lock_init(&s->lock);
 		INIT_DELAYED_WORK(&s->boost_rem, do_boost_rem);
-		s->thread = kthread_run(boost_mig_sync_thread,
-				(void *) (long)cpu, "boost_sync/%d", cpu);
-		set_cpus_allowed(s->thread, *cpumask_of(cpu));
+		s->thread = kthread_create(boost_mig_sync_thread,
+				(void *)(long)cpu, "boost_sync/%d", cpu);
+		if (IS_ERR(s->thread)) {
+			ret = PTR_ERR(s->thread);
+			s->thread = NULL;
+			goto stop_threads;
+		}
+		kthread_bind(s->thread, cpu);
+		wake_up_process(s->thread);
 	}
-	cpufreq_register_notifier(&boost_adjust_nb, CPUFREQ_POLICY_NOTIFIER);
-	atomic_notifier_chain_register(&migration_notifier_head,
-					&boost_migration_nb);
+	ret = cpufreq_register_notifier(&boost_adjust_nb, CPUFREQ_POLICY_NOTIFIER);
+	if (ret)
+		goto stop_threads;
+	ret = atomic_notifier_chain_register(&migration_notifier_head,
+					     &boost_migration_nb);
+	if (ret)
+		goto unregister_cpufreq;
 	ret = input_register_handler(&cpuboost_input_handler);
+	if (!ret)
+		return 0;
 
-	return 0;
+	atomic_notifier_chain_unregister(&migration_notifier_head,
+					&boost_migration_nb);
+unregister_cpufreq:
+	cpufreq_unregister_notifier(&boost_adjust_nb, CPUFREQ_POLICY_NOTIFIER);
+stop_threads:
+	for_each_possible_cpu(cpu) {
+		s = &per_cpu(sync_info, cpu);
+		if (s->thread) {
+			kthread_stop(s->thread);
+			cancel_delayed_work_sync(&s->boost_rem);
+		}
+	}
+	destroy_workqueue(cpu_boost_wq);
+	return ret;
 }
 late_initcall(cpu_boost_init);
