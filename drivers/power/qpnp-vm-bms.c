@@ -507,7 +507,9 @@ static int calculate_delta_time(unsigned long *time_stamp, int *delta_time_s)
 		return 0;
 	}
 
-	*delta_time_s = (now_tm_sec - *time_stamp);
+	if (*time_stamp && now_tm_sec >= *time_stamp &&
+	    now_tm_sec - *time_stamp <= INT_MAX)
+		*delta_time_s = now_tm_sec - *time_stamp;
 
 	/* remember this time */
 	*time_stamp = now_tm_sec;
@@ -4313,7 +4315,7 @@ static int bms_resume(struct device *dev)
 {
 	u8 state = 0;
 	int rc, monitor_soc_delay = 0;
-	unsigned long tm_now_sec;
+	unsigned long tm_now_sec = 0;
 	struct qpnp_bms_chip *chip = dev_get_drvdata(dev);
 
 	if (chip->apply_suspend_config) {
@@ -4346,10 +4348,12 @@ static int bms_resume(struct device *dev)
 	rc = get_current_time(&tm_now_sec);
 	if (rc) {
 		pr_err("Could not read current time: %d\n", rc);
-	} else {
-		monitor_soc_delay = get_calculation_delay_ms(chip) -
-			((tm_now_sec - chip->tm_sec) * 1000);
-		monitor_soc_delay = max(0, monitor_soc_delay);
+	} else if (chip->tm_sec && tm_now_sec >= chip->tm_sec) {
+		unsigned long elapsed = tm_now_sec - chip->tm_sec;
+		int interval = get_calculation_delay_ms(chip);
+
+		if (interval > 0 && elapsed <= interval / 1000)
+			monitor_soc_delay = interval - elapsed * 1000;
 	}
 	pr_debug("monitor_soc_delay_sec=%d tm_now_sec=%ld chip->tm_sec=%ld\n",
 			monitor_soc_delay / 1000, tm_now_sec, chip->tm_sec);
