@@ -256,7 +256,7 @@ static void do_input_boost_rem(struct work_struct *work)
 static int boost_mig_sync_thread(void *data)
 {
 	int dest_cpu = (long) data;
-	int src_cpu, ret;
+	int src_cpu, task_load, ret;
 	struct cpu_sync *s = &per_cpu(sync_info, dest_cpu);
 	struct cpufreq_policy dest_policy;
 	struct cpufreq_policy src_policy;
@@ -273,6 +273,7 @@ static int boost_mig_sync_thread(void *data)
 		spin_lock_irqsave(&s->lock, flags);
 		s->pending = false;
 		src_cpu = s->src_cpu;
+		task_load = s->task_load;
 		spin_unlock_irqrestore(&s->lock, flags);
 
 		ret = cpufreq_get_policy(&src_policy, src_cpu);
@@ -284,7 +285,7 @@ static int boost_mig_sync_thread(void *data)
 			continue;
 
 		req_freq = load_based_syncs ?
-			(dest_policy.cpuinfo.max_freq * s->task_load) / 100 :
+			(dest_policy.cpuinfo.max_freq * task_load) / 100 :
 							src_policy.cur;
 
 		if (req_freq <= dest_policy.cpuinfo.min_freq) {
