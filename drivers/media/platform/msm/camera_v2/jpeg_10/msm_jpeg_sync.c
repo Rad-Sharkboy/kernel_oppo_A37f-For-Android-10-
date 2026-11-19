@@ -718,9 +718,7 @@ int __msm_jpeg_open(struct msm_jpeg_device *pgmn_dev)
 		mutex_unlock(&pgmn_dev->lock);
 		return -EBUSY;
 	}
-	pgmn_dev->open_count++;
-	mutex_unlock(&pgmn_dev->lock);
-
+	msm_jpeg_core_init(pgmn_dev);
 	msm_jpeg_core_irq_install(msm_jpeg_irq);
 	if (pgmn_dev->core_type == MSM_JPEG_CORE_CODEC)
 		core_irq = msm_jpeg_core_irq;
@@ -733,6 +731,7 @@ int __msm_jpeg_open(struct msm_jpeg_device *pgmn_dev)
 	if (rc) {
 		JPEG_PR_ERR("%s:%d] platform_init fail %d\n", __func__,
 			__LINE__, rc);
+		mutex_unlock(&pgmn_dev->lock);
 		return rc;
 	}
 
@@ -747,10 +746,11 @@ int __msm_jpeg_open(struct msm_jpeg_device *pgmn_dev)
 		pgmn_dev->domain_num);
 	msm_jpeg_q_cleanup(&pgmn_dev->input_rtn_q);
 	msm_jpeg_q_cleanup(&pgmn_dev->input_buf_q);
-	msm_jpeg_core_init(pgmn_dev);
 
+	pgmn_dev->open_count = 1;
+	mutex_unlock(&pgmn_dev->lock);
 	JPEG_DBG("%s:%d] success\n", __func__, __LINE__);
-	return rc;
+	return 0;
 }
 
 int __msm_jpeg_release(struct msm_jpeg_device *pgmn_dev)
@@ -762,9 +762,7 @@ int __msm_jpeg_release(struct msm_jpeg_device *pgmn_dev)
 		mutex_unlock(&pgmn_dev->lock);
 		return -EINVAL;
 	}
-	pgmn_dev->open_count--;
-	mutex_unlock(&pgmn_dev->lock);
-
+	free_irq(pgmn_dev->irq, pgmn_dev);
 	msm_jpeg_core_release(pgmn_dev, pgmn_dev->domain_num);
 	msm_jpeg_q_cleanup(&pgmn_dev->evt_q);
 	msm_jpeg_q_cleanup(&pgmn_dev->output_rtn_q);
@@ -774,12 +772,9 @@ int __msm_jpeg_release(struct msm_jpeg_device *pgmn_dev)
 	msm_jpeg_outbuf_q_cleanup(pgmn_dev, &pgmn_dev->input_buf_q,
 		pgmn_dev->domain_num);
 
-	JPEG_DBG("%s:%d]\n", __func__, __LINE__);
-	if (pgmn_dev->open_count)
-		JPEG_PR_ERR(KERN_ERR "%s: multiple opens\n", __func__);
-
-	msm_jpeg_platform_release(pgmn_dev->mem, pgmn_dev->base,
-		pgmn_dev->irq, pgmn_dev);
+	msm_jpeg_platform_release(pgmn_dev->mem, pgmn_dev->base, pgmn_dev);
+	pgmn_dev->open_count = 0;
+	mutex_unlock(&pgmn_dev->lock);
 
 	JPEG_DBG("%s:%d]\n", __func__, __LINE__);
 	return 0;
