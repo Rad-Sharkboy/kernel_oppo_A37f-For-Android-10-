@@ -2015,8 +2015,11 @@ int32_t qpnp_adc_tm_channel_measure(struct qpnp_adc_tm_chip *chip,
 	adc_tm_rscale_fn[scale_type].chan(chip->vadc_dev, param,
 			&chip->adc->amux_prop->chan_prop->low_thr,
 			&chip->adc->amux_prop->chan_prop->high_thr);
-	qpnp_adc_tm_add_to_list(chip, dt_index, param,
-				chip->adc->amux_prop->chan_prop);
+	rc = qpnp_adc_tm_add_to_list(chip, dt_index, param,
+				     chip->adc->amux_prop->chan_prop);
+	if (rc)
+		goto fail_unlock;
+
 	chip->adc->amux_prop->chan_prop->tm_channel_select =
 				chip->sensor[dt_index].btm_channel_num;
 	chip->adc->amux_prop->chan_prop->state_request =
