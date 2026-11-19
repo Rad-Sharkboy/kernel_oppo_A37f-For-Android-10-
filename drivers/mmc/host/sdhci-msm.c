@@ -2845,8 +2845,12 @@ static void sdhci_msm_set_clock(struct sdhci_host *host, unsigned int clock)
 		 * disable pwrsave to ensure clock is not auto-gated until
 		 * the rate is >400KHz (initialization complete).
 		 */
-		writel_relaxed(readl_relaxed(host->ioaddr + CORE_VENDOR_SPEC) &
-			~CORE_CLK_PWRSAVE, host->ioaddr + CORE_VENDOR_SPEC);
+		if (atomic_read(&msm_host->controller_clock)) {
+			u32 vendor = readl_relaxed(host->ioaddr + CORE_VENDOR_SPEC);
+
+			writel_relaxed(vendor & ~CORE_CLK_PWRSAVE,
+				       host->ioaddr + CORE_VENDOR_SPEC);
+		}
 		sdhci_msm_prepare_clocks(host, false);
 		host->clock = clock;
 		return;
@@ -3580,10 +3584,12 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		host->quirks2 |= SDHCI_QUIRK2_NO_1_8_V;
 
 	/* Setup PWRCTL irq */
+	init_completion(&msm_host->pwr_irq_completion);
 	msm_host->pwr_irq = platform_get_irq_byname(pdev, "pwr_irq");
 	if (msm_host->pwr_irq < 0) {
 		dev_err(&pdev->dev, "Failed to get pwr_irq by name (%d)\n",
 				msm_host->pwr_irq);
+		ret = msm_host->pwr_irq;
 		goto vreg_deinit;
 	}
 	ret = devm_request_threaded_irq(&pdev->dev, msm_host->pwr_irq, NULL,
@@ -3625,8 +3631,6 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	if (msm_host->pdata->nonhotplug)
 		msm_host->mmc->caps2 |= MMC_CAP2_NONHOTPLUG;
 
-	init_completion(&msm_host->pwr_irq_completion);
-
 	if (gpio_is_valid(msm_host->pdata->status_gpio)) {
 		/*
 		 * Set up the card detect GPIO in active configuration before
@@ -3640,7 +3644,7 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		if (ret) {
 			dev_err(&pdev->dev, "%s: Failed to request card detection IRQ %d\n",
 					__func__, ret);
-			goto vreg_deinit;
+			goto free_pwr_irq;
 		}
 	}
 
@@ -3745,6 +3749,8 @@ free_cd_gpio:
 		mmc_gpio_free_cd(msm_host->mmc);
 	if (sdhci_is_valid_gpio_wakeup_int(msm_host))
 		free_irq(msm_host->pdata->sdiowakeup_irq, host);
+free_pwr_irq:
+	devm_free_irq(&pdev->dev, msm_host->pwr_irq, host);
 vreg_deinit:
 	sdhci_msm_vreg_init(&pdev->dev, msm_host->pdata, false);
 bus_unregister:
@@ -3786,9 +3792,10 @@ static int sdhci_msm_remove(struct platform_device *pdev)
 	if (!gpio_is_valid(msm_host->pdata->status_gpio))
 		device_remove_file(&pdev->dev, &msm_host->polling);
 	device_remove_file(&pdev->dev, &msm_host->msm_bus_vote.max_bus_bw);
+	device_remove_file(&pdev->dev, &msm_host->auto_cmd21_attr);
 	sdhci_remove_host(host, dead);
 	pm_runtime_disable(&pdev->dev);
-	sdhci_pltfm_free(pdev);
+	devm_free_irq(&pdev->dev, msm_host->pwr_irq, host);
 
 	if (sdhci_is_valid_mpm_wakeup_int(msm_host))
 		sdhci_msm_cfg_mpm_pin_wakeup(host, SDC_DAT1_DISABLE);
@@ -3812,6 +3819,7 @@ static int sdhci_msm_remove(struct platform_device *pdev)
 	if (gpio_is_valid(msm_host->pdata->sd_vdd_en))
 		gpio_free(msm_host->pdata->sd_vdd_en);
 #endif
+	sdhci_pltfm_free(pdev);
 	return 0;
 }
 
