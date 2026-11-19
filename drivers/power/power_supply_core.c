@@ -328,10 +328,12 @@ void power_supply_changed(struct power_supply *psy)
 	dev_dbg(psy->dev, "%s\n", __func__);
 
 	spin_lock_irqsave(&psy->changed_lock, flags);
-	psy->changed = true;
-	pm_stay_awake(psy->dev);
+	if (!psy->changed) {
+		psy->changed = true;
+		pm_stay_awake(psy->dev);
+		schedule_work(&psy->changed_work);
+	}
 	spin_unlock_irqrestore(&psy->changed_lock, flags);
-	schedule_work(&psy->changed_work);
 }
 EXPORT_SYMBOL_GPL(power_supply_changed);
 
