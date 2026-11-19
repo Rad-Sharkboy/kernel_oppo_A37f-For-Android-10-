@@ -888,7 +888,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	unsigned long flags;
 	struct sk_buff *new_skb = NULL;
 	struct sk_buff *original_skb = skb;
-	unsigned int original_len = skb->len;
+	unsigned int original_len;
 	dma_addr_t dma_address;
 	struct tx_pkt_info *pkt;
 	int rcu_id;
@@ -897,6 +897,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 		return -EINVAL;
 	if (!skb)
 		return -EINVAL;
+	original_len = skb->len;
 	if (!bam_mux_initialized)
 		return -ENODEV;
 
@@ -960,11 +961,9 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	hdr->signal = 0;
 	hdr->ch_id = id;
 	hdr->pkt_len = skb->len - sizeof(struct bam_mux_hdr);
-	if (skb->len & 0x3)
-		memset(skb_put(skb, 4 - (skb->len & 0x3)), 0,
-		       4 - (hdr->pkt_len & 0x3));
-
-	hdr->pad_len = skb->len - (sizeof(struct bam_mux_hdr) + hdr->pkt_len);
+	hdr->pad_len = (-skb->len) & 0x3;
+	if (hdr->pad_len)
+		memset(skb_put(skb, hdr->pad_len), 0, hdr->pad_len);
 
 	DBG("%s: data %p, tail %p skb len %d pkt len %d pad len %d\n",
 	    __func__, skb->data, skb_tail_pointer(skb), skb->len,
