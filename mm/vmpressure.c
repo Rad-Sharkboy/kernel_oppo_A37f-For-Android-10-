@@ -187,12 +187,13 @@ out:
 static unsigned long vmpressure_account_stall(unsigned long pressure,
 				unsigned long stall, unsigned long scanned)
 {
+	unsigned long max_pressure = ACCESS_ONCE(vmpressure_scale_max);
 	unsigned long scale;
 
-	if (pressure < allocstall_threshold)
+	if (pressure < allocstall_threshold || pressure >= max_pressure)
 		return pressure;
 
-	scale = ((vmpressure_scale_max - pressure) * stall) / scanned;
+	scale = ((max_pressure - pressure) * stall) / scanned;
 
 	return pressure + scale;
 }
@@ -325,15 +326,14 @@ void vmpressure_global(gfp_t gfp, unsigned long scanned,
 	if (!current_is_kswapd())
 		vmpr->stall += scanned;
 
+	if (vmpr->scanned < vmpressure_win) {
+		mutex_unlock(&vmpr->sr_lock);
+		return;
+	}
+
 	stall = vmpr->stall;
 	scanned = vmpr->scanned;
 	reclaimed = vmpr->reclaimed;
-	mutex_unlock(&vmpr->sr_lock);
-
-	if (scanned < vmpressure_win)
-		return;
-
-	mutex_lock(&vmpr->sr_lock);
 	vmpr->scanned = 0;
 	vmpr->reclaimed = 0;
 	vmpr->stall = 0;
