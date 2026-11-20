@@ -160,7 +160,8 @@ DEVICE_ATTR(timeout, 0664, timeout_show, timeout_store);
 static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd);
 static struct platform_driver bam_rmnet_drivers[BAM_DMUX_NUM_CHANNELS];
 
-static struct net_device *netdevs[BAM_DMUX_NUM_CHANNELS];
+static char bam_rmnet_driver_names[BAM_DMUX_NUM_CHANNELS]
+				  [BAM_DMUX_CH_NAME_MAX_LEN];
 
 static __be16 rmnet_ip_type_trans(struct sk_buff *skb, struct net_device *dev)
 {
@@ -195,41 +196,38 @@ static int count_this_packet(void *_hdr, int len)
 /* Rx Callback, Called in Work Queue context */
 static void bam_recv_notify(void *dev, struct sk_buff *skb)
 {
-	struct rmnet_private *p = netdev_priv(dev);
-	unsigned long flags;
-	u32 opmode;
+	struct net_device *netdev = dev;
+	struct rmnet_private *p = netdev_priv(netdev);
+	u32 opmode = smp_load_acquire(&p->operation_mode);
+	bool ip_mode = RMNET_IS_MODE_IP(opmode);
 
-	if (skb) {
-		skb->dev = dev;
-		/* Handle Rx frame format */
-		spin_lock_irqsave(&p->lock, flags);
-		opmode = p->operation_mode;
-		spin_unlock_irqrestore(&p->lock, flags);
+	if (!skb) {
+		pr_err_ratelimited("[%s] no RX skb\n", netdev->name);
+		return;
+	}
+	if (!netif_running(netdev) ||
+	    !pskb_may_pull(skb, ip_mode ? 1 : ETH_HLEN)) {
+		p->stats.rx_dropped++;
+		dev_kfree_skb_any(skb);
+		return;
+	}
 
-		if (RMNET_IS_MODE_IP(opmode)) {
-			/* Driver in IP mode */
-			skb->protocol = rmnet_ip_type_trans(skb, dev);
-		} else {
-			/* Driver in Ethernet mode */
-			skb->protocol = eth_type_trans(skb, dev);
-		}
-		if (RMNET_IS_MODE_IP(opmode) ||
-		    count_this_packet(skb->data, skb->len)) {
+	if (ip_mode)
+		skb->protocol = rmnet_ip_type_trans(skb, netdev);
+	else
+		skb->protocol = eth_type_trans(skb, netdev);
+	if (ip_mode || skb->protocol != htons(ETH_P_ARP)) {
 #ifdef CONFIG_MSM_RMNET_DEBUG
-			p->wakeups_rcv += rmnet_cause_wakeup(p);
+		p->wakeups_rcv += rmnet_cause_wakeup(p);
 #endif
-			p->stats.rx_packets++;
-			p->stats.rx_bytes += skb->len;
-		}
-		DBG1("[%s] Rx packet #%lu len=%d\n",
-			((struct net_device *)dev)->name,
-			p->stats.rx_packets, skb->len);
+		p->stats.rx_packets++;
+		p->stats.rx_bytes += skb->len;
+	}
+	DBG1("[%s] Rx packet #%lu len=%d\n", netdev->name,
+		p->stats.rx_packets, skb->len);
 
-		/* Deliver to network stack */
-		netif_rx_ni(skb);
-	} else
-		pr_err("[%s] %s: No skb received",
-			((struct net_device *)dev)->name, __func__);
+	if (netif_rx_ni(skb) == NET_RX_DROP)
+		p->stats.rx_dropped++;
 }
 
 static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -238,7 +236,6 @@ static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 	int bam_ret;
 	struct QMI_QOS_HDR_S *qmih;
 	u32 opmode;
-	unsigned long flags;
 
 	if (skb_headroom(skb) < dev->needed_headroom)
 		msm_rmnet_bam_headroom_check_failure++;
@@ -248,9 +245,7 @@ static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 		return NETDEV_TX_OK;
 	}
 	/* For QoS mode, prepend QMI header and assign flow ID from skb->mark */
-	spin_lock_irqsave(&p->lock, flags);
-	opmode = p->operation_mode;
-	spin_unlock_irqrestore(&p->lock, flags);
+	opmode = smp_load_acquire(&p->operation_mode);
 
 	if (RMNET_IS_MODE_QOS(opmode)) {
 		qmih = (struct QMI_QOS_HDR_S *)
@@ -267,8 +262,8 @@ static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 		skb_pull(skb, sizeof(struct QMI_QOS_HDR_S));
 
 	if (bam_ret != 0 && bam_ret != -EAGAIN && bam_ret != -EFAULT) {
-		pr_err("[%s] %s: write returned error %d",
-			dev->name, __func__, bam_ret);
+		pr_err_ratelimited("[%s] BAM transmit failed: %d\n",
+				   dev->name, bam_ret);
 		return -EPERM;
 	}
 
@@ -278,7 +273,7 @@ static int _rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 static void bam_write_done(void *dev, struct sk_buff *skb)
 {
 	struct rmnet_private *p = netdev_priv(dev);
-	u32 opmode = p->operation_mode;
+	u32 opmode = smp_load_acquire(&p->operation_mode);
 	unsigned long flags;
 
 	DBG1("%s: write complete\n", __func__);
@@ -305,37 +300,43 @@ static void bam_write_done(void *dev, struct sk_buff *skb)
 	spin_unlock_irqrestore(&p->tx_queue_lock, flags);
 }
 
+static struct sk_buff *rmnet_take_waiting_skb(struct rmnet_private *p)
+{
+	struct sk_buff *skb;
+	unsigned long flags;
+
+	spin_lock_irqsave(&p->lock, flags);
+	skb = p->waiting_for_ul_skb;
+	p->waiting_for_ul_skb = NULL;
+	spin_unlock_irqrestore(&p->lock, flags);
+
+	return skb;
+}
+
 static void bam_notify(void *dev, int event, unsigned long data)
 {
-	struct rmnet_private *p = netdev_priv(dev);
-	unsigned long flags;
+	struct net_device *netdev = dev;
+	struct rmnet_private *p = netdev_priv(netdev);
+	struct sk_buff *skb;
 
 	switch (event) {
 	case BAM_DMUX_RECEIVE:
-		bam_recv_notify(dev, (struct sk_buff *)(data));
+		bam_recv_notify(dev, (struct sk_buff *)data);
 		break;
 	case BAM_DMUX_WRITE_DONE:
-		bam_write_done(dev, (struct sk_buff *)(data));
+		bam_write_done(dev, (struct sk_buff *)data);
 		break;
 	case BAM_DMUX_UL_CONNECTED:
-		spin_lock_irqsave(&p->lock, flags);
-		if (p->waiting_for_ul_skb != NULL) {
-			struct sk_buff *skb;
-			int ret;
-
-			skb = p->waiting_for_ul_skb;
-			p->waiting_for_ul_skb = NULL;
-			spin_unlock_irqrestore(&p->lock, flags);
-			ret = _rmnet_xmit(skb, dev);
-			if (ret) {
-				pr_err("%s: error %d dropping delayed TX SKB %p\n",
-						__func__, ret, skb);
-				dev_kfree_skb_any(skb);
-			}
-			netif_wake_queue(dev);
-		} else {
-			spin_unlock_irqrestore(&p->lock, flags);
+		skb = rmnet_take_waiting_skb(p);
+		if (!skb)
+			break;
+		if (!netif_running(netdev) || !netif_carrier_ok(netdev) ||
+		    _rmnet_xmit(skb, netdev)) {
+			p->stats.tx_dropped++;
+			dev_kfree_skb_any(skb);
 		}
+		if (netif_running(netdev) && netif_carrier_ok(netdev))
+			netif_wake_queue(netdev);
 		break;
 	case BAM_DMUX_UL_DISCONNECTED:
 		break;
@@ -376,10 +377,16 @@ static int __rmnet_close(struct net_device *dev)
 
 static int rmnet_stop(struct net_device *dev)
 {
+	struct rmnet_private *p = netdev_priv(dev);
+	struct sk_buff *skb;
+
 	DBG0("[%s] rmnet_stop()\n", dev->name);
 
+	netif_tx_disable(dev);
 	__rmnet_close(dev);
-	netif_stop_queue(dev);
+	skb = rmnet_take_waiting_skb(p);
+	if (skb)
+		dev_kfree_skb_any(skb);
 
 	return 0;
 }
@@ -403,27 +410,31 @@ static int rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 	int awake;
 	int ret = 0;
 
-	if (netif_queue_stopped(dev)) {
-		pr_err("[%s]fatal: rmnet_xmit called when "
-			"netif_queue is stopped", dev->name);
-		return 0;
-	}
+	if (unlikely(netif_queue_stopped(dev)))
+		return NETDEV_TX_BUSY;
 
 	spin_lock_irqsave(&p->lock, flags);
 	awake = msm_bam_dmux_ul_power_vote();
 	if (!awake) {
 		/* send SKB once wakeup is complete */
 		netif_stop_queue(dev);
-		p->waiting_for_ul_skb = skb;
+		if (unlikely(p->waiting_for_ul_skb)) {
+			ret = NETDEV_TX_BUSY;
+		} else {
+			p->waiting_for_ul_skb = skb;
+			ret = NETDEV_TX_OK;
+		}
 		spin_unlock_irqrestore(&p->lock, flags);
-		ret = 0;
 		goto exit;
 	}
 	spin_unlock_irqrestore(&p->lock, flags);
 
 	ret = _rmnet_xmit(skb, dev);
 	if (ret == -EPERM) {
-		ret = NETDEV_TX_BUSY;
+		/* A failed DMA submission is not TX-ring backpressure. */
+		p->stats.tx_dropped++;
+		dev_kfree_skb_any(skb);
+		ret = NETDEV_TX_OK;
 		goto exit;
 	}
 
@@ -433,6 +444,7 @@ static int rmnet_xmit(struct sk_buff *skb, struct net_device *dev)
 	 */
 	if (ret == -EFAULT) {
 		netif_carrier_off(dev);
+		p->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);
 		ret = 0;
 		goto exit;
@@ -523,13 +535,8 @@ static int rmnet_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
 	struct rmnet_private *p = netdev_priv(dev);
 	struct rmnet_free_bam_work *work;
 
-	rc = copy_from_user(&ext_cmd, ifr->ifr_ifru.ifru_data,
-			    sizeof(ext_cmd));
-
-	if (rc) {
-		pr_err("%s: copy_from_user failed ,error %d", __func__, rc);
-		return rc;
-	}
+	if (copy_from_user(&ext_cmd, ifr->ifr_ifru.ifru_data, sizeof(ext_cmd)))
+		return -EFAULT;
 
 	switch (ext_cmd.extended_ioctl) {
 	case RMNET_IOCTL_SET_MRU:
@@ -548,7 +555,7 @@ static int rmnet_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
 	case RMNET_IOCTL_DEREGISTER_DEV:
 		work = kmalloc(sizeof(*work), GFP_KERNEL);
 		if (!work)
-			break;
+			return -ENOMEM;
 		INIT_WORK(&work->work, _rmnet_free_bam_later);
 
 		work->ch_id = p->ch_id;
@@ -559,12 +566,10 @@ static int rmnet_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
 		break;
 	}
 
-	rc = copy_to_user(ifr->ifr_ifru.ifru_data, &ext_cmd, sizeof(ext_cmd));
-
 	if (rc)
-		pr_err("%s: copy_to_user failed, error %d", __func__, rc);
-
-	return rc;
+		return rc;
+	return copy_to_user(ifr->ifr_ifru.ifru_data, &ext_cmd, sizeof(ext_cmd)) ?
+		-EFAULT : 0;
 }
 
 static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
@@ -574,7 +579,7 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	unsigned long flags;
 	int prev_mtu = dev->mtu;
 	int rc = 0;
-	struct rmnet_ioctl_data_s ioctl_data;
+	struct rmnet_ioctl_data_s ioctl_data = { };
 
 	/* Process IOCTL command */
 	switch (cmd) {
@@ -584,11 +589,14 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 			ether_setup(dev);
 			random_ether_addr(dev->dev_addr);
 			dev->mtu = prev_mtu;
+			dev->needed_headroom = HEADROOM_FOR_BAM + HEADROOM_FOR_QOS;
+			dev->needed_tailroom = TAILROOM;
 
 			dev->netdev_ops = &rmnet_ops_ether;
 			spin_lock_irqsave(&p->lock, flags);
-			p->operation_mode &= ~RMNET_MODE_LLP_IP;
-			p->operation_mode |= RMNET_MODE_LLP_ETH;
+			smp_store_release(&p->operation_mode,
+				(p->operation_mode & ~RMNET_MODE_LLP_IP) |
+				RMNET_MODE_LLP_ETH);
 			spin_unlock_irqrestore(&p->lock, flags);
 			DBG0("[%s] rmnet_ioctl(): "
 				"set Ethernet protocol mode\n",
@@ -614,8 +622,9 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 			dev->needed_tailroom = TAILROOM;
 			dev->netdev_ops = &rmnet_ops_ip;
 			spin_lock_irqsave(&p->lock, flags);
-			p->operation_mode &= ~RMNET_MODE_LLP_ETH;
-			p->operation_mode |= RMNET_MODE_LLP_IP;
+			smp_store_release(&p->operation_mode,
+				(p->operation_mode & ~RMNET_MODE_LLP_ETH) |
+				RMNET_MODE_LLP_IP);
 			spin_unlock_irqrestore(&p->lock, flags);
 			DBG0("[%s] rmnet_ioctl(): "
 				"set IP protocol mode\n",
@@ -633,7 +642,8 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 	case RMNET_IOCTL_SET_QOS_ENABLE:    /* Set QoS header enabled  */
 		spin_lock_irqsave(&p->lock, flags);
-		p->operation_mode |= RMNET_MODE_QOS;
+		smp_store_release(&p->operation_mode,
+				  p->operation_mode | RMNET_MODE_QOS);
 		spin_unlock_irqrestore(&p->lock, flags);
 		DBG0("[%s] rmnet_ioctl(): set QMI QOS header enable\n",
 			dev->name);
@@ -641,7 +651,8 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 	case RMNET_IOCTL_SET_QOS_DISABLE:   /* Set QoS header disabled */
 		spin_lock_irqsave(&p->lock, flags);
-		p->operation_mode &= ~RMNET_MODE_QOS;
+		smp_store_release(&p->operation_mode,
+				  p->operation_mode & ~RMNET_MODE_QOS);
 		spin_unlock_irqrestore(&p->lock, flags);
 		DBG0("[%s] rmnet_ioctl(): set QMI QOS header disable\n",
 			dev->name);
@@ -756,7 +767,6 @@ static int bam_rmnet_probe(struct platform_device *pdev)
 {
 	int i, ret;
 	struct rmnet_private *p;
-	struct device *d;
 	char name[BAM_DMUX_CH_NAME_MAX_LEN];
 	struct net_device *dev;
 	const char *dev_name;
@@ -784,8 +794,6 @@ static int bam_rmnet_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	netdevs[i] = dev;
-	d = &(dev->dev);
 	p = netdev_priv(dev);
 	/* Initial config uses Ethernet */
 	p->operation_mode = RMNET_MODE_LLP_ETH;
@@ -799,7 +807,6 @@ static int bam_rmnet_probe(struct platform_device *pdev)
 	if (ret) {
 		pr_err("%s: unable to register netdev %d rc=%d\n",
 			__func__, i, ret);
-		netdevs[i] = NULL;
 		free_netdev(dev);
 		return ret;
 	}
@@ -820,38 +827,25 @@ static int bam_rmnet_probe(struct platform_device *pdev)
 	}
 
 	p->device_up = DEVICE_ACTIVE;
+	platform_set_drvdata(pdev, dev);
 	return 0;
 }
 
 static int bam_rmnet_remove(struct platform_device *pdev)
 {
-	int i;
-	struct rmnet_private *p;
-	char name[BAM_DMUX_CH_NAME_MAX_LEN];
+	struct net_device *dev = platform_get_drvdata(pdev);
+	struct rmnet_private *p = netdev_priv(dev);
+	struct sk_buff *skb;
 
-	for (i = 0; i < BAM_DMUX_NUM_CHANNELS; ++i) {
-		scnprintf(name, BAM_DMUX_CH_NAME_MAX_LEN, "bam_dmux_ch_%d", i);
-		if (!strcmp(pdev->name, name))
-			break;
-	}
-
-	if (((i > BAM_DMUX_DATA_RMNET_7) && (i < BAM_DMUX_DATA_REV_RMNET_0)) ||
-	    (i >= BAM_DMUX_NUM_CHANNELS)) {
-		pr_err("%s: wrong netdev %s\n", __func__, pdev->name);
-		return -ENODEV;
-	}
-
-	p = netdev_priv(netdevs[i]);
-	if (p->waiting_for_ul_skb != NULL) {
-		dev_kfree_skb_any(p->waiting_for_ul_skb);
-		p->waiting_for_ul_skb = NULL;
-	}
+	netif_carrier_off(dev);
+	netif_tx_disable(dev);
+	skb = rmnet_take_waiting_skb(p);
+	if (skb)
+		dev_kfree_skb_any(skb);
 	msm_bam_dmux_close(p->ch_id);
-	netif_carrier_off(netdevs[i]);
-	netif_stop_queue(netdevs[i]);
-
-	unregister_netdev(netdevs[i]);
-	free_netdev(netdevs[i]);
+	platform_set_drvdata(pdev, NULL);
+	unregister_netdev(dev);
+	free_netdev(dev);
 
 	return 0;
 }
@@ -870,34 +864,31 @@ static void rmnet_clear_timeout_us(void)
 
 static int __init rmnet_init(void)
 {
-	unsigned n;
-	char *tempname;
+	unsigned int n, registered[BAM_DMUX_NUM_CHANNELS], count = 0;
+	int ret;
 
 	rmnet_clear_timeout_us();
-
-	n = 0;
-	while (n <= BAM_DMUX_DATA_REV_RMNET_8) {
-		if ((n > BAM_DMUX_DATA_RMNET_7) &&
-		    (n < BAM_DMUX_DATA_REV_RMNET_0)) {
-			n++;
+	for (n = 0; n <= BAM_DMUX_DATA_REV_RMNET_8; n++) {
+		if (n > BAM_DMUX_DATA_RMNET_7 && n < BAM_DMUX_DATA_REV_RMNET_0)
 			continue;
-		}
 		bam_rmnet_drivers[n].probe = bam_rmnet_probe;
 		bam_rmnet_drivers[n].remove = bam_rmnet_remove;
-		tempname = kmalloc(BAM_DMUX_CH_NAME_MAX_LEN, GFP_KERNEL);
-		if (tempname == NULL) {
-			netdevs[n] = NULL;
-			return -ENOMEM;
-		}
-		scnprintf(tempname, BAM_DMUX_CH_NAME_MAX_LEN, "bam_dmux_ch_%d",
-			  n);
-		bam_rmnet_drivers[n].driver.name = tempname;
+		scnprintf(bam_rmnet_driver_names[n], BAM_DMUX_CH_NAME_MAX_LEN,
+			  "bam_dmux_ch_%u", n);
+		bam_rmnet_drivers[n].driver.name = bam_rmnet_driver_names[n];
 		bam_rmnet_drivers[n].driver.owner = THIS_MODULE;
-		platform_driver_register(&bam_rmnet_drivers[n]);
-		n++;
+		ret = platform_driver_register(&bam_rmnet_drivers[n]);
+		if (ret)
+			goto unregister;
+		registered[count++] = n;
 	}
 
 	return 0;
+
+unregister:
+	while (count)
+		platform_driver_unregister(&bam_rmnet_drivers[registered[--count]]);
+	return ret;
 }
 
 module_init(rmnet_init);
