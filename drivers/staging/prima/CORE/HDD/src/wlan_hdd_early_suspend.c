@@ -1111,13 +1111,8 @@ void hdd_conf_mcastbcast_filter(hdd_context_t* pHddCtx, v_BOOL_t setfilter)
        pHddCtx->hdd_mcastbcast_filter_set = TRUE;
     }
 
-    hddLog(VOS_TRACE_LEVEL_INFO, "%s to post set/reset filter to"
-           "lower mac with status %d"
-           "configuredMcstBcstFilterSetting = %d"
-           "setMcstBcstFilter = %d",(eHAL_STATUS_SUCCESS != halStatus) ?
-           "Failed" : "Success", halStatus,
-           wlanRxpFilterParam->configuredMcstBcstFilterSetting,
-           wlanRxpFilterParam->setMcstBcstFilter);
+    hddLog(VOS_TRACE_LEVEL_INFO, FL("MC/BC filter set=%d status=%d"),
+           setfilter, halStatus);
 
     if (eHAL_STATUS_SUCCESS != halStatus)
         vos_mem_free(wlanRxpFilterParam);
@@ -1347,26 +1342,18 @@ static void hdd_conf_resume_ind(hdd_adapter_t *pAdapter)
     hddLog(VOS_TRACE_LEVEL_INFO,
       "%s: send wlan resume indication", __func__);
 
-    wlanResumeParam = vos_mem_malloc(sizeof(tSirWlanResumeParam));
-
-    if (NULL == wlanResumeParam)
-    {
-        hddLog(VOS_TRACE_LEVEL_FATAL,
-             "%s: memory allocation failed for wlanResumeParam ", __func__);
-        return;
-    }
-
-    //Disable supported OffLoads
     hdd_conf_hostoffload(pAdapter, FALSE);
-
-    wlanResumeParam->configuredMcstBcstFilterSetting =
-                               pHddCtx->configuredMcastBcastFilter;
-    halStatus = sme_ConfigureResumeReq(pHddCtx->hHal, wlanResumeParam);
-    if (eHAL_STATUS_SUCCESS != halStatus)
-    {
-        hddLog(VOS_TRACE_LEVEL_ERROR,
-              "%s: sme_ConfigureResumeReq return failure %d", __func__, halStatus);
-        vos_mem_free(wlanResumeParam);
+    wlanResumeParam = vos_mem_malloc(sizeof(*wlanResumeParam));
+    if (wlanResumeParam) {
+        wlanResumeParam->configuredMcstBcstFilterSetting =
+            pHddCtx->configuredMcastBcastFilter;
+        halStatus = sme_ConfigureResumeReq(pHddCtx->hHal, wlanResumeParam);
+        if (halStatus != eHAL_STATUS_SUCCESS) {
+            hddLog(LOGE, FL("resume request failed: %d"), halStatus);
+            vos_mem_free(wlanResumeParam);
+        }
+    } else {
+        hddLog(LOGE, FL("resume request allocation failed"));
     }
 
     pHddCtx->hdd_mcastbcast_filter_set = FALSE;
