@@ -1170,12 +1170,9 @@ static int msm_rpm_send_data(struct msm_rpm_request *cdata,
 
 	if (cdata->msg_hdr.set == MSM_RPM_CTX_SLEEP_SET) {
 		ret = msm_rpm_smd_buffer_request(cdata, msg_size);
-		if (!ret) {
-			for (i = 0; i < cdata->write_idx; i++)
-				cdata->kvp[i].valid = false;
-			cdata->msg_hdr.data_len = 0;
+		/* A persistent handle may reassert its vote after another producer. */
+		if (!ret)
 			return 1;
-		}
 		if (ret != -EOPNOTSUPP)
 			return 0;
 	}
