@@ -1832,18 +1832,18 @@ static int reset_vbat_monitoring(struct qpnp_bms_chip *chip)
 {
 	int rc;
 
-	chip->vbat_monitor_params.state_request = ADC_TM_HIGH_LOW_THR_DISABLE;
-	rc = qpnp_adc_tm_channel_measure(chip->adc_tm_dev,
-						&chip->vbat_monitor_params);
-	if (rc) {
-		pr_err("tm disable failed: %d\n", rc);
-		return rc;
-	}
+	if (!chip->vbat_monitor_params.threshold_notification)
+		return 0;
+
+	rc = qpnp_adc_tm_unregister_client(chip->adc_tm_dev,
+					  &chip->vbat_monitor_params);
+	if (rc)
+		pr_err("Unable to release VBAT monitor rc=%d\n", rc);
 
 	if (bms_wake_active(&chip->vbms_lv_wake_source))
 		bms_relax(&chip->vbms_lv_wake_source);
 
-	return 0;
+	return rc;
 }
 
 static int setup_vbat_monitoring(struct qpnp_bms_chip *chip)
@@ -4141,8 +4141,8 @@ fail_bms_device:
 	chip->bms_psy_registered = false;
 fail_irq:
 	bms_free_irqs(chip);
-	reset_vbat_monitoring(chip);
 fail_setup:
+	reset_vbat_monitoring(chip);
 	wakeup_source_trash(&chip->vbms_lv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_cv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_soc_wake_source.source);

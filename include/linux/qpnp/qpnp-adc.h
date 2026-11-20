@@ -2043,6 +2043,9 @@ int32_t qpnp_adc_tm_channel_measure(struct qpnp_adc_tm_chip *chip,
  */
 int32_t qpnp_adc_tm_disable_chan_meas(struct qpnp_adc_tm_chip *chip,
 					struct qpnp_adc_tm_btm_param *param);
+/* Detach one client and drain its callback. Call outside the callback. */
+int32_t qpnp_adc_tm_unregister_client(struct qpnp_adc_tm_chip *chip,
+				     struct qpnp_adc_tm_btm_param *param);
 /**
  * qpnp_get_adc_tm() - Clients need to register with the adc_tm using the
  *		corresponding device instance it wants to read the channels
@@ -2066,6 +2069,10 @@ static inline int32_t qpnp_adc_tm_channel_measure(
 					struct qpnp_adc_tm_btm_param *param)
 { return -ENXIO; }
 static inline int32_t qpnp_adc_tm_disable_chan_meas(
+					struct qpnp_adc_tm_chip *chip,
+					struct qpnp_adc_tm_btm_param *param)
+{ return -ENXIO; }
+static inline int32_t qpnp_adc_tm_unregister_client(
 					struct qpnp_adc_tm_chip *chip,
 					struct qpnp_adc_tm_btm_param *param)
 { return -ENXIO; }

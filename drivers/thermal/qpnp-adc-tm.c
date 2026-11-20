@@ -201,6 +201,7 @@ struct qpnp_adc_tm_sensor {
 	bool				thermal_node;
 	uint32_t			scale_type;
 	struct list_head		thr_list;
+	struct mutex			notify_lock;
 };
 
 struct qpnp_adc_tm_chip {
@@ -1289,63 +1290,40 @@ static int qpnp_adc_tm_set_trip_temp(struct thermal_zone_device *thermal,
 	return 0;
 }
 
-static void notify_battery_therm(struct qpnp_adc_tm_sensor *adc_tm)
+static void notify_clients(struct qpnp_adc_tm_sensor *sensor)
 {
-	struct qpnp_adc_thr_client_info *client_info = NULL;
+	struct qpnp_adc_tm_chip *chip = sensor->chip;
+	struct qpnp_adc_thr_client_info *client;
+	struct qpnp_adc_tm_btm_param *param;
+	enum qpnp_tm_state state;
+	bool batt_therm;
 
-	list_for_each_entry(client_info,
-			&adc_tm->thr_list, list) {
-		/* Batt therm's warm temperature translates to low voltage */
-		if (client_info->notify_low_thr) {
-			/* HIGH_STATE = WARM_TEMP for battery client */
-			client_info->btm_param->threshold_notification(
-			ADC_TM_WARM_STATE, client_info->btm_param->btm_ctx);
-			client_info->notify_low_thr = false;
-		}
-
-		/* Batt therm's cool temperature translates to high voltage */
-		if (client_info->notify_high_thr) {
-			/* LOW_STATE = COOL_TEMP for battery client */
-			client_info->btm_param->threshold_notification(
-			ADC_TM_COOL_STATE, client_info->btm_param->btm_ctx);
-			client_info->notify_high_thr = false;
-		}
-	}
-
-	return;
-}
-
-static void notify_clients(struct qpnp_adc_tm_sensor *adc_tm)
-{
-	struct qpnp_adc_thr_client_info *client_info = NULL;
-
-	list_for_each_entry(client_info,
-			&adc_tm->thr_list, list) {
-		/* For non batt therm clients */
-		if (client_info->notify_low_thr) {
-			if (client_info->btm_param->threshold_notification
-								!= NULL) {
-				pr_debug("notify kernel with low state\n");
-				client_info->btm_param->threshold_notification(
-					ADC_TM_LOW_STATE,
-					client_info->btm_param->btm_ctx);
-				client_info->notify_low_thr = false;
+	/* A departing client waits for its callback, which may re-arm ADC_TM. */
+	mutex_lock(&sensor->notify_lock);
+	for (;;) {
+		param = NULL;
+		mutex_lock(&chip->adc->adc_lock);
+		batt_therm = sensor->scale_type == SCALE_RBATT_THERM;
+		list_for_each_entry(client, &sensor->thr_list, list) {
+			if (client->notify_low_thr) {
+				client->notify_low_thr = false;
+				state = batt_therm ? ADC_TM_WARM_STATE : ADC_TM_LOW_STATE;
+			} else if (client->notify_high_thr) {
+				client->notify_high_thr = false;
+				state = batt_therm ? ADC_TM_COOL_STATE : ADC_TM_HIGH_STATE;
+			} else {
+				continue;
 			}
+			param = client->btm_param;
+			break;
 		}
+		mutex_unlock(&chip->adc->adc_lock);
 
-		if (client_info->notify_high_thr) {
-			if (client_info->btm_param->threshold_notification
-								!= NULL) {
-				pr_debug("notify kernel with high state\n");
-				client_info->btm_param->threshold_notification(
-					ADC_TM_HIGH_STATE,
-					client_info->btm_param->btm_ctx);
-				client_info->notify_high_thr = false;
-			}
-		}
+		if (!param)
+			break;
+		param->threshold_notification(state, param->btm_ctx);
 	}
-
-	return;
+	mutex_unlock(&sensor->notify_lock);
 }
 
 static void notify_adc_tm_fn(struct work_struct *work)
@@ -1354,16 +1332,10 @@ static void notify_adc_tm_fn(struct work_struct *work)
 		struct qpnp_adc_tm_sensor, work);
 	struct qpnp_adc_tm_chip *chip = adc_tm->chip;
 
-	if (adc_tm->thermal_node) {
-		sysfs_notify(&adc_tm->tz_dev->device.kobj,
-					NULL, "btm");
-		pr_debug("notifying uspace client\n");
-	} else {
-		if (adc_tm->scale_type == SCALE_RBATT_THERM)
-			notify_battery_therm(adc_tm);
-		else
-			notify_clients(adc_tm);
-	}
+	if (!adc_tm->thermal_node)
+		notify_clients(adc_tm);
+	else if (!IS_ERR_OR_NULL(adc_tm->tz_dev))
+		sysfs_notify(&adc_tm->tz_dev->device.kobj, NULL, "btm");
 
 	atomic_dec(&chip->wq_cnt);
 	return;
@@ -1938,6 +1910,55 @@ fail:
 }
 EXPORT_SYMBOL(qpnp_adc_tm_disable_chan_meas);
 
+int32_t qpnp_adc_tm_unregister_client(struct qpnp_adc_tm_chip *chip,
+				     struct qpnp_adc_tm_btm_param *param)
+{
+	struct qpnp_adc_tm_sensor *sensor;
+	struct qpnp_adc_thr_client_info *client;
+	int i, rc = 0, restart_rc;
+
+	if (qpnp_adc_tm_is_valid(chip))
+		return -ENODEV;
+
+	for (i = 0; i < chip->max_channels_available; i++)
+		if (chip->sensor[i].vadc_channel_num == param->channel)
+			break;
+	if (i == chip->max_channels_available || chip->sensor[i].thermal_node)
+		return -EINVAL;
+
+	sensor = &chip->sensor[i];
+	mutex_lock(&sensor->notify_lock);
+	mutex_lock(&chip->adc->adc_lock);
+	list_for_each_entry(client, &sensor->thr_list, list) {
+		if (client->btm_param != param)
+			continue;
+		list_del(&client->list);
+		devm_kfree(chip->dev, client);
+
+		rc = qpnp_adc_tm_mode_select(chip,
+					ADC_OP_NORMAL_MODE << QPNP_OP_MODE_SHIFT);
+		if (rc)
+			break;
+		rc = qpnp_adc_tm_disable(chip);
+		if (rc)
+			break;
+		rc = qpnp_adc_tm_req_sts_check(chip);
+		if (rc)
+			break;
+
+		rc = qpnp_adc_tm_set_client_thresholds(sensor);
+		restart_rc = qpnp_adc_tm_enable_if_channel_meas(chip);
+		if (!rc)
+			rc = restart_rc;
+		break;
+	}
+	mutex_unlock(&chip->adc->adc_lock);
+	mutex_unlock(&sensor->notify_lock);
+
+	return rc;
+}
+EXPORT_SYMBOL(qpnp_adc_tm_unregister_client);
+
 int32_t qpnp_adc_tm_usbid_configure(struct qpnp_adc_tm_chip *chip,
 				struct qpnp_adc_tm_btm_param *param)
 {
@@ -2118,6 +2139,7 @@ static int qpnp_adc_tm_probe(struct spmi_device *spmi)
 		}
 		INIT_WORK(&chip->sensor[sen_idx].work, notify_adc_tm_fn);
 		INIT_LIST_HEAD(&chip->sensor[sen_idx].thr_list);
+		mutex_init(&chip->sensor[sen_idx].notify_lock);
 		sen_idx++;
 	}
 	chip->max_channels_available = count_adc_channel_list;
