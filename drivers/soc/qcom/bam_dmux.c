@@ -29,6 +29,7 @@
 #include <linux/of.h>
 #include <linux/ipc_logging.h>
 #include <linux/jiffies.h>
+#include <linux/rculist.h>
 #include <linux/srcu.h>
 #include <linux/msm-sps.h>
 #include <linux/sizes.h>
@@ -163,6 +164,7 @@ static atomic_t bam_dmux_a2_pwr_cntl_in_cnt = ATOMIC_INIT(0);
 
 struct bam_ch_info {
 	uint32_t status;
+	u32 generation;
 	void (*notify)(void *, int, unsigned long);
 	void *priv;
 	spinlock_t lock;
@@ -275,6 +277,7 @@ static DEFINE_SPINLOCK(wakelock_reference_lock);
 static int wakelock_reference_count;
 static int a2_pc_disabled_wakelock_skipped;
 static LIST_HEAD(bam_other_notify_funcs);
+static DEFINE_SPINLOCK(bam_other_notify_lock);
 static DEFINE_MUTEX(smsm_cb_lock);
 static DEFINE_MUTEX(delayed_ul_vote_lock);
 static int need_delayed_ul_vote;
@@ -540,38 +543,45 @@ static void process_dynamic_mtu(bool current_state)
 	old_state = current_state;
 }
 
+static bool bam_mux_notify_channel(u32 id, int event, unsigned long data,
+				   u32 generation)
+{
+	struct bam_ch_info *ch = &bam_ch[id];
+	void (*notify)(void *, int, unsigned long) = NULL;
+	void *priv = NULL;
+	unsigned long flags;
+
+	/* The copied callback remains valid until close finishes its grace period. */
+	rcu_read_lock();
+	spin_lock_irqsave(&ch->lock, flags);
+	if (bam_ch_is_open(id) &&
+	    (event != BAM_DMUX_WRITE_DONE || ch->generation == generation)) {
+		if (event == BAM_DMUX_WRITE_DONE && ch->num_tx_pkts)
+			ch->num_tx_pkts--;
+		notify = ch->notify;
+		priv = ch->priv;
+	}
+	spin_unlock_irqrestore(&ch->lock, flags);
+	if (notify)
+		notify(priv, event, data);
+	rcu_read_unlock();
+
+	return !!notify;
+}
+
 static void bam_mux_process_data(struct sk_buff *rx_skb)
 {
-	unsigned long flags;
-	struct bam_mux_hdr *rx_hdr;
-	unsigned long event_data;
-	uint8_t ch_id;
-	void (*notify)(void *, int, unsigned long);
-	void *priv;
-
-	rx_hdr = (struct bam_mux_hdr *)rx_skb->data;
-	ch_id = rx_hdr->ch_id;
+	struct bam_mux_hdr *rx_hdr = (struct bam_mux_hdr *)rx_skb->data;
+	u8 ch_id = rx_hdr->ch_id;
 
 	process_dynamic_mtu(rx_hdr->signal & DYNAMIC_MTU_MASK);
 
 	skb_pull(rx_skb, sizeof(*rx_hdr));
 	skb_trim(rx_skb, rx_hdr->pkt_len);
 
-	event_data = (unsigned long)(rx_skb);
-	notify = NULL;
-	priv = NULL;
-
-	spin_lock_irqsave(&bam_ch[ch_id].lock, flags);
-	if (bam_ch[ch_id].notify) {
-		notify = bam_ch[ch_id].notify;
-		priv = bam_ch[ch_id].priv;
-	}
-	spin_unlock_irqrestore(&bam_ch[ch_id].lock, flags);
-	if (notify)
-		notify(priv, BAM_DMUX_RECEIVE, event_data);
-	else
+	if (!bam_mux_notify_channel(ch_id, BAM_DMUX_RECEIVE,
+				     (unsigned long)rx_skb, 0))
 		dev_kfree_skb_any(rx_skb);
-
 	queue_rx();
 }
 
@@ -854,10 +864,8 @@ static void bam_mux_write_done(struct work_struct *work)
 	struct bam_mux_hdr *hdr;
 	struct tx_pkt_info *info;
 	struct tx_pkt_info *info_expected;
-	unsigned long event_data;
+	u32 generation;
 	unsigned long flags;
-	void (*notify)(void *, int, unsigned long);
-	void *priv;
 
 	if (in_global_reset)
 		return;
@@ -893,6 +901,7 @@ static void bam_mux_write_done(struct work_struct *work)
 		return;
 	}
 	skb = info->skb;
+	generation = info->generation;
 	kfree(info);
 	hdr = (struct bam_mux_hdr *)skb->data;
 	DBG_INC_WRITE_CNT(skb->len);
@@ -901,16 +910,8 @@ static void bam_mux_write_done(struct work_struct *work)
 	if (hdr->pad_len)
 		skb_trim(skb, skb->len - hdr->pad_len);
 
-	event_data = (unsigned long)(skb);
-	spin_lock_irqsave(&bam_ch[hdr->ch_id].lock, flags);
-	if (bam_ch[hdr->ch_id].num_tx_pkts)
-		bam_ch[hdr->ch_id].num_tx_pkts--;
-	notify = bam_ch[hdr->ch_id].notify;
-	priv = bam_ch[hdr->ch_id].priv;
-	spin_unlock_irqrestore(&bam_ch[hdr->ch_id].lock, flags);
-	if (notify)
-		notify(priv, BAM_DMUX_WRITE_DONE, event_data);
-	else
+	if (!bam_mux_notify_channel(hdr->ch_id, BAM_DMUX_WRITE_DONE,
+				     (unsigned long)skb, generation))
 		dev_kfree_skb_any(skb);
 }
 
@@ -925,6 +926,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	dma_addr_t dma_address;
 	struct tx_pkt_info *pkt;
 	int rcu_id;
+	u32 generation;
 
 	if (id >= BAM_DMUX_NUM_CHANNELS)
 		return -EINVAL;
@@ -961,6 +963,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 		srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 		return -EAGAIN;
 	}
+	generation = bam_ch[id].generation;
 	spin_unlock_irqrestore(&bam_ch[id].lock, flags);
 
 	read_lock(&ul_wakeup_lock);
@@ -1023,31 +1026,35 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	pkt->skb = skb;
 	pkt->dma_address = dma_address;
 	pkt->is_cmd = 0;
+	pkt->generation = generation;
 	set_tx_timestamp(pkt);
 	INIT_WORK(&pkt->work, bam_mux_write_done);
 	spin_lock_irqsave(&bam_tx_pool_spinlock, flags);
-	list_add_tail(&pkt->list_node, &bam_tx_pool);
-	rc = bam_ops->sps_transfer_one_ptr(bam_tx_pipe, dma_address, skb->len,
-				pkt, SPS_IOVEC_FLAG_EOT);
-	ul_last_activity = jiffies;
+	spin_lock(&bam_ch[id].lock);
+	if (!bam_ch_is_open(id) || bam_ch[id].generation != generation) {
+		rc = -ENODEV;
+	} else {
+		list_add_tail(&pkt->list_node, &bam_tx_pool);
+		rc = bam_ops->sps_transfer_one_ptr(bam_tx_pipe, dma_address,
+						 skb->len, pkt, SPS_IOVEC_FLAG_EOT);
+		ul_last_activity = jiffies;
+		if (rc) {
+			list_del(&pkt->list_node);
+			DBG_INC_TX_SPS_FAILURE_CNT();
+		} else {
+			bam_ch[id].num_tx_pkts++;
+		}
+	}
+	spin_unlock(&bam_ch[id].lock);
+	spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
 	if (rc) {
-		DMUX_LOG_KERR("%s sps_transfer_one failed rc=%d\n",
-			__func__, rc);
-		list_del(&pkt->list_node);
-		DBG_INC_TX_SPS_FAILURE_CNT();
-		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
-		dma_unmap_single(dma_dev, pkt->dma_address,
-					pkt->skb->len,	bam_ops->dma_to);
+		dma_unmap_single(dma_dev, pkt->dma_address, skb->len,
+				 bam_ops->dma_to);
 		kfree(pkt);
 		goto restore_skb;
-	} else {
-		spin_lock(&bam_ch[id].lock);
-		bam_ch[id].num_tx_pkts++;
-		spin_unlock(&bam_ch[id].lock);
-		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
-		if (new_skb)
-			dev_kfree_skb_any(original_skb);
 	}
+	if (new_skb)
+		dev_kfree_skb_any(original_skb);
 	read_unlock(&ul_wakeup_lock);
 	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 	return rc;
@@ -1136,6 +1143,8 @@ int msm_bam_dmux_open(uint32_t id, void *priv,
 	struct bam_mux_hdr *hdr;
 	unsigned long flags;
 	int rc = 0;
+	u32 generation;
+	bool detached = false;
 
 	DBG("%s: opening ch %d\n", __func__, id);
 	if (!bam_mux_initialized) {
@@ -1170,6 +1179,7 @@ int msm_bam_dmux_open(uint32_t id, void *priv,
 		return -ENODEV;
 	}
 
+	generation = ++bam_ch[id].generation;
 	bam_ch[id].notify = notify;
 	bam_ch[id].priv = priv;
 	bam_ch[id].status |= BAM_CH_LOCAL_OPEN;
@@ -1211,12 +1221,15 @@ open_done:
 
 open_failed:
 	spin_lock_irqsave(&bam_ch[id].lock, flags);
-	if (bam_ch[id].notify == notify && bam_ch[id].priv == priv) {
+	if (bam_ch[id].generation == generation && bam_ch[id].notify) {
+		detached = true;
 		bam_ch[id].status &= ~BAM_CH_LOCAL_OPEN;
 		bam_ch[id].notify = NULL;
 		bam_ch[id].priv = NULL;
 	}
 	spin_unlock_irqrestore(&bam_ch[id].lock, flags);
+	if (detached)
+		synchronize_rcu();
 	return rc;
 }
 
@@ -1224,7 +1237,7 @@ int msm_bam_dmux_close(uint32_t id)
 {
 	struct bam_mux_hdr *hdr;
 	unsigned long flags;
-	bool reset;
+	bool reset, open, detached;
 	int rc;
 
 	if (id >= BAM_DMUX_NUM_CHANNELS)
@@ -1235,11 +1248,15 @@ int msm_bam_dmux_close(uint32_t id)
 
 	spin_lock_irqsave(&bam_ch[id].lock, flags);
 	reset = bam_ch_is_in_reset(id);
+	open = bam_ch_is_local_open(id);
+	detached = bam_ch[id].notify != NULL;
 	bam_ch[id].notify = NULL;
 	bam_ch[id].priv = NULL;
 	bam_ch[id].status &= ~(BAM_CH_LOCAL_OPEN | BAM_CH_IN_RESET);
 	spin_unlock_irqrestore(&bam_ch[id].lock, flags);
-	if (reset)
+	if (detached)
+		synchronize_rcu();
+	if (!open || reset)
 		return 0;
 
 	read_lock(&ul_wakeup_lock);
@@ -1690,33 +1707,18 @@ static void debug_create(const char *name, mode_t mode,
 
 static void notify_all(int event, unsigned long data)
 {
-	int i;
-	unsigned long flags;
-	struct list_head *temp;
 	struct outside_notify_func *func;
-	void (*notify)(void *, int, unsigned long);
-	void *priv;
+	int i;
 
 	BAM_DMUX_LOG("%s: event=%d, data=%lu\n", __func__, event, data);
 
-	for (i = 0; i < BAM_DMUX_NUM_CHANNELS; ++i) {
-		notify = NULL;
-		priv = NULL;
-		spin_lock_irqsave(&bam_ch[i].lock, flags);
-		if (bam_ch_is_open(i)) {
-			notify = bam_ch[i].notify;
-			priv = bam_ch[i].priv;
-		}
-		spin_unlock_irqrestore(&bam_ch[i].lock, flags);
-		if (notify)
-			notify(priv, event, data);
-	}
+	for (i = 0; i < BAM_DMUX_NUM_CHANNELS; i++)
+		bam_mux_notify_channel(i, event, data, 0);
 
-	__list_for_each(temp, &bam_other_notify_funcs) {
-		func = container_of(temp, struct outside_notify_func,
-								list_node);
+	rcu_read_lock();
+	list_for_each_entry_rcu(func, &bam_other_notify_funcs, list_node)
 		func->notify(func->priv, event, data);
-	}
+	rcu_read_unlock();
 }
 
 static void record_ul_activity(void)
@@ -1856,7 +1858,9 @@ int msm_bam_dmux_reg_notify(void *priv,
 
 	func->notify = notify;
 	func->priv = priv;
-	list_add(&func->list_node, &bam_other_notify_funcs);
+	spin_lock(&bam_other_notify_lock);
+	list_add_rcu(&func->list_node, &bam_other_notify_funcs);
+	spin_unlock(&bam_other_notify_lock);
 
 	return 0;
 }

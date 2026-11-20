@@ -169,6 +169,7 @@ struct tx_pkt_info {
 	struct work_struct work;
 	struct list_head list_node;
 	u64 timestamp_ns;
+	u32 generation;
 };
 
 void msm_bam_dmux_set_bam_ops(struct bam_ops_if *ops);
