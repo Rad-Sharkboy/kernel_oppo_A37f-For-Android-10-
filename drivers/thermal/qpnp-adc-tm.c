@@ -1566,7 +1566,7 @@ EXPORT_SYMBOL(qpnp_adc_tm_channel_measure);
 int32_t qpnp_adc_tm_disable_chan_meas(struct qpnp_adc_tm_chip *chip,
 					struct qpnp_adc_tm_btm_param *param)
 {
-	uint32_t channel, dt_index = 0, btm_chan_num;
+	uint32_t channel, dt_index = 0;
 	u8 sensor_mask = 0, mode_ctl = 0;
 	int rc = 0;
 
@@ -1610,7 +1610,6 @@ int32_t qpnp_adc_tm_disable_chan_meas(struct qpnp_adc_tm_chip *chip,
 	}
 
 
-	btm_chan_num = chip->sensor[dt_index].btm_channel_num;
 	sensor_mask = chip->sensor[dt_index].channel_mask;
 
 	rc = qpnp_adc_tm_reg_update(chip, QPNP_ADC_TM_LOW_THR_INT_EN,
@@ -1704,7 +1703,9 @@ EXPORT_SYMBOL(qpnp_adc_tm_usbid_configure);
 
 int32_t qpnp_adc_tm_usbid_end(struct qpnp_adc_tm_chip *chip)
 {
-	struct qpnp_adc_tm_btm_param param;
+	struct qpnp_adc_tm_btm_param param = {
+		.channel = LR_MUX10_PU2_AMUX_USB_ID_LV,
+	};
 
 	return qpnp_adc_tm_disable_chan_meas(chip, &param);
 }
