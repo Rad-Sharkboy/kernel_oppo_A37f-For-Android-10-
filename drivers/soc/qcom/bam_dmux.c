@@ -2728,14 +2728,9 @@ static int bam_dmux_probe(struct platform_device *pdev)
 	}
 
 	dma_dev = &pdev->dev;
-	/* The BAM only suports 32 bits of address */
-	dma_dev->dma_mask = kmalloc(sizeof(*dma_dev->dma_mask), GFP_KERNEL);
-	if (!dma_dev->dma_mask) {
-		DMUX_LOG_KERR("%s: cannot allocate dma_mask\n", __func__);
-		return -ENOMEM;
-	}
-	*dma_dev->dma_mask = DMA_BIT_MASK(32);
+	/* The BAM has a 32-bit address bus. */
 	dma_dev->coherent_dma_mask = DMA_BIT_MASK(32);
+	dma_dev->dma_mask = &dma_dev->coherent_dma_mask;
 
 	xo_clk = clk_get(&pdev->dev, "xo");
 	if (IS_ERR(xo_clk)) {
