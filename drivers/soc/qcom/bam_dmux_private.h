@@ -158,8 +158,7 @@ struct rx_pkt_info {
  * @len: length og the packet
  * @work: work_struct for processing this packet
  * @list_node: list_head for placing this on a list
- * @ts_sec: seconds portion of the timestamp
- * @ts_nsec: nanoseconds portion of the timestamp
+ * @timestamp_ns: timestamp at submission
  *
  */
 struct tx_pkt_info {
@@ -169,8 +168,7 @@ struct tx_pkt_info {
 	uint32_t len;
 	struct work_struct work;
 	struct list_head list_node;
-	unsigned ts_sec;
-	unsigned long ts_nsec;
+	u64 timestamp_ns;
 };
 
 void msm_bam_dmux_set_bam_ops(struct bam_ops_if *ops);

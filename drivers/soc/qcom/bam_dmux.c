@@ -226,7 +226,8 @@ static void queue_rx_work_func(struct work_struct *work);
 static int ssrestart_check(void);
 
 static DECLARE_WORK(rx_timer_work, rx_timer_work_func);
-static DECLARE_WORK(queue_rx_work, queue_rx_work_func);
+#define RX_REFILL_RETRY_MS 20
+static DECLARE_DELAYED_WORK(queue_rx_work, queue_rx_work_func);
 
 static struct workqueue_struct *bam_mux_rx_workqueue;
 static struct workqueue_struct *bam_mux_tx_workqueue;
@@ -362,11 +363,7 @@ do { \
 
 static inline void set_tx_timestamp(struct tx_pkt_info *pkt)
 {
-	unsigned long long t_now;
-
-	t_now = sched_clock();
-	pkt->ts_nsec = do_div(t_now, 1000000000U);
-	pkt->ts_sec = (unsigned)t_now;
+	pkt->timestamp_ns = sched_clock();
 }
 
 static inline void verify_tx_queue_is_empty(const char *func)
@@ -383,11 +380,11 @@ static inline void verify_tx_queue_is_empty(const char *func)
 				pr_err("%s: tx pool not empty\n", func);
 			reported = 1;
 		}
-		BAM_DMUX_LOG("%s: node=%p ts=%u.%09lu\n", __func__,
-			&info->list_node, info->ts_sec, info->ts_nsec);
+		BAM_DMUX_LOG("%s: node=%p t=%lluns\n", __func__,
+			&info->list_node, info->timestamp_ns);
 		if (!in_global_reset)
-			pr_err("%s: node=%p ts=%u.%09lu\n", __func__,
-			&info->list_node, info->ts_sec, info->ts_nsec);
+			pr_err("%s: node=%p t=%lluns\n", __func__,
+			&info->list_node, info->timestamp_ns);
 	}
 	spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
 }
@@ -441,6 +438,23 @@ static void __queue_rx(gfp_t alloc_flags)
 		}
 
 		mutex_lock(&bam_rx_pool_mutexlock);
+		/* Another refiller, a link stop, or an MTU change can win. */
+		if (!bam_connection_is_active || in_global_reset ||
+		    bam_rx_pool_len >= num_buffers ||
+		    info->len != buffer_size) {
+			bool retry = bam_connection_is_active && !in_global_reset &&
+				     bam_rx_pool_len < num_buffers;
+
+			mutex_unlock(&bam_rx_pool_mutexlock);
+			dma_unmap_single(dma_dev, info->dma_address, info->len,
+					 bam_ops->dma_from);
+			dev_kfree_skb_any(info->skb);
+			kfree(info);
+			if (retry)
+				schedule_delayed_work(&queue_rx_work,
+					msecs_to_jiffies(RX_REFILL_RETRY_MS));
+			return;
+		}
 		list_add_tail(&info->list_node, &bam_rx_pool);
 		rx_len_cached = ++bam_rx_pool_len;
 		current_buffer_size = buffer_size;
@@ -471,10 +485,9 @@ fail_info:
 	kfree(info);
 
 fail:
-	if (!in_global_reset) {
-		DMUX_LOG_KERR("%s: rescheduling\n", __func__);
-		schedule_work(&queue_rx_work);
-	}
+	if (bam_connection_is_active && !in_global_reset)
+		schedule_delayed_work(&queue_rx_work,
+				      msecs_to_jiffies(RX_REFILL_RETRY_MS));
 }
 
 static void queue_rx(void)
@@ -541,10 +554,8 @@ static void bam_mux_process_data(struct sk_buff *rx_skb)
 
 	process_dynamic_mtu(rx_hdr->signal & DYNAMIC_MTU_MASK);
 
-	rx_skb->data = (unsigned char *)(rx_hdr + 1);
-	skb_set_tail_pointer(rx_skb, rx_hdr->pkt_len);
-	rx_skb->len = rx_hdr->pkt_len;
-	rx_skb->truesize = rx_hdr->pkt_len + sizeof(struct sk_buff);
+	skb_pull(rx_skb, sizeof(*rx_hdr));
+	skb_trim(rx_skb, rx_hdr->pkt_len);
 
 	event_data = (unsigned long)(rx_skb);
 	notify = NULL;
@@ -644,22 +655,29 @@ static inline void handle_bam_mux_cmd_open(struct bam_mux_hdr *rx_hdr)
 	}
 	spin_lock_irqsave(&bam_ch[rx_hdr->ch_id].lock, flags);
 	if (bam_ch_is_remote_open(rx_hdr->ch_id)) {
-		/*
-		 * Receiving an open command for a channel that is already open
-		 * is an invalid operation and likely signifies a significant
-		 * issue within the A2 which should be caught immediately
-		 * before it snowballs and the root cause is lost.
-		 */
-		panic("A2 sent invalid duplicate open for channel %d\n",
-								rx_hdr->ch_id);
+		spin_unlock_irqrestore(&bam_ch[rx_hdr->ch_id].lock, flags);
+		pr_warn_ratelimited("BAM: duplicate OPEN on channel %u\n",
+				    rx_hdr->ch_id);
+		goto unlock;
 	}
 	bam_ch[rx_hdr->ch_id].status |= BAM_CH_REMOTE_OPEN;
 	bam_ch[rx_hdr->ch_id].num_tx_pkts = 0;
 	spin_unlock_irqrestore(&bam_ch[rx_hdr->ch_id].lock, flags);
-	ret = platform_device_add(bam_ch[rx_hdr->ch_id].pdev);
-	if (ret)
-		pr_err("%s: platform_device_add() error: %d\n",
-				__func__, ret);
+	if (!bam_ch[rx_hdr->ch_id].pdev)
+		bam_ch[rx_hdr->ch_id].pdev =
+			platform_device_alloc(bam_ch[rx_hdr->ch_id].name, 2);
+	ret = bam_ch[rx_hdr->ch_id].pdev ?
+		platform_device_add(bam_ch[rx_hdr->ch_id].pdev) : -ENOMEM;
+	if (ret) {
+		pr_err("%s: platform device registration failed: %d\n",
+		       __func__, ret);
+		platform_device_put(bam_ch[rx_hdr->ch_id].pdev);
+		bam_ch[rx_hdr->ch_id].pdev = NULL;
+		spin_lock_irqsave(&bam_ch[rx_hdr->ch_id].lock, flags);
+		bam_ch[rx_hdr->ch_id].status &= ~BAM_CH_REMOTE_OPEN;
+		spin_unlock_irqrestore(&bam_ch[rx_hdr->ch_id].lock, flags);
+	}
+unlock:
 	mutex_unlock(&bam_pdev_mutexlock);
 	queue_rx();
 }
@@ -679,6 +697,8 @@ static void handle_bam_mux_cmd(struct work_struct *work)
 	sps_size = info->sps_size;
 	kfree(info);
 
+	if (rx_skb->len < sizeof(*rx_hdr) || sps_size < sizeof(*rx_hdr))
+		goto drop;
 	rx_hdr = (struct bam_mux_hdr *)rx_skb->data;
 
 	DBG_INC_READ_CNT(sizeof(struct bam_mux_hdr));
@@ -710,6 +730,9 @@ static void handle_bam_mux_cmd(struct work_struct *work)
 	case BAM_MUX_HDR_CMD_DATA:
 		if (rx_hdr->pkt_len == 0xffff)
 			rx_hdr->pkt_len = sps_size;
+		/* The legacy extended length still has to fit the receive slot. */
+		if (rx_hdr->pkt_len > rx_skb->len - sizeof(*rx_hdr))
+			goto drop;
 		DBG_INC_READ_CNT(rx_hdr->pkt_len);
 		bam_mux_process_data(rx_skb);
 		break;
@@ -740,9 +763,14 @@ static void handle_bam_mux_cmd(struct work_struct *work)
 			BAM_DMUX_LOG("%s: close cid %d aborted due to ssr\n",
 					__func__, rx_hdr->ch_id);
 			mutex_unlock(&bam_pdev_mutexlock);
-			break;
+			goto drop;
 		}
 		spin_lock_irqsave(&bam_ch[rx_hdr->ch_id].lock, flags);
+		if (!bam_ch_is_remote_open(rx_hdr->ch_id)) {
+			spin_unlock_irqrestore(&bam_ch[rx_hdr->ch_id].lock, flags);
+			mutex_unlock(&bam_pdev_mutexlock);
+			goto drop;
+		}
 		bam_ch[rx_hdr->ch_id].status &= ~BAM_CH_REMOTE_OPEN;
 		spin_unlock_irqrestore(&bam_ch[rx_hdr->ch_id].lock, flags);
 		platform_device_unregister(bam_ch[rx_hdr->ch_id].pdev);
@@ -760,10 +788,13 @@ static void handle_bam_mux_cmd(struct work_struct *work)
 			__func__, rx_hdr->magic_num, rx_hdr->signal,
 			rx_hdr->cmd, rx_hdr->pad_len, rx_hdr->ch_id,
 			rx_hdr->pkt_len);
-		dev_kfree_skb_any(rx_skb);
-		queue_rx();
-		return;
+		goto drop;
 	}
+	return;
+
+drop:
+	dev_kfree_skb_any(rx_skb);
+	queue_rx();
 }
 
 static int bam_mux_write_cmd(void *data, uint32_t len)
@@ -825,6 +856,8 @@ static void bam_mux_write_done(struct work_struct *work)
 	struct tx_pkt_info *info_expected;
 	unsigned long event_data;
 	unsigned long flags;
+	void (*notify)(void *, int, unsigned long);
+	void *priv;
 
 	if (in_global_reset)
 		return;
@@ -838,15 +871,14 @@ static void bam_mux_write_done(struct work_struct *work)
 		struct tx_pkt_info *errant_pkt;
 
 		DMUX_LOG_KERR("%s: bam_tx_pool mismatch .next=%p,"
-				" list_node=%p, ts=%u.%09lu\n",
+				" list_node=%p, t=%lluns\n",
 				__func__, bam_tx_pool.next, &info->list_node,
-				info->ts_sec, info->ts_nsec
+				info->timestamp_ns
 				);
 
 		list_for_each_entry(errant_pkt, &bam_tx_pool, list_node) {
-			DMUX_LOG_KERR("%s: node=%p ts=%u.%09lu\n", __func__,
-			&errant_pkt->list_node, errant_pkt->ts_sec,
-			errant_pkt->ts_nsec);
+			DMUX_LOG_KERR("%s: node=%p t=%lluns\n", __func__,
+			&errant_pkt->list_node, errant_pkt->timestamp_ns);
 
 		}
 		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
@@ -871,12 +903,13 @@ static void bam_mux_write_done(struct work_struct *work)
 
 	event_data = (unsigned long)(skb);
 	spin_lock_irqsave(&bam_ch[hdr->ch_id].lock, flags);
-	bam_ch[hdr->ch_id].num_tx_pkts--;
+	if (bam_ch[hdr->ch_id].num_tx_pkts)
+		bam_ch[hdr->ch_id].num_tx_pkts--;
+	notify = bam_ch[hdr->ch_id].notify;
+	priv = bam_ch[hdr->ch_id].priv;
 	spin_unlock_irqrestore(&bam_ch[hdr->ch_id].lock, flags);
-	if (bam_ch[hdr->ch_id].notify)
-		bam_ch[hdr->ch_id].notify(
-			bam_ch[hdr->ch_id].priv, BAM_DMUX_WRITE_DONE,
-							event_data);
+	if (notify)
+		notify(priv, BAM_DMUX_WRITE_DONE, event_data);
 	else
 		dev_kfree_skb_any(skb);
 }
@@ -895,8 +928,12 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 
 	if (id >= BAM_DMUX_NUM_CHANNELS)
 		return -EINVAL;
-	if (!skb)
+	if (!skb || skb_headroom(skb) < sizeof(*hdr))
 		return -EINVAL;
+	if (skb->len >= U16_MAX)
+		return -EMSGSIZE;
+	if (skb_is_nonlinear(skb) && skb_linearize(skb))
+		return -ENOMEM;
 	original_len = skb->len;
 	if (!bam_mux_initialized)
 		return -ENODEV;
@@ -1187,6 +1224,7 @@ int msm_bam_dmux_close(uint32_t id)
 {
 	struct bam_mux_hdr *hdr;
 	unsigned long flags;
+	bool reset;
 	int rc;
 
 	if (id >= BAM_DMUX_NUM_CHANNELS)
@@ -1195,26 +1233,26 @@ int msm_bam_dmux_close(uint32_t id)
 	if (!bam_mux_initialized)
 		return -ENODEV;
 
-	read_lock(&ul_wakeup_lock);
-	if (!bam_is_connected && !bam_ch_is_in_reset(id)) {
-		read_unlock(&ul_wakeup_lock);
-		ul_wakeup();
-		if (unlikely(in_global_reset == 1))
-			return -EFAULT;
-		read_lock(&ul_wakeup_lock);
-		notify_all(BAM_DMUX_UL_CONNECTED, (unsigned long)(NULL));
-	}
-
 	spin_lock_irqsave(&bam_ch[id].lock, flags);
+	reset = bam_ch_is_in_reset(id);
 	bam_ch[id].notify = NULL;
 	bam_ch[id].priv = NULL;
-	bam_ch[id].status &= ~BAM_CH_LOCAL_OPEN;
+	bam_ch[id].status &= ~(BAM_CH_LOCAL_OPEN | BAM_CH_IN_RESET);
 	spin_unlock_irqrestore(&bam_ch[id].lock, flags);
-
-	if (bam_ch_is_in_reset(id)) {
-		read_unlock(&ul_wakeup_lock);
-		bam_ch[id].status &= ~BAM_CH_IN_RESET;
+	if (reset)
 		return 0;
+
+	read_lock(&ul_wakeup_lock);
+	if (!bam_is_connected) {
+		read_unlock(&ul_wakeup_lock);
+		ul_wakeup();
+		read_lock(&ul_wakeup_lock);
+		if (unlikely(in_global_reset || !bam_is_connected)) {
+			rc = in_global_reset ? -EFAULT : -EBUSY;
+			read_unlock(&ul_wakeup_lock);
+			return rc;
+		}
+		notify_all(BAM_DMUX_UL_CONNECTED, (unsigned long)(NULL));
 	}
 
 	hdr = kmalloc(sizeof(struct bam_mux_hdr), GFP_ATOMIC);
@@ -1281,6 +1319,25 @@ int msm_bam_dmux_is_ch_low(uint32_t id)
 	return ret;
 }
 
+/* The completion queue can lag a reconnect or mode transition. */
+static struct rx_pkt_info *bam_rx_take_completion(dma_addr_t addr)
+{
+	struct rx_pkt_info *info;
+
+	mutex_lock(&bam_rx_pool_mutexlock);
+	list_for_each_entry(info, &bam_rx_pool, list_node) {
+		if (info->dma_address == addr) {
+			list_del(&info->list_node);
+			--bam_rx_pool_len;
+			mutex_unlock(&bam_rx_pool_mutexlock);
+			return info;
+		}
+	}
+	mutex_unlock(&bam_rx_pool_mutexlock);
+	pr_warn_ratelimited("BAM: untracked RX completion %pad\n", &addr);
+	return NULL;
+}
+
 static void rx_switch_to_interrupt_mode(void)
 {
 	struct sps_connect cur_rx_conn;
@@ -1327,31 +1384,9 @@ static void rx_switch_to_interrupt_mode(void)
 		if (iov.addr == 0)
 			break;
 
-		mutex_lock(&bam_rx_pool_mutexlock);
-		if (unlikely(list_empty(&bam_rx_pool))) {
-			DMUX_LOG_KERR("%s: have iovec %p but rx pool empty\n",
-				__func__, (void *)(uintptr_t)iov.addr);
-			mutex_unlock(&bam_rx_pool_mutexlock);
+		info = bam_rx_take_completion(iov.addr);
+		if (!info)
 			continue;
-		}
-		info = list_first_entry(&bam_rx_pool, struct rx_pkt_info,
-							list_node);
-		if (info->dma_address != iov.addr) {
-			DMUX_LOG_KERR("%s: iovec %p != dma %p\n",
-				__func__,
-				(void *)(uintptr_t)iov.addr,
-				(void *)(uintptr_t)info->dma_address);
-			list_for_each_entry(info, &bam_rx_pool, list_node) {
-				DMUX_LOG_KERR("%s: dma %p\n", __func__,
-					(void *)(uintptr_t)info->dma_address);
-				if (iov.addr == info->dma_address)
-					break;
-			}
-		}
-		BUG_ON(info->dma_address != iov.addr);
-		list_del(&info->list_node);
-		--bam_rx_pool_len;
-		mutex_unlock(&bam_rx_pool_mutexlock);
 		info->sps_size = iov.size;
 		handle_bam_mux_cmd(&info->work);
 	}
@@ -1396,7 +1431,8 @@ static void rx_timer_work_func(struct work_struct *work)
 	int ret;
 	u32 buffs_unused, buffs_used;
 
-	BAM_DMUX_LOG("%s: polling start\n", __func__);
+	if (msm_bam_dmux_debug_enable)
+		BAM_DMUX_LOG("%s: polling start\n", __func__);
 	while (bam_connection_is_active) { /* timer loop */
 		++inactive_cycles;
 		while (bam_connection_is_active) { /* deplete queue loop */
@@ -1415,42 +1451,19 @@ static void rx_timer_work_func(struct work_struct *work)
 			}
 			if (iov.addr == 0)
 				break;
-			store_rx_timestamp();
-			inactive_cycles = 0;
-			mutex_lock(&bam_rx_pool_mutexlock);
-			if (unlikely(list_empty(&bam_rx_pool))) {
-				DMUX_LOG_KERR(
-					"%s: have iovec %p but rx pool empty\n",
-					__func__, (void *)(uintptr_t)iov.addr);
-				mutex_unlock(&bam_rx_pool_mutexlock);
+			info = bam_rx_take_completion(iov.addr);
+			if (!info)
 				continue;
-			}
-			info = list_first_entry(&bam_rx_pool,
-					struct rx_pkt_info,	list_node);
-			if (info->dma_address != iov.addr) {
-				DMUX_LOG_KERR("%s: iovec %p != dma %p\n",
-					__func__,
-					(void *)(uintptr_t)iov.addr,
-					(void *)(uintptr_t)info->dma_address);
-				list_for_each_entry(info, &bam_rx_pool,
-						list_node) {
-					DMUX_LOG_KERR("%s: dma %p\n", __func__,
-						(void *)(uintptr_t)
-							info->dma_address);
-					if (iov.addr == info->dma_address)
-						break;
-				}
-			}
-			BUG_ON(info->dma_address != iov.addr);
-			list_del(&info->list_node);
-			--bam_rx_pool_len;
-			mutex_unlock(&bam_rx_pool_mutexlock);
+			inactive_cycles = 0;
 			info->sps_size = iov.size;
 			handle_bam_mux_cmd(&info->work);
 		}
 
+		if (!inactive_cycles)
+			store_rx_timestamp();
 		if (inactive_cycles >= POLLING_INACTIVITY) {
-			BAM_DMUX_LOG("%s: polling exit, no data\n", __func__);
+			if (msm_bam_dmux_debug_enable)
+				BAM_DMUX_LOG("%s: polling exit, no data\n", __func__);
 			rx_switch_to_interrupt_mode();
 			break;
 		}
@@ -1465,10 +1478,12 @@ static void rx_timer_work_func(struct work_struct *work)
 				DMUX_LOG_KERR(
 					"%s: error getting num buffers unused after sleep\n",
 					__func__);
-
+				if (bam_connection_is_active && !in_global_reset)
+					rx_switch_to_interrupt_mode();
 				break;
 			}
 
+			buffs_unused = min_t(u32, buffs_unused, num_buffers);
 			buffs_used = num_buffers - buffs_unused;
 
 			if (buffs_unused == 0) {
@@ -1536,7 +1551,7 @@ static void bam_mux_rx_notify(struct sps_event_notify *notify)
 	switch (notify->event_id) {
 	case SPS_EVENT_EOT:
 		/* attempt to disable interrupts in this pipe */
-		if (!polling_mode) {
+		if (bam_connection_is_active && !polling_mode) {
 			ret = bam_ops->sps_get_config_ptr(bam_rx_pipe,
 					&cur_rx_conn);
 			if (ret) {
@@ -1818,7 +1833,7 @@ int msm_bam_dmux_ul_power_unvote(void)
 	int vote;
 
 	read_lock(&ul_wakeup_lock);
-	vote = atomic_dec_return(&ul_ondemand_vote);
+	vote = atomic_dec_if_positive(&ul_ondemand_vote);
 	if (unlikely(vote) < 0)
 		DMUX_LOG_KERR("%s: invalid power vote %d\n", __func__, vote);
 	read_unlock(&ul_wakeup_lock);
@@ -1854,7 +1869,8 @@ static void ul_timeout(struct work_struct *work)
 	if (in_global_reset)
 		return;
 	if (!write_trylock_irqsave(&ul_wakeup_lock, flags)) {
-		schedule_delayed_work(&ul_timeout_work, retry);
+		schedule_delayed_work(&ul_timeout_work,
+				      min(retry, msecs_to_jiffies(20)));
 		return;
 	}
 	if (bam_is_connected) {
@@ -1868,8 +1884,8 @@ static void ul_timeout(struct work_struct *work)
 
 			info = list_first_entry(&bam_tx_pool,
 						struct tx_pkt_info, list_node);
-			DMUX_LOG_KERR("%s: UL delayed ts=%u.%09lu\n",
-				      __func__, info->ts_sec, info->ts_nsec);
+			DMUX_LOG_KERR("%s: UL delayed t=%lluns\n",
+				      __func__, info->timestamp_ns);
 			DBG_INC_TX_STALL_CNT();
 			delay = retry;
 		}
@@ -2087,7 +2103,10 @@ static void disconnect_to_bam(void)
 		}
 	}
 
+	mutex_lock(&bam_rx_pool_mutexlock);
 	bam_connection_is_active = 0;
+	mutex_unlock(&bam_rx_pool_mutexlock);
+	cancel_delayed_work_sync(&queue_rx_work);
 
 	/* handle disconnect during active UL */
 	write_lock_irqsave(&ul_wakeup_lock, flags);
