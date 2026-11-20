@@ -1594,12 +1594,20 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			return PTR_ERR(handle);
 		shared = ion_share_dma_buf(client, handle);
 		ion_handle_put(handle);
-		if (IS_ERR(shared))
-			return PTR_ERR(shared);
-		fd = get_unused_fd_flags(O_CLOEXEC);
-		if (fd < 0) {
-			dma_buf_put(shared);
-			return fd;
+		if (IS_ERR(shared)) {
+			ret = PTR_ERR(shared);
+			shared = NULL;
+		} else {
+			fd = get_unused_fd_flags(O_CLOEXEC);
+			if (fd < 0) {
+				dma_buf_put(shared);
+				shared = NULL;
+				ret = fd;
+			}
+		}
+		if (ret) {
+			data.fd.fd = ret;
+			break;
 		}
 		data.fd.fd = fd;
 		break;
