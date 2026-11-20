@@ -2667,7 +2667,7 @@ static int bam_dmux_probe(struct platform_device *pdev)
 	int rc, channels = 0;
 	struct resource *r;
 	void *subsys_h;
-	uint32_t requested_dl_mtu;
+	uint32_t requested_dl_mtu, modem_state;
 
 	DBG("%s probe called\n", __func__);
 	if (bam_mux_initialized)
@@ -2806,23 +2806,28 @@ static int bam_dmux_probe(struct platform_device *pdev)
 	rc = bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
 			SMSM_A2_POWER_CONTROL_ACK,
 			bam_dmux_smsm_ack_cb, NULL);
-	if (rc) {
-		pr_err("%s: smsm ACK registration failed: %d\n", __func__, rc);
+	if (rc < 0) {
+		if (rc == -ENODEV)
+			rc = -EPROBE_DEFER;
+		else
+			pr_err("%s: smsm ACK registration failed: %d\n", __func__, rc);
 		goto unregister_restart;
 	}
 
 	rc = bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
 			SMSM_A2_POWER_CONTROL,
 			bam_dmux_smsm_cb, NULL);
-	if (rc) {
-		pr_err("%s: smsm power registration failed: %d\n", __func__, rc);
+	if (rc < 0) {
+		if (rc == -ENODEV)
+			rc = -EPROBE_DEFER;
+		else
+			pr_err("%s: smsm power registration failed: %d\n", __func__, rc);
 		goto unregister_ack;
 	}
 
-	if (bam_ops->smsm_get_state_ptr(SMSM_MODEM_STATE) &
-			SMSM_A2_POWER_CONTROL)
-		bam_dmux_smsm_cb(NULL, 0,
-			bam_ops->smsm_get_state_ptr(SMSM_MODEM_STATE));
+	modem_state = bam_ops->smsm_get_state_ptr(SMSM_MODEM_STATE);
+	if (modem_state & SMSM_A2_POWER_CONTROL)
+		bam_dmux_smsm_cb(NULL, 0, modem_state);
 
 	return 0;
 
