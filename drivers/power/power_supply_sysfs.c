@@ -142,6 +142,8 @@ static ssize_t power_supply_store_property(struct device *dev,
 	if (ret < 0)
 		return ret;
 
+	if (long_val < INT_MIN || long_val > INT_MAX)
+		return -ERANGE;
 	value.intval = long_val;
 
 	ret = psy->set_property(psy, off, &value);
