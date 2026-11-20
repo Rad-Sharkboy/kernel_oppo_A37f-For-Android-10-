@@ -208,6 +208,7 @@ struct qpnp_bms_chip {
 	bool				last_soc_invalid;
 	bool				warm_reset;
 	bool				bms_psy_registered;
+	bool				stopping;
 	bool				battery_full;
 	bool				bms_dev_open;
 	bool				data_ready;
@@ -272,6 +273,7 @@ struct qpnp_bms_chip {
 	struct delayed_work		voltage_soc_timeout_work;
 	struct mutex			bms_data_mutex;
 	struct mutex			bms_device_mutex;
+	struct mutex			power_event_mutex;
 	struct mutex			last_soc_mutex;
 	struct mutex			state_change_mutex;
 	struct class			*bms_class;
@@ -299,6 +301,7 @@ struct qpnp_bms_chip {
 };
 
 static struct qpnp_bms_chip *the_chip;
+static DEFINE_MUTEX(the_chip_lock);
 
 static struct temp_curr_comp_map temp_curr_comp_lut[] = {
 			{-300, 15},
@@ -457,16 +460,21 @@ static int backup_ocv_soc(struct qpnp_bms_chip *chip, int ocv_uv, int soc)
 #ifdef CONFIG_MACH_OPPO
 int opchg_backup_ocv_soc(int soc)
 {
-	struct qpnp_bms_chip *chip = ACCESS_ONCE(the_chip);
+	struct qpnp_bms_chip *chip;
 	int rc, ocv_uv;
 
-	if (!chip)
+	mutex_lock(&the_chip_lock);
+	chip = the_chip;
+	if (!chip) {
+		mutex_unlock(&the_chip_lock);
 		return -ENODEV;
+	}
 
 	mutex_lock(&chip->last_soc_mutex);
 	ocv_uv = ACCESS_ONCE(chip->last_ocv_uv);
 	rc = backup_ocv_soc(chip, ocv_uv, soc);
 	mutex_unlock(&chip->last_soc_mutex);
+	mutex_unlock(&the_chip_lock);
 	if (rc)
 		pr_warn_ratelimited("BMS backup failed: %d\n", rc);
 
@@ -2109,6 +2117,9 @@ static void monitor_soc_work(struct work_struct *work)
 				monitor_soc_work.work);
 	int rc, new_soc = 0, batt_temp, vbat_uv;
 
+	if (ACCESS_ONCE(chip->stopping))
+		return;
+
 	bms_stay_awake(&chip->vbms_soc_wake_source);
 
 	calculate_delta_time(&chip->tm_sec, &chip->delta_time_s);
@@ -2368,6 +2379,9 @@ static int qpnp_vm_bms_power_set_property(struct power_supply *psy,
 	struct qpnp_bms_chip *chip = container_of(psy,
 				struct qpnp_bms_chip, bms_psy);
 
+	if (ACCESS_ONCE(chip->stopping))
+		return -ESHUTDOWN;
+
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		chip->current_now = val->intval;
@@ -2537,8 +2551,13 @@ static void qpnp_vm_bms_ext_power_changed(struct power_supply *psy)
 {
 	struct qpnp_bms_chip *chip = container_of(psy, struct qpnp_bms_chip,
 								bms_psy);
-	int old_status = chip->battery_status;
-	int old_present = chip->battery_present;
+	int old_status, old_present;
+
+	mutex_lock(&chip->power_event_mutex);
+	if (chip->stopping)
+		goto out;
+	old_status = chip->battery_status;
+	old_present = chip->battery_present;
 
 	pr_debug("Triggered!\n");
 	battery_status_check(chip);
@@ -2557,6 +2576,8 @@ static void qpnp_vm_bms_ext_power_changed(struct power_supply *psy)
 
 	if (chip->reported_soc_in_use)
 		reported_soc_check_status(chip);
+out:
+	mutex_unlock(&chip->power_event_mutex);
 }
 
 
@@ -3934,6 +3955,22 @@ static void unregister_bms_char_device(struct qpnp_bms_chip *chip)
 	unregister_chrdev_region(chip->dev_no, 1);
 }
 
+static void bms_stop_monitoring(struct qpnp_bms_chip *chip)
+{
+	mutex_lock(&chip->power_event_mutex);
+	ACCESS_ONCE(chip->stopping) = true;
+	mutex_unlock(&chip->power_event_mutex);
+	cancel_delayed_work_sync(&chip->voltage_soc_timeout_work);
+	bms_free_irqs(chip);
+	cancel_delayed_work_sync(&chip->monitor_soc_work);
+	reset_vbat_monitoring(chip);
+	if (chip->bms_psy_registered) {
+		chip->bms_psy_registered = false;
+		power_supply_unregister(&chip->bms_psy);
+	}
+	cancel_delayed_work_sync(&chip->monitor_soc_work);
+}
+
 static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 {
 	struct qpnp_bms_chip *chip;
@@ -4010,6 +4047,7 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 	device_init_wakeup(&spmi->dev, 1);
 	mutex_init(&chip->bms_data_mutex);
 	mutex_init(&chip->bms_device_mutex);
+	mutex_init(&chip->power_event_mutex);
 	mutex_init(&chip->last_soc_mutex);
 	mutex_init(&chip->state_change_mutex);
 	init_waitqueue_head(&chip->bms_wait_q);
@@ -4074,7 +4112,6 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 		goto fail_bms_device;
 	}
 
-	the_chip = chip;
 	calculate_initial_soc(chip);
 	if (chip->dt.cfg_battery_aging_comp) {
 		rc = calculate_initial_aging_comp(chip);
@@ -4135,6 +4172,10 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 			pr_err("Couldn't create bms_status debug file\n");
 	}
 
+	mutex_lock(&the_chip_lock);
+	the_chip = chip;
+	mutex_unlock(&the_chip_lock);
+
 	schedule_delayed_work(&chip->monitor_soc_work, 0);
 
 	/*
@@ -4152,17 +4193,15 @@ static int qpnp_vm_bms_probe(struct spmi_device *spmi)
 	return rc;
 
 fail_get_vtg:
-	bms_free_irqs(chip);
-	chip->bms_psy_registered = false;
-	power_supply_unregister(&chip->bms_psy);
 fail_psy:
+	bms_stop_monitoring(chip);
 	unregister_bms_char_device(chip);
+	goto fail_wake;
 fail_bms_device:
-	chip->bms_psy_registered = false;
 fail_irq:
-	bms_free_irqs(chip);
 fail_setup:
-	reset_vbat_monitoring(chip);
+	bms_stop_monitoring(chip);
+fail_wake:
 	wakeup_source_trash(&chip->vbms_lv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_cv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_soc_wake_source.source);
@@ -4173,7 +4212,7 @@ fail_init:
 	mutex_destroy(&chip->last_soc_mutex);
 	mutex_destroy(&chip->state_change_mutex);
 	mutex_destroy(&chip->bms_device_mutex);
-	the_chip = NULL;
+	mutex_destroy(&chip->power_event_mutex);
 
 	return rc;
 }
@@ -4182,15 +4221,13 @@ static int qpnp_vm_bms_remove(struct spmi_device *spmi)
 {
 	struct qpnp_bms_chip *chip = dev_get_drvdata(&spmi->dev);
 
-	/* Stop the fallback producer before draining its monitor work. */
-	cancel_delayed_work_sync(&chip->voltage_soc_timeout_work);
-	cancel_delayed_work_sync(&chip->monitor_soc_work);
-	bms_free_irqs(chip);
+	mutex_lock(&the_chip_lock);
+	if (the_chip == chip)
+		the_chip = NULL;
+	mutex_unlock(&the_chip_lock);
 	debugfs_remove_recursive(chip->debug_root);
-	chip->bms_psy_registered = false;
-	power_supply_unregister(&chip->bms_psy);
+	bms_stop_monitoring(chip);
 	unregister_bms_char_device(chip);
-	reset_vbat_monitoring(chip);
 	wakeup_source_trash(&chip->vbms_lv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_cv_wake_source.source);
 	wakeup_source_trash(&chip->vbms_soc_wake_source.source);
@@ -4198,9 +4235,9 @@ static int qpnp_vm_bms_remove(struct spmi_device *spmi)
 	mutex_destroy(&chip->last_soc_mutex);
 	mutex_destroy(&chip->state_change_mutex);
 	mutex_destroy(&chip->bms_device_mutex);
+	mutex_destroy(&chip->power_event_mutex);
 	device_init_wakeup(&spmi->dev, 0);
 	dev_set_drvdata(&spmi->dev, NULL);
-	the_chip = NULL;
 
 	return 0;
 }
