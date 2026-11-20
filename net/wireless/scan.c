@@ -481,12 +481,14 @@ static int cmp_bss(struct cfg80211_bss *a,
 	if (!b_ies)
 		return 1;
 
-	if (WLAN_CAPABILITY_IS_STA_BSS(a->capability))
+	if (WLAN_CAPABILITY_IS_STA_BSS(a->capability) &&
+	    WLAN_CAPABILITY_IS_STA_BSS(b->capability)) {
 		ie1 = cfg80211_find_ie(WLAN_EID_MESH_ID,
 				       a_ies->data, a_ies->len);
-	if (WLAN_CAPABILITY_IS_STA_BSS(b->capability))
-		ie2 = cfg80211_find_ie(WLAN_EID_MESH_ID,
-				       b_ies->data, b_ies->len);
+		if (ie1)
+			ie2 = cfg80211_find_ie(WLAN_EID_MESH_ID,
+					       b_ies->data, b_ies->len);
+	}
 	if (ie1 && ie2) {
 		int mesh_id_cmp;
 
