@@ -314,29 +314,12 @@ void power_supply_init_attrs(struct device_type *dev_type)
 		__power_supply_attrs[i] = &power_supply_attrs[i].attr;
 }
 
-static char *kstruprdup(const char *str, gfp_t gfp)
-{
-	char *ret, *ustr;
-
-	ustr = ret = kmalloc(strlen(str) + 1, gfp);
-
-	if (!ret)
-		return NULL;
-
-	while (*str)
-		*ustr++ = toupper(*str++);
-
-	*ustr = 0;
-
-	return ret;
-}
-
 int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
 {
 	struct power_supply *psy = dev_get_drvdata(dev);
 	int ret = 0, j;
 	char *prop_buf;
-	char *attrname;
+	char attrname[64];
 
 	dev_dbg(dev, "uevent\n");
 
@@ -351,13 +334,14 @@ int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
 	if (ret)
 		return ret;
 
-	prop_buf = (char *)get_zeroed_page(GFP_KERNEL);
+	prop_buf = (char *)__get_free_page(GFP_KERNEL);
 	if (!prop_buf)
 		return -ENOMEM;
 
 	for (j = 0; j < psy->num_properties; j++) {
 		struct device_attribute *attr;
 		char *line;
+		int i;
 
 		attr = &power_supply_attrs[psy->properties[j]];
 
@@ -376,16 +360,17 @@ int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
 		if (line)
 			*line = 0;
 
-		attrname = kstruprdup(attr->attr.name, GFP_KERNEL);
-		if (!attrname) {
-			ret = -ENOMEM;
+		if (strlcpy(attrname, attr->attr.name, sizeof(attrname)) >=
+		    sizeof(attrname)) {
+			ret = -ENAMETOOLONG;
 			goto out;
 		}
+		for (i = 0; attrname[i]; i++)
+			attrname[i] = toupper(attrname[i]);
 
 		dev_dbg(dev, "prop %s=%s\n", attrname, prop_buf);
 
 		ret = add_uevent_var(env, "POWER_SUPPLY_%s=%s", attrname, prop_buf);
-		kfree(attrname);
 		if (ret)
 			goto out;
 	}
