@@ -411,15 +411,25 @@ static void cinnamon_merged_requests(struct request_queue *q, struct request *rq
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 	int prio = get_req_prio(next);
+	u64 next_time = get_req_time(next);
 
 	if (list_empty(&next->queuelist))
 		return;
-	if (!list_empty(&rq->queuelist) && get_req_time(next) < get_req_time(rq)) {
-		int rq_prio = get_req_prio(rq);
 
-		if (rq_prio == prio)
+	if (!list_empty(&rq->queuelist)) {
+		int rq_prio = get_req_prio(rq);
+		u64 rq_time = get_req_time(rq);
+
+		if (prio < rq_prio && prio >= 0 && rq_prio < PRIO_COUNT &&
+		    cd->queue_counts[rq_prio]) {
 			list_move_tail(&rq->queuelist, &next->queuelist);
-		set_req_time_and_prio(rq, get_req_time(next), rq_prio);
+			cd->queue_counts[rq_prio]--;
+			cd->queue_counts[prio]++;
+			rq_prio = prio;
+		} else if (prio == rq_prio && next_time < rq_time) {
+			list_move_tail(&rq->queuelist, &next->queuelist);
+		}
+		set_req_time_and_prio(rq, min(rq_time, next_time), rq_prio);
 	}
 	if (prio >= 0 && prio < PRIO_COUNT && cd->queue_counts[prio] > 0) {
 		cd->queue_counts[prio]--;
