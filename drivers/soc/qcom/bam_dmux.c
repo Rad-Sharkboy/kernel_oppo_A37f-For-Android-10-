@@ -2643,6 +2643,25 @@ static void set_dl_mtu(int requested_mtu)
 	dl_mtu = SZ_2K;
 }
 
+/* clk_get_sys() also returns -EPROBE_DEFER for absent legacy aliases. */
+static struct clk *bam_get_optional_clk(struct device *dev, const char *name)
+{
+	struct device_node *np = dev->of_node;
+	struct clk *clk = devm_clk_get(dev, name);
+
+	if (!IS_ERR(clk) || PTR_ERR(clk) != -EPROBE_DEFER)
+		return clk;
+
+	while (np) {
+		if (of_property_match_string(np, "clock-names", name) >= 0)
+			return clk;
+		np = np->parent;
+		if (!np || !of_find_property(np, "clock-ranges", NULL))
+			break;
+	}
+	return NULL;
+}
+
 static int bam_dmux_probe(struct platform_device *pdev)
 {
 	int rc, channels = 0;
@@ -2663,9 +2682,9 @@ static int bam_dmux_probe(struct platform_device *pdev)
 		a2_phys_base = r->start;
 		a2_phys_size = (uint32_t)(resource_size(r));
 		a2_bam_irq = platform_get_irq(pdev, 0);
-		if (a2_bam_irq == -ENXIO) {
+		if (a2_bam_irq < 0) {
 			pr_err("%s: irq field missing\n", __func__);
-			return -ENODEV;
+			return a2_bam_irq;
 		}
 		satellite_mode = of_property_read_bool(pdev->dev.of_node,
 						"qcom,satellite-mode");
@@ -2725,20 +2744,13 @@ static int bam_dmux_probe(struct platform_device *pdev)
 	dma_dev->coherent_dma_mask = DMA_BIT_MASK(32);
 	dma_dev->dma_mask = &dma_dev->coherent_dma_mask;
 
-	xo_clk = devm_clk_get(&pdev->dev, "xo");
-	if (IS_ERR(xo_clk)) {
-		if (PTR_ERR(xo_clk) == -EPROBE_DEFER)
-			return -EPROBE_DEFER;
-		BAM_DMUX_LOG("%s: did not get xo clock\n", __func__);
-		xo_clk = NULL;
-	}
-	dfab_clk = devm_clk_get(&pdev->dev, "bus_clk");
-	if (IS_ERR(dfab_clk)) {
-		if (PTR_ERR(dfab_clk) == -EPROBE_DEFER)
-			return -EPROBE_DEFER;
-		BAM_DMUX_LOG("%s: did not get dfab clock\n", __func__);
-		dfab_clk = NULL;
-	} else {
+	xo_clk = bam_get_optional_clk(&pdev->dev, "xo");
+	if (IS_ERR(xo_clk))
+		return PTR_ERR(xo_clk);
+	dfab_clk = bam_get_optional_clk(&pdev->dev, "bus_clk");
+	if (IS_ERR(dfab_clk))
+		return PTR_ERR(dfab_clk);
+	if (dfab_clk) {
 		rc = clk_set_rate(dfab_clk, 64000000);
 		if (rc)
 			pr_err("%s: unable to set dfab clock rate\n", __func__);
