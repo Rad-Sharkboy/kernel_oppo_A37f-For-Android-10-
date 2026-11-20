@@ -995,13 +995,12 @@ cfg80211_inform_bss_frame(struct wiphy *wiphy,
 {
 	struct cfg80211_internal_bss tmp = {}, *res;
 	struct cfg80211_bss_ies *ies;
-	size_t ielen = len - offsetof(struct ieee80211_mgmt,
-				      u.probe_resp.variable);
+	const size_t header = offsetof(struct ieee80211_mgmt, u.probe_resp.variable);
+	size_t ielen;
 
 	BUILD_BUG_ON(offsetof(struct ieee80211_mgmt, u.probe_resp.variable) !=
 			offsetof(struct ieee80211_mgmt, u.beacon.variable));
 
-	trace_cfg80211_inform_bss_frame(wiphy, channel, mgmt, len, signal);
 
 	if (WARN_ON(!mgmt))
 		return NULL;
@@ -1013,8 +1012,11 @@ cfg80211_inform_bss_frame(struct wiphy *wiphy,
 		    (signal < 0 || signal > 100)))
 		return NULL;
 
-	if (WARN_ON(len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable)))
+	if (WARN_ON(len < header))
 		return NULL;
+
+	ielen = len - header;
+	trace_cfg80211_inform_bss_frame(wiphy, channel, mgmt, len, signal);
 
 	channel = cfg80211_get_bss_channel(wiphy, mgmt->u.beacon.variable,
 					   ielen, channel);
