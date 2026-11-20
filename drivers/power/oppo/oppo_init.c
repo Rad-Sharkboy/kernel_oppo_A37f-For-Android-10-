@@ -623,6 +623,9 @@ static int opcharger_suspend(struct device *dev)
 	rc = regulator_disable(chip->vcc_i2c);
 	if (rc) {
 		dev_err(chip->dev, "Regulator vcc_i2c disable failed rc=%d\n", rc);
+		chip->suspending = false;
+		enable_irq(client->irq);
+		schedule_delayed_work(&chip->update_opchg_thread_work, 0);
 		return rc;
 	}
 	}
