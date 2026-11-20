@@ -73,6 +73,7 @@ struct cinnamon_data {
 	/* Tiered queues */
 	struct list_head queues[PRIO_COUNT];
 	unsigned int queue_counts[PRIO_COUNT];
+	unsigned int queued;
 
 	/* Batching state */
 	unsigned int batch_count;
@@ -87,6 +88,8 @@ struct cinnamon_data {
 	int pressure;
 	int last_ra_pressure;
 	unsigned long last_ra_update;
+	unsigned long saved_ra_pages;
+	unsigned long last_ra_pages;
 	unsigned long last_pressure_change_jiffies;
 	unsigned long last_manual_param_change_jiffies;
 
@@ -214,7 +217,7 @@ static void cinnamon_update_ra(struct cinnamon_data *cd)
 	if (cd->last_ra_pressure >= 0 &&
 	    time_before(now, cd->last_ra_update + msecs_to_jiffies(50)))
 		return;
-	current_ra = cd->q->backing_dev_info.ra_pages;
+	current_ra = ACCESS_ONCE(cd->q->backing_dev_info.ra_pages);
 	switch (cd->pressure) {
 	case 3: ra_kb = 128; break;
 	case 2: ra_kb = 512; break;
@@ -230,8 +233,13 @@ static void cinnamon_update_ra(struct cinnamon_data *cd)
 		next = current_ra - min(16UL, current_ra - target);
 	else
 		next = current_ra;
-	if (next != current_ra)
-		cd->q->backing_dev_info.ra_pages = next;
+	if (current_ra != cd->last_ra_pages) {
+		cd->saved_ra_pages = current_ra;
+		cd->last_ra_pages = current_ra;
+	}
+	if (next != current_ra &&
+	    cmpxchg(&cd->q->backing_dev_info.ra_pages, current_ra, next) == current_ra)
+		cd->last_ra_pages = next;
 	cd->last_ra_pressure = cd->pressure;
 	cd->last_ra_update = now;
 }
@@ -243,13 +251,10 @@ static void cinnamon_set_pressure(struct cinnamon_data *cd, int new_pressure)
 
 	if (new_pressure == old_pressure)
 		return;
-	if (new_pressure) {
-		if (!time_after(jiffies, cd->last_pressure_change_jiffies +
-				msecs_to_jiffies(cd->hysteresis_ms)))
-			return;
-		if (old_pressure && new_pressure < old_pressure)
-			return;
-	}
+	if (new_pressure &&
+	    time_before(jiffies, cd->last_pressure_change_jiffies +
+			msecs_to_jiffies(cd->hysteresis_ms)))
+		return;
 
 	cd->pressure = new_pressure;
 	atomic_set(&cinnamon_io_pressure, new_pressure);
@@ -350,7 +355,7 @@ static bool cinnamon_sequence_ready(struct cinnamon_data *cd)
 		 list_empty(&cd->queues[PRIO_READ_FG]));
 }
 
-/* Merge function with O(1) scan limit */
+/* Share the merge budget across eligible queues. */
 static int cinnamon_merge(struct request_queue *q, struct request **req,
 			  struct bio *bio)
 {
@@ -358,60 +363,67 @@ static int cinnamon_merge(struct request_queue *q, struct request **req,
 	int dir = bio_data_dir(bio);
 	sector_t sector = bio->bi_sector;
 	sector_t last_sector = sector + bio_sectors(bio);
-	struct list_head *queue_head;
-	struct request *rq_iter;
-	int scanned = 0;
+	struct list_head *heads[3], *pos[3];
+	int i, count, scanned = 0;
 
-	if (dir == READ) {
-		if (!list_empty(&cd->queues[PRIO_CRITICAL]))
-			queue_head = &cd->queues[PRIO_CRITICAL];
-		else if (!list_empty(&cd->queues[PRIO_READ_FG]))
-			queue_head = &cd->queues[PRIO_READ_FG];
-		else if (!list_empty(&cd->queues[PRIO_READ_BG]))
-			queue_head = &cd->queues[PRIO_READ_BG];
-		else
-			return ELEVATOR_NO_MERGE;
+	if (bio->bi_rw & REQ_DISCARD) {
+		heads[0] = &cd->queues[PRIO_TRIM];
+		count = 1;
 	} else {
-		if (!list_empty(&cd->queues[PRIO_TRIM]))
-			queue_head = &cd->queues[PRIO_TRIM];
-		else if (!list_empty(&cd->queues[PRIO_WRITE_FG]))
-			queue_head = &cd->queues[PRIO_WRITE_FG];
-		else if (!list_empty(&cd->queues[PRIO_WRITE_BG]))
-			queue_head = &cd->queues[PRIO_WRITE_BG];
-		else
-			return ELEVATOR_NO_MERGE;
+		heads[0] = &cd->queues[PRIO_CRITICAL];
+		heads[1] = &cd->queues[dir == READ ? PRIO_READ_FG : PRIO_WRITE_FG];
+		heads[2] = &cd->queues[dir == READ ? PRIO_READ_BG : PRIO_WRITE_BG];
+		count = 3;
 	}
+	for (i = 0; i < count; i++)
+		pos[i] = heads[i]->next;
 
-	list_for_each_entry(rq_iter, queue_head, queuelist) {
-		sector_t rq_sector = blk_rq_pos(rq_iter);
-		sector_t rq_last_sector = rq_sector + blk_rq_sectors(rq_iter);
+	while (scanned < MAX_MERGE_SCAN) {
+		int before = scanned;
 
-		/* Adjacent sectors still require compatible I/O operations. */
-		if (sector == rq_last_sector && elv_rq_merge_ok(rq_iter, bio)) {
-			*req = rq_iter;
-			return ELEVATOR_BACK_MERGE;
+		for (i = 0; i < count && scanned < MAX_MERGE_SCAN; i++) {
+			struct request *candidate;
+			sector_t start, end;
+
+			if (pos[i] == heads[i])
+				continue;
+			candidate = list_entry(pos[i], struct request, queuelist);
+			pos[i] = pos[i]->next;
+			scanned++;
+			start = blk_rq_pos(candidate);
+			end = start + blk_rq_sectors(candidate);
+			if ((sector == end || last_sector == start) &&
+			    elv_rq_merge_ok(candidate, bio)) {
+				*req = candidate;
+				return sector == end ? ELEVATOR_BACK_MERGE :
+						       ELEVATOR_FRONT_MERGE;
+			}
 		}
-		if (last_sector == rq_sector && elv_rq_merge_ok(rq_iter, bio)) {
-			*req = rq_iter;
-			return ELEVATOR_FRONT_MERGE;
-		}
-		if (++scanned >= MAX_MERGE_SCAN)
+		if (scanned == before)
 			break;
 	}
 
 	return ELEVATOR_NO_MERGE;
 }
 
-/* Handle merged requests - now correctly decrement queue count */
 static void cinnamon_merged_requests(struct request_queue *q, struct request *rq,
 				      struct request *next)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
 	int prio = get_req_prio(next);
 
-	if (prio >= 0 && prio < PRIO_COUNT) {
-		if (cd->queue_counts[prio] > 0)
-			cd->queue_counts[prio]--;
+	if (list_empty(&next->queuelist))
+		return;
+	if (!list_empty(&rq->queuelist) && get_req_time(next) < get_req_time(rq)) {
+		int rq_prio = get_req_prio(rq);
+
+		if (rq_prio == prio)
+			list_move_tail(&rq->queuelist, &next->queuelist);
+		set_req_time_and_prio(rq, get_req_time(next), rq_prio);
+	}
+	if (prio >= 0 && prio < PRIO_COUNT && cd->queue_counts[prio] > 0) {
+		cd->queue_counts[prio]--;
+		cd->queued--;
 	}
 	list_del_init(&next->queuelist);
 }
@@ -441,6 +453,7 @@ static void cinnamon_add_request(struct request_queue *q, struct request *rq)
 	list_add_tail(&rq->queuelist, &cd->queues[prio]);
 
 	cd->queue_counts[prio]++;
+	cd->queued++;
 }
 
 /* Update latency moving average */
@@ -468,8 +481,6 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd)
 	unsigned long now = jiffies;
 	u64 total_ns;
 	int num, avg_latency_ms;
-	int queue_depth = 0;
-	int i;
 	int read_cnt, write_cnt, total_io;
 	int read_ratio;
 
@@ -492,9 +503,6 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd)
 	cd->write_batch = cd->saved_write_batch;
 	cd->write_expire_ms = cd->saved_write_expire_ms;
 	avg_latency_ms = div64_u64(total_ns, 1000000);
-
-	for (i = 0; i < PRIO_COUNT; i++)
-		queue_depth += cd->queue_counts[i];
 
 	if (avg_latency_ms > cd->target_latency_ms * 2) {
 		cd->read_batch = max(cd->read_batch / 2, 4);
@@ -523,7 +531,7 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd)
 			cd->write_batch = min(cd->write_batch * 2, 32);
 	}
 
-	if (queue_depth > cd->pressure_thres * 2) {
+	if (cd->queued > cd->pressure_thres * 2) {
 		cd->read_batch = max(cd->read_batch / 2, 4);
 		cd->write_batch = max(cd->write_batch / 2, 4);
 	}
@@ -536,7 +544,23 @@ static void cinnamon_adjust_params(struct cinnamon_data *cd)
 	cinnamon_apply_params(cd);
 }
 
-/* Dispatch function with tiered priority, starvation avoidance, and background anti-starvation */
+/* Preserve the age order of the background queues as a pair. */
+static struct request *cinnamon_background_request(struct cinnamon_data *cd)
+{
+	struct request *read = NULL, *write = NULL;
+
+	if (!list_empty(&cd->queues[PRIO_READ_BG]))
+		read = list_first_entry(&cd->queues[PRIO_READ_BG],
+					struct request, queuelist);
+	if (!list_empty(&cd->queues[PRIO_WRITE_BG]))
+		write = list_first_entry(&cd->queues[PRIO_WRITE_BG],
+					 struct request, queuelist);
+	if (!read || (write && get_req_time(write) < get_req_time(read)))
+		return write;
+	return read;
+}
+
+/* Dispatch function with tiered priority and starvation avoidance. */
 static int cinnamon_dispatch(struct request_queue *q, int force)
 {
 	struct cinnamon_data *cd = q->elevator->elevator_data;
@@ -545,10 +569,9 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	bool timestamp_valid = false;
 	int target_pressure = 0;
 	int pressure = cd->pressure;
-	unsigned long write_expire_ns = cd->write_expire_ms * 1000000ULL;
+	u64 write_expire_ns;
 	unsigned long read_batch;
-	int prio, i;
-	int total_pending;
+	int prio;
 
 	/* Starvation recovery check */
 	if (cd->starvation_recovery_until &&
@@ -557,35 +580,26 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 		cinnamon_apply_params(cd);
 	}
 	read_batch = cd->read_batch;
+	write_expire_ns = cd->write_expire_ms * 1000000ULL;
 	cinnamon_update_ra(cd);
 
 	/* Dynamic expiration based on pressure and queue depth */
 	if (unlikely(pressure == 3))
-		write_expire_ns = 50 * 1000000ULL;
+		write_expire_ns = min_t(u64, write_expire_ns, 50000000ULL);
 	else if (pressure <= 1)
-		write_expire_ns = 250 * 1000000ULL;
+		write_expire_ns = min_t(u64, write_expire_ns, 250000000ULL);
 
 	if (cd->queue_counts[PRIO_WRITE_FG] + cd->queue_counts[PRIO_WRITE_BG] > 16)
-		write_expire_ns = 150 * 1000000ULL;
+		write_expire_ns = min_t(u64, write_expire_ns, 150000000ULL);
 
-	/* Anti-starvation for background: force a background request after too many foreground */
+	/* Reserve a dispatch for the oldest background request when needed. */
 	if (cd->fg_dispatch_count >= FG_STARVE_LIMIT) {
-		if (!list_empty(&cd->queues[PRIO_READ_BG])) {
-			rq = list_first_entry(&cd->queues[PRIO_READ_BG],
-					      struct request, queuelist);
-			target_pressure = 1;
-			cd->fg_dispatch_count = 0;
-			goto dispatch;
-		}
-		if (!list_empty(&cd->queues[PRIO_WRITE_BG])) {
-			rq = list_first_entry(&cd->queues[PRIO_WRITE_BG],
-					      struct request, queuelist);
-			target_pressure = 2;
-			cd->fg_dispatch_count = 0;
-			goto dispatch;
-		}
-		/* No background, reset counter anyway? Keep it? */
+		rq = cinnamon_background_request(cd);
 		cd->fg_dispatch_count = 0;
+		if (rq) {
+			target_pressure = rq_data_dir(rq) == READ ? 1 : 2;
+			goto dispatch;
+		}
 	}
 
 	/* 1. Critical queue */
@@ -670,20 +684,9 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 		goto dispatch;
 	}
 
-	/* 7. Background reads */
-	if (!list_empty(&cd->queues[PRIO_READ_BG])) {
-		rq = list_first_entry(&cd->queues[PRIO_READ_BG],
-				      struct request, queuelist);
-		target_pressure = 1;
-		cd->fg_dispatch_count = 0;  /* reset on background */
-		goto dispatch;
-	}
-
-	/* 8. Background writes */
-	if (!list_empty(&cd->queues[PRIO_WRITE_BG])) {
-		rq = list_first_entry(&cd->queues[PRIO_WRITE_BG],
-				      struct request, queuelist);
-		target_pressure = 2;
+	rq = cinnamon_background_request(cd);
+	if (rq) {
+		target_pressure = rq_data_dir(rq) == READ ? 1 : 2;
 		cd->fg_dispatch_count = 0;
 		goto dispatch;
 	}
@@ -701,8 +704,10 @@ dispatch:
 	if (rq) {
 		/* Decrement count for the queue this request belongs to */
 		prio = get_req_prio(rq);
-		if (prio >= 0 && prio < PRIO_COUNT && cd->queue_counts[prio] > 0)
+		if (prio >= 0 && prio < PRIO_COUNT && cd->queue_counts[prio] > 0) {
 			cd->queue_counts[prio]--;
+			cd->queued--;
+		}
 
 		list_del_init(&rq->queuelist);
 		cinnamon_account_sequence(cd, rq, prio);
@@ -732,10 +737,7 @@ dispatch:
 			cd->read_batch_count = 0;
 
 		/* Update pressure if needed */
-		total_pending = 0;
-		for (i = 0; i < PRIO_COUNT; i++)
-			total_pending += cd->queue_counts[i];
-		if (total_pending > cd->pressure_thres)
+		if (cd->queued > cd->pressure_thres)
 			target_pressure = 3;
 
 		if (target_pressure != cd->pressure)
@@ -757,7 +759,7 @@ cinnamon_former_request(struct request_queue *q, struct request *rq)
 	if (prio < 0 || prio >= PRIO_COUNT)
 		return NULL;
 
-	if (rq->queuelist.prev == &cd->queues[prio])
+	if (list_empty(&rq->queuelist) || rq->queuelist.prev == &cd->queues[prio])
 		return NULL;
 
 	return list_entry(rq->queuelist.prev, struct request, queuelist);
@@ -772,7 +774,7 @@ cinnamon_latter_request(struct request_queue *q, struct request *rq)
 	if (prio < 0 || prio >= PRIO_COUNT)
 		return NULL;
 
-	if (rq->queuelist.next == &cd->queues[prio])
+	if (list_empty(&rq->queuelist) || rq->queuelist.next == &cd->queues[prio])
 		return NULL;
 
 	return list_entry(rq->queuelist.next, struct request, queuelist);
@@ -800,6 +802,7 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 		cd->queue_counts[i] = 0;
 	}
 
+	cd->queued = 0;
 	cd->batch_count = 0;
 	cd->read_batch_count = 0;
 	cd->fg_dispatch_count = 0;
@@ -807,7 +810,9 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	atomic_set(&cd->num_requests, 0);
 	cd->pressure = 0;
 	cd->last_ra_pressure = -1;
-	cd->last_pressure_change_jiffies = 0;
+	cd->saved_ra_pages = ACCESS_ONCE(q->backing_dev_info.ra_pages);
+	cd->last_ra_pages = cd->saved_ra_pages;
+	cd->last_pressure_change_jiffies = jiffies - msecs_to_jiffies(CINNAMON_HYSTERESIS_MS);
 	cd->last_manual_param_change_jiffies = jiffies;
 	cd->write_expire_ms = CINNAMON_WRITE_EXPIRE;
 	cd->read_batch = CINNAMON_READ_BATCH;
@@ -865,6 +870,8 @@ static void cinnamon_exit_queue(struct elevator_queue *e)
 	for (i = 0; i < PRIO_COUNT; i++)
 		WARN_ON(!list_empty(&cd->queues[i]));
 
+	cmpxchg(&cd->q->backing_dev_info.ra_pages, cd->last_ra_pages,
+		cd->saved_ra_pages);
 	kfree(cd);
 }
 
