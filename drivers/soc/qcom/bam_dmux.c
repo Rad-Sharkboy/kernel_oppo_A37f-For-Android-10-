@@ -2652,7 +2652,7 @@ static void set_dl_mtu(int requested_mtu)
 
 static int bam_dmux_probe(struct platform_device *pdev)
 {
-	int rc;
+	int rc, channels = 0;
 	struct resource *r;
 	void *subsys_h;
 	uint32_t requested_dl_mtu;
@@ -2763,21 +2763,20 @@ static int bam_dmux_probe(struct platform_device *pdev)
 
 	bam_mux_tx_workqueue = create_singlethread_workqueue("bam_dmux_tx");
 	if (!bam_mux_tx_workqueue) {
-		destroy_workqueue(bam_mux_rx_workqueue);
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto free_rx_queue;
 	}
 
-	for (rc = 0; rc < BAM_DMUX_NUM_CHANNELS; ++rc) {
-		spin_lock_init(&bam_ch[rc].lock);
-		scnprintf(bam_ch[rc].name, BAM_DMUX_CH_NAME_MAX_LEN,
-					"bam_dmux_ch_%d", rc);
-		/* bus 2, ie a2 stream 2 */
-		bam_ch[rc].pdev = platform_device_alloc(bam_ch[rc].name, 2);
-		if (!bam_ch[rc].pdev) {
-			pr_err("%s: platform device alloc failed\n", __func__);
-			destroy_workqueue(bam_mux_rx_workqueue);
-			destroy_workqueue(bam_mux_tx_workqueue);
-			return -ENOMEM;
+	for (; channels < BAM_DMUX_NUM_CHANNELS; ++channels) {
+		typeof(bam_ch[0]) *channel = &bam_ch[channels];
+
+		spin_lock_init(&channel->lock);
+		scnprintf(channel->name, sizeof(channel->name),
+			  "bam_dmux_ch_%d", channels);
+		channel->pdev = platform_device_alloc(channel->name, 2);
+		if (!channel->pdev) {
+			rc = -ENOMEM;
+			goto free_channels;
 		}
 	}
 
@@ -2787,46 +2786,32 @@ static int bam_dmux_probe(struct platform_device *pdev)
 	init_completion(&shutdown_completion);
 	complete_all(&shutdown_completion);
 	INIT_DELAYED_WORK(&ul_timeout_work, ul_timeout);
+	rc = init_srcu_struct(&bam_dmux_srcu);
+	if (rc)
+		goto free_channels;
 	wake_lock_init(&bam_wakelock, WAKE_LOCK_SUSPEND, "bam_dmux_wakelock");
-	init_srcu_struct(&bam_dmux_srcu);
 
 	subsys_h = subsys_notif_register_notifier("modem", &restart_notifier);
 	if (IS_ERR(subsys_h)) {
-		destroy_workqueue(bam_mux_rx_workqueue);
-		destroy_workqueue(bam_mux_tx_workqueue);
-		rc = (int)PTR_ERR(subsys_h);
+		rc = PTR_ERR(subsys_h);
 		pr_err("%s: failed to register for ssr rc: %d\n", __func__, rc);
-		return rc;
-	}
-
-	rc = bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
-			SMSM_A2_POWER_CONTROL,
-			bam_dmux_smsm_cb, NULL);
-
-	if (rc) {
-		subsys_notif_unregister_notifier(subsys_h, &restart_notifier);
-		destroy_workqueue(bam_mux_rx_workqueue);
-		destroy_workqueue(bam_mux_tx_workqueue);
-		pr_err("%s: smsm cb register failed, rc: %d\n", __func__, rc);
-		return -ENOMEM;
+		goto free_srcu;
 	}
 
 	rc = bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
 			SMSM_A2_POWER_CONTROL_ACK,
 			bam_dmux_smsm_ack_cb, NULL);
-
 	if (rc) {
-		subsys_notif_unregister_notifier(subsys_h, &restart_notifier);
-		destroy_workqueue(bam_mux_rx_workqueue);
-		destroy_workqueue(bam_mux_tx_workqueue);
-		bam_ops->smsm_state_cb_deregister_ptr(SMSM_MODEM_STATE,
-					SMSM_A2_POWER_CONTROL,
-					bam_dmux_smsm_cb, NULL);
-		pr_err("%s: smsm ack cb register failed, rc: %d\n", __func__,
-				rc);
-		for (rc = 0; rc < BAM_DMUX_NUM_CHANNELS; ++rc)
-			platform_device_put(bam_ch[rc].pdev);
-		return -ENOMEM;
+		pr_err("%s: smsm ACK registration failed: %d\n", __func__, rc);
+		goto unregister_restart;
+	}
+
+	rc = bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
+			SMSM_A2_POWER_CONTROL,
+			bam_dmux_smsm_cb, NULL);
+	if (rc) {
+		pr_err("%s: smsm power registration failed: %d\n", __func__, rc);
+		goto unregister_ack;
 	}
 
 	if (bam_ops->smsm_get_state_ptr(SMSM_MODEM_STATE) &
@@ -2835,6 +2820,25 @@ static int bam_dmux_probe(struct platform_device *pdev)
 			bam_ops->smsm_get_state_ptr(SMSM_MODEM_STATE));
 
 	return 0;
+
+unregister_ack:
+	bam_ops->smsm_state_cb_deregister_ptr(SMSM_MODEM_STATE,
+			SMSM_A2_POWER_CONTROL_ACK, bam_dmux_smsm_ack_cb, NULL);
+unregister_restart:
+	subsys_notif_unregister_notifier(subsys_h, &restart_notifier);
+free_srcu:
+	wake_lock_destroy(&bam_wakelock);
+	cleanup_srcu_struct(&bam_dmux_srcu);
+free_channels:
+	while (channels > 0) {
+		--channels;
+		platform_device_put(bam_ch[channels].pdev);
+		bam_ch[channels].pdev = NULL;
+	}
+	destroy_workqueue(bam_mux_tx_workqueue);
+free_rx_queue:
+	destroy_workqueue(bam_mux_rx_workqueue);
+	return rc;
 }
 
 static struct of_device_id msm_match_table[] = {
