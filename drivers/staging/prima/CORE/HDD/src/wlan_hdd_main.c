@@ -10731,23 +10731,22 @@ static void __hdd_set_multicast_list(struct net_device *dev)
          hddLog(VOS_TRACE_LEVEL_INFO,
                "%s: No free filter available; allow all multicast frames", __func__);
          pAdapter->mc_addr_list.mc_cnt = 0;
-         return;
+         goto configure;
       }
-
-      pAdapter->mc_addr_list.mc_cnt = mc_count;
 
       netdev_for_each_mc_addr(ha, dev) {
          if (i == mc_count)
             break;
-         memset(&(pAdapter->mc_addr_list.addr[i][0]), 0, ETH_ALEN);
          memcpy(&(pAdapter->mc_addr_list.addr[i][0]), ha->addr, ETH_ALEN);
          hddLog(VOS_TRACE_LEVEL_INFO, "%s: mlist[%d] = "MAC_ADDRESS_STR,
                __func__, i,
                MAC_ADDR_ARRAY(pAdapter->mc_addr_list.addr[i]));
          i++;
       }
+      pAdapter->mc_addr_list.mc_cnt = i;
    }
 
+configure:
    if (pHddCtx->hdd_wlan_suspended)
    {
        /*

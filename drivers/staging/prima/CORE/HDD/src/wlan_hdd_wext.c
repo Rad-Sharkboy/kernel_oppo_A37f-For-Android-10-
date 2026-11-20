@@ -9661,88 +9661,37 @@ int wlan_hdd_setIPv6Filter(hdd_context_t *pHddCtx, tANI_U8 filterType,
     return 0;
 }
 
-void wlan_hdd_set_mc_addr_list(hdd_adapter_t *pAdapter, v_U8_t set)
+void wlan_hdd_set_mc_addr_list(hdd_adapter_t *adapter, v_U8_t set)
 {
-    v_U8_t i;
-    tpSirRcvFltMcAddrList pMulticastAddrs = NULL;
-    tHalHandle hHal = NULL;
-    hdd_context_t* pHddCtx = (hdd_context_t*)pAdapter->pHddCtx;
+	hdd_context_t *ctx = WLAN_HDD_GET_CTX(adapter);
+	tSirRcvFltMcAddrList *request;
+	unsigned int count = 0;
 
-    if (NULL == pHddCtx)
-    {
-        hddLog(VOS_TRACE_LEVEL_ERROR, FL("HDD CTX is NULL"));
-        return;
-    }
+	if (!ctx || !ctx->hHal || !ctx->cfg_ini->fEnableMCAddrList)
+		return;
 
-    hHal = pHddCtx->hHal;
+	if (set && (adapter->device_mode == WLAN_HDD_INFRA_STATION ||
+		    adapter->device_mode == WLAN_HDD_P2P_CLIENT) &&
+	    WLAN_HDD_GET_STATION_CTX_PTR(adapter)->conn_info.connState ==
+		eConnectionState_Associated)
+		count = ACCESS_ONCE(adapter->mc_addr_list.mc_cnt);
 
-    if (NULL == hHal)
-    {
-        hddLog(VOS_TRACE_LEVEL_ERROR, FL("HAL Handle is NULL"));
-        return;
-    }
+	/* An empty or overflowed host list requires removing any old filter. */
+	if (!count && !ACCESS_ONCE(adapter->mc_addr_list.isFilterApplied))
+		return;
+	request = vos_mem_malloc(sizeof(*request));
+	if (!request)
+		return;
+	memset(request, 0, sizeof(*request));
+	request->ulMulticastAddrCnt = count;
+	if (count)
+		memcpy(request->multicastAddr, adapter->mc_addr_list.addr,
+		       count * ETH_ALEN);
 
-    /* Check if INI is enabled or not, other wise just return
-     */
-    if (pHddCtx->cfg_ini->fEnableMCAddrList)
-    {
-        pMulticastAddrs = vos_mem_malloc(sizeof(tSirRcvFltMcAddrList));
-        if (NULL == pMulticastAddrs)
-        {
-            hddLog(VOS_TRACE_LEVEL_ERROR, FL("Could not allocate Memory"));
-            return;
-        }
-
-        if (set)
-        {
-            /* Following pre-conditions should be satisfied before wei
-             * configure the MC address list.
-             */
-            if (((pAdapter->device_mode == WLAN_HDD_INFRA_STATION) ||
-               (pAdapter->device_mode == WLAN_HDD_P2P_CLIENT))
-               && pAdapter->mc_addr_list.mc_cnt
-               && (eConnectionState_Associated ==
-               (WLAN_HDD_GET_STATION_CTX_PTR(pAdapter))->conn_info.connState))
-            {
-                pMulticastAddrs->ulMulticastAddrCnt =
-                                 pAdapter->mc_addr_list.mc_cnt;
-                for (i = 0; i < pAdapter->mc_addr_list.mc_cnt; i++)
-                {
-                    memcpy(pMulticastAddrs->multicastAddr[i],
-                            pAdapter->mc_addr_list.addr[i],
-                            sizeof(pAdapter->mc_addr_list.addr[i]));
-                    hddLog(VOS_TRACE_LEVEL_INFO,
-                            "%s: %s multicast filter: addr ="
-                            MAC_ADDRESS_STR,
-                            __func__, set ? "setting" : "clearing",
-                            MAC_ADDR_ARRAY(pMulticastAddrs->multicastAddr[i]));
-                }
-                /* Set multicast filter */
-                sme_8023MulticastList(hHal, pAdapter->sessionId,
-                                      pMulticastAddrs);
-            }
-        }
-        else
-        {
-            /* Need to clear only if it was previously configured
-             */
-            if (pAdapter->mc_addr_list.isFilterApplied)
-            {
-                pMulticastAddrs->ulMulticastAddrCnt = 0;
-                sme_8023MulticastList(hHal, pAdapter->sessionId,
-                                      pMulticastAddrs);
-            }
-
-        }
-        pAdapter->mc_addr_list.isFilterApplied = set ? TRUE : FALSE;
-        vos_mem_free(pMulticastAddrs);
-    }
-    else
-    {
-        hddLog(VOS_TRACE_LEVEL_INFO,
-                FL("gMCAddrListEnable is not enabled in INI"));
-    }
-    return;
+	if (sme_8023MulticastList(ctx->hHal, adapter->sessionId, request) ==
+	    eHAL_STATUS_SUCCESS)
+		ACCESS_ONCE(adapter->mc_addr_list.isFilterApplied) = !!count;
+	vos_mem_free(request);
 }
 
 static int __iw_set_packet_filter_params(struct net_device *dev,
