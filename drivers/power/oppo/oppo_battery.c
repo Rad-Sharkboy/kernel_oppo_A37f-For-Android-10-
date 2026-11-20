@@ -1567,6 +1567,37 @@ void opchg_set_status(struct opchg_charger *chip,bool input_curr_set)
     }
 }
 
+/* Keep the hardware poll and all IRQ notifications at their original cadence. */
+static bool opchg_periodic_report_due(struct opchg_charger *chip)
+{
+	struct opchg_discharge_report *last = &chip->discharge_report;
+
+	if (!(is_project(OPPO_15109) || is_project(OPPO_15399)) ||
+	    chip->chg_present || chip->bat_status != POWER_SUPPLY_STATUS_DISCHARGING ||
+	    !chip->bat_exist || chip->battery_missing || chip->bypass ||
+	    chip->bat_temp_status != POWER_SUPPLY_HEALTH_GOOD ||
+	    chip->batterynotify || chip->charging_time_out ||
+	    chip->bat_volt_check_point <= 5 || chip->bat_instant_vol <= 0) {
+		last->valid = false;
+		return true;
+	}
+
+	if (last->valid && time_before(jiffies, last->next_report) &&
+	    last->capacity == chip->bat_volt_check_point &&
+	    last->temp_zone == chip->charging_opchg_temp_statu &&
+	    abs(chip->temperature - last->temp) < 5 &&
+	    abs(chip->bat_instant_vol - last->voltage_uv) < 20000)
+		return false;
+
+	last->capacity = chip->bat_volt_check_point;
+	last->temp = chip->temperature;
+	last->temp_zone = chip->charging_opchg_temp_statu;
+	last->voltage_uv = chip->bat_instant_vol;
+	last->next_report = jiffies + 30 * HZ;
+	last->valid = true;
+	return true;
+}
+
 void opchg_update_thread(struct work_struct *work)
 {
     struct delayed_work *dwork = to_delayed_work(work);
@@ -1741,7 +1772,8 @@ void opchg_update_thread(struct work_struct *work)
     opchg_check_charging_full(chip);
 
     opchg_set_status(chip, true);
-    power_supply_changed(&chip->batt_psy);
+    if (opchg_periodic_report_due(chip))
+        power_supply_changed(&chip->batt_psy);
 
     /*update time 5s*/
     schedule_delayed_work(&chip->update_opchg_thread_work,

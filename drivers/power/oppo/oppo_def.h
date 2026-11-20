@@ -178,7 +178,17 @@ struct opchg_regulator {
     struct regulator_dev            *rdev;
 };
 
+struct opchg_discharge_report {
+	unsigned long next_report;
+	int capacity;
+	int temp;
+	int temp_zone;
+	int voltage_uv;
+	bool valid;
+};
+
 struct opchg_charger {
+	struct opchg_discharge_report discharge_report;
     struct i2c_client               *client;
     struct device                   *dev;
     struct mutex                    read_write_lock;
