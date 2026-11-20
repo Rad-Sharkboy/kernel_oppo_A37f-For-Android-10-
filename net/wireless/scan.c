@@ -393,15 +393,17 @@ static bool cfg80211_bss_expire_oldest(struct cfg80211_registered_device *rdev)
 
 const u8 *cfg80211_find_ie(u8 eid, const u8 *ies, int len)
 {
-	while (len > 2 && ies[0] != eid) {
-		len -= ies[1] + 2;
-		ies += ies[1] + 2;
+	while (ies && len >= 2) {
+		int size = ies[1] + 2;
+
+		if (size > len)
+			break;
+		if (ies[0] == eid)
+			return ies;
+		len -= size;
+		ies += size;
 	}
-	if (len < 2)
-		return NULL;
-	if (len < 2 + ies[1])
-		return NULL;
-	return ies;
+	return NULL;
 }
 EXPORT_SYMBOL(cfg80211_find_ie);
 
