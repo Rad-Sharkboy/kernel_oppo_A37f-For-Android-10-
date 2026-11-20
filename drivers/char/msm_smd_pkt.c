@@ -429,9 +429,8 @@ ssize_t smd_pkt_read(struct file *file,
 	D_READ("Begin %s on smd_pkt_dev id:%d buffer_size %zu\n",
 		__func__, smd_pkt_devp->i, count);
 
-	buf = kmalloc(count, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	if (!count)
+		return 0;
 
 wait_for_packet:
 	r = wait_event_interruptible(smd_pkt_devp->ch_read_wait_queue,
@@ -444,7 +443,6 @@ wait_for_packet:
 	if (smd_pkt_devp->has_reset) {
 		mutex_unlock(&smd_pkt_devp->rx_lock);
 		E_SMD_PKT_SSR(smd_pkt_devp);
-		kfree(buf);
 		return notify_reset(smd_pkt_devp);
 	}
 
@@ -452,7 +450,6 @@ wait_for_packet:
 		mutex_unlock(&smd_pkt_devp->rx_lock);
 		pr_err_ratelimited("%s on a closed smd_pkt_dev id:%d\n",
 			__func__, smd_pkt_devp->i);
-		kfree(buf);
 		return -EINVAL;
 	}
 
@@ -464,7 +461,6 @@ wait_for_packet:
 			pr_err_ratelimited("%s: wait_event_interruptible on smd_pkt_dev id:%d ret %i\n",
 				__func__, smd_pkt_devp->i, r);
 		}
-		kfree(buf);
 		return r;
 	}
 
@@ -481,7 +477,7 @@ wait_for_packet:
 	if (pkt_size < 0) {
 		pr_err_ratelimited("%s: Error %d obtaining packet size for Channel %s",
 				__func__, pkt_size, smd_pkt_devp->ch_name);
-		kfree(buf);
+		mutex_unlock(&smd_pkt_devp->rx_lock);
 		return pkt_size;
 	}
 
@@ -490,8 +486,13 @@ wait_for_packet:
 			__func__, smd_pkt_devp->i,
 			pkt_size, count);
 		mutex_unlock(&smd_pkt_devp->rx_lock);
-		kfree(buf);
 		return -ETOOSMALL;
+	}
+
+	buf = kmalloc(pkt_size, GFP_KERNEL);
+	if (!buf) {
+		mutex_unlock(&smd_pkt_devp->rx_lock);
+		return -ENOMEM;
 	}
 
 	bytes_read = 0;
@@ -501,13 +502,13 @@ wait_for_packet:
 					 (pkt_size - bytes_read));
 		if (r < 0) {
 			mutex_unlock(&smd_pkt_devp->rx_lock);
+			kfree(buf);
 			if (smd_pkt_devp->has_reset) {
 				E_SMD_PKT_SSR(smd_pkt_devp);
 				return notify_reset(smd_pkt_devp);
 			}
 			pr_err_ratelimited("%s Error while reading %d\n",
 				__func__, r);
-			kfree(buf);
 			return r;
 		}
 		bytes_read += r;
