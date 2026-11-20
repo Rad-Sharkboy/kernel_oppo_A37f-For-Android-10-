@@ -930,11 +930,13 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	if (!bam_is_connected) {
 		read_unlock(&ul_wakeup_lock);
 		ul_wakeup();
-		if (unlikely(in_global_reset == 1)) {
-			srcu_read_unlock(&bam_dmux_srcu, rcu_id);
-			return -EFAULT;
-		}
 		read_lock(&ul_wakeup_lock);
+		if (unlikely(in_global_reset || !bam_is_connected)) {
+			rc = in_global_reset ? -EFAULT : -EBUSY;
+			read_unlock(&ul_wakeup_lock);
+			srcu_read_unlock(&bam_dmux_srcu, rcu_id);
+			return rc;
+		}
 		notify_all(BAM_DMUX_UL_CONNECTED, (unsigned long)(NULL));
 	}
 
