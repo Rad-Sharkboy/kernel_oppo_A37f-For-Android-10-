@@ -190,6 +190,7 @@ struct qpnp_adc_tm_sensor {
 	struct qpnp_adc_tm_chip		*chip;
 	enum thermal_device_mode	mode;
 	uint32_t			sensor_num;
+	u8				channel_mask;
 	enum qpnp_adc_meas_timer_select	timer_select;
 	uint32_t			meas_interval;
 	uint32_t			low_thr;
@@ -830,7 +831,7 @@ static int qpnp_adc_tm_set_client_thresholds(struct qpnp_adc_tm_sensor *sensor)
 	struct qpnp_adc_thr_client_info *client;
 	int high = 0xffff, low = 0;
 	bool high_enabled = false, low_enabled = false;
-	u8 mask = BIT(sensor->sensor_num);
+	u8 mask = sensor->channel_mask;
 	int rc;
 
 	list_for_each_entry(client, &sensor->thr_list, list) {
@@ -900,7 +901,7 @@ static int qpnp_adc_tm_channel_configure(struct qpnp_adc_tm_chip *chip,
 		if (!sensor->thermal_node)
 			return qpnp_adc_tm_set_client_thresholds(sensor);
 		return qpnp_adc_tm_reg_update(chip, QPNP_ADC_TM_MULTI_MEAS_EN,
-					      BIT(sensor->sensor_num), true);
+					      sensor->channel_mask, true);
 	}
 
 	return -EINVAL;
@@ -1048,7 +1049,7 @@ static int qpnp_adc_tm_set_mode(struct thermal_zone_device *thermal,
 			return -EINVAL;
 		}
 	} else if (mode == THERMAL_DEVICE_DISABLED) {
-		sensor_mask = 1 << adc_tm->sensor_num;
+		sensor_mask = adc_tm->channel_mask;
 
 		mode_ctl = ADC_OP_NORMAL_MODE << QPNP_OP_MODE_SHIFT;
 		rc = qpnp_adc_tm_mode_select(chip, mode_ctl);
@@ -1360,7 +1361,7 @@ static int qpnp_adc_tm_activate_trip_type(struct thermal_zone_device *thermal,
 	if (mode == THERMAL_TRIP_ACTIVATION_ENABLED)
 		state = true;
 
-	sensor_mask = 1 << adc_tm->sensor_num;
+	sensor_mask = adc_tm->channel_mask;
 
 	pr_debug("Sensor number:%x with state:%d\n", adc_tm->sensor_num, state);
 
@@ -1417,7 +1418,7 @@ static int qpnp_adc_tm_recalib_request_check(struct qpnp_adc_tm_chip *chip,
 				struct qpnp_adc_thr_client_info, list);
 		channel = client_info->btm_param->channel;
 		btm_chan_num = chip->sensor[sensor_num].btm_channel_num;
-		sensor_mask = 1 << sensor_num;
+		sensor_mask = chip->sensor[sensor_num].channel_mask;
 
 		rc = qpnp_vadc_read(chip->vadc_dev, channel, &result);
 		if (rc < 0) {
@@ -1617,7 +1618,7 @@ static int qpnp_adc_tm_read_status(struct qpnp_adc_tm_chip *chip)
 	for (i = 0; i < chip->max_channels_available; i++) {
 		struct qpnp_adc_tm_sensor *sensor = &chip->sensor[i];
 		bool handled = false;
-		u8 mask = BIT(i);
+		u8 mask = sensor->channel_mask;
 
 		if (high & mask) {
 			rc = qpnp_adc_tm_handle_threshold(sensor, true);
@@ -1876,7 +1877,7 @@ int32_t qpnp_adc_tm_disable_chan_meas(struct qpnp_adc_tm_chip *chip,
 
 
 	btm_chan_num = chip->sensor[dt_index].btm_channel_num;
-	sensor_mask = 1 << chip->sensor[dt_index].sensor_num;
+	sensor_mask = chip->sensor[dt_index].channel_mask;
 
 	rc = qpnp_adc_tm_reg_update(chip, QPNP_ADC_TM_LOW_THR_INT_EN,
 		sensor_mask, false);
@@ -2069,6 +2070,7 @@ static int qpnp_adc_tm_probe(struct spmi_device *spmi)
 	for_each_child_of_node(node, child) {
 		char name[25];
 		int btm_channel_num, timer_select = 0;
+		u32 hw_index;
 
 		rc = of_property_read_u32(child,
 				"qcom,btm-channel-number", &btm_channel_num);
@@ -2101,6 +2103,10 @@ static int qpnp_adc_tm_probe(struct spmi_device *spmi)
 						ADC_MEAS2_INTERVAL_1S;
 		}
 
+		rc = qpnp_adc_tm_get_btm_idx(btm_channel_num, &hw_index);
+		if (rc)
+			goto fail;
+		chip->sensor[sen_idx].channel_mask = BIT(hw_index);
 		chip->sensor[sen_idx].btm_channel_num = btm_channel_num;
 		chip->sensor[sen_idx].vadc_channel_num =
 				chip->adc->adc_channels[sen_idx].channel_num;
