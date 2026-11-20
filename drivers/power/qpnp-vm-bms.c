@@ -515,50 +515,42 @@ static bool is_charger_present(struct qpnp_bms_chip *chip)
 
 static bool is_battery_charging(struct qpnp_bms_chip *chip)
 {
-	union power_supply_propval ret = {0,};
+	union power_supply_propval ret;
+	int rc;
 
-	if (chip->batt_psy == NULL)
+	if (!chip->batt_psy)
 		chip->batt_psy = power_supply_get_by_name("battery");
-	if (chip->batt_psy) {
-		/* if battery has been registered, use the type property */
-		chip->batt_psy->get_property(chip->batt_psy,
-					POWER_SUPPLY_PROP_CHARGE_TYPE, &ret);
-		return ret.intval != POWER_SUPPLY_CHARGE_TYPE_NONE;
-	}
+	if (!chip->batt_psy)
+		return false;
 
-	/* Default to false if the battery power supply is not registered. */
-	pr_debug("battery power supply is not registered\n");
-	return false;
+	rc = chip->batt_psy->get_property(chip->batt_psy,
+					POWER_SUPPLY_PROP_CHARGE_TYPE, &ret);
+	return !rc && ret.intval > POWER_SUPPLY_CHARGE_TYPE_NONE;
 }
 
 #define BAT_PRES_BIT		BIT(7)
 static bool is_battery_present(struct qpnp_bms_chip *chip)
 {
-	union power_supply_propval ret = {0,};
+	union power_supply_propval ret;
 	int rc;
 	u8 batt_pres;
 
-	/* first try to use the batt_pres register if given */
 	if (chip->batt_pres_addr) {
-		rc = qpnp_read_wrapper(chip, &batt_pres,
-				chip->batt_pres_addr, 1);
-		if (!rc && (batt_pres & BAT_PRES_BIT))
-			return true;
-		else
-			return false;
-	}
-	if (chip->batt_psy == NULL)
-		chip->batt_psy = power_supply_get_by_name("battery");
-	if (chip->batt_psy) {
-		/* if battery has been registered, use the present property */
-		chip->batt_psy->get_property(chip->batt_psy,
-					POWER_SUPPLY_PROP_PRESENT, &ret);
-		return ret.intval;
+		rc = qpnp_read_wrapper(chip, &batt_pres, chip->batt_pres_addr, 1);
+		if (!rc)
+			return !!(batt_pres & BAT_PRES_BIT);
+	} else {
+		if (!chip->batt_psy)
+			chip->batt_psy = power_supply_get_by_name("battery");
+		if (chip->batt_psy) {
+			rc = chip->batt_psy->get_property(chip->batt_psy,
+						POWER_SUPPLY_PROP_PRESENT, &ret);
+			if (!rc)
+				return ret.intval > 0;
+		}
 	}
 
-	/* Default to false if the battery power supply is not registered. */
-	pr_debug("battery power supply is not registered\n");
-	return false;
+	return chip->battery_present > 0;
 }
 
 #define BAT_REMOVED_OFFMODE_BIT		BIT(6)
@@ -1062,11 +1054,20 @@ static int vadc_reading_to_uv(int reading, bool vadc_bms)
 	return div_u64(value, (u32)V_PER_BIT_DIV_FACTOR);
 }
 
+static int bms_monitored_soc(struct qpnp_bms_chip *chip)
+{
+	int voltage_soc = ACCESS_ONCE(chip->prev_voltage_based_soc);
+
+	if (ACCESS_ONCE(chip->dt.cfg_use_voltage_soc) && voltage_soc >= 0)
+		return voltage_soc;
+	return ACCESS_ONCE(chip->calculated_soc);
+}
+
 static int get_calculation_delay_ms(struct qpnp_bms_chip *chip)
 {
 	if (bms_wake_active(&chip->vbms_lv_wake_source))
 		return chip->dt.cfg_low_voltage_calculate_soc_ms;
-	if (chip->calculated_soc < chip->dt.cfg_low_soc_calc_threshold)
+	if (bms_monitored_soc(chip) < chip->dt.cfg_low_soc_calc_threshold)
 		return chip->dt.cfg_low_soc_calculate_soc_ms;
 	else
 		return chip->dt.cfg_calculate_soc_ms;
@@ -1925,17 +1926,18 @@ static void cv_voltage_check(struct qpnp_bms_chip *chip, int vbat_uv)
 
 static void low_soc_check(struct qpnp_bms_chip *chip)
 {
-	int rc;
+	int rc, soc;
 
 	if (chip->dt.cfg_low_soc_fifo_length < 1)
 		return;
 
 	mutex_lock(&chip->state_change_mutex);
 
-	if (chip->calculated_soc <= chip->dt.cfg_low_soc_calc_threshold) {
+	soc = bms_monitored_soc(chip);
+	if (soc <= chip->dt.cfg_low_soc_calc_threshold) {
 		if (!chip->low_soc_fifo_set) {
 			pr_debug("soc=%d (low-soc) setting fifo_length to %d\n",
-						chip->calculated_soc,
+						soc,
 					chip->dt.cfg_low_soc_fifo_length);
 			rc = get_fifo_length(chip, S2_STATE,
 						&chip->s2_fifo_length);
@@ -1954,7 +1956,7 @@ static void low_soc_check(struct qpnp_bms_chip *chip)
 	} else {
 		if (chip->low_soc_fifo_set) {
 			pr_debug("soc=%d setting back fifo_length to %d\n",
-						chip->calculated_soc,
+						soc,
 						chip->s2_fifo_length);
 			rc = set_fifo_length(chip, S2_STATE,
 						chip->s2_fifo_length);
@@ -1973,15 +1975,15 @@ low_soc_exit:
 static int calculate_soc_from_voltage(struct qpnp_bms_chip *chip,
 				      int instant_uv)
 {
-	int voltage_range_uv, voltage_remaining_uv, voltage_based_soc;
-	int rc, vbat_uv;
+	int cutoff = chip->dt.cfg_v_cutoff_uv;
+	int maximum = chip->dt.cfg_max_voltage_uv;
+	int voltage_based_soc;
+	int rc, vbat_uv = ACCESS_ONCE(chip->voltage_soc_uv);
 
 	/* check if we have the averaged fifo data */
-	if (chip->voltage_soc_uv) {
-		vbat_uv = chip->voltage_soc_uv;
-	} else if (instant_uv > 0) {
+	if (vbat_uv <= 0)
 		vbat_uv = instant_uv;
-	} else {
+	if (vbat_uv <= 0) {
 		rc = get_battery_voltage(chip, &vbat_uv);
 		if (rc < 0) {
 			pr_err("adc vbat failed err = %d\n", rc);
@@ -1990,18 +1992,12 @@ static int calculate_soc_from_voltage(struct qpnp_bms_chip *chip,
 		pr_debug("instant-voltage based voltage-soc\n");
 	}
 
-	if (vbat_uv <= 0)
+	if (vbat_uv <= 0 || cutoff <= 0 || maximum <= cutoff)
 		return -EINVAL;
 
-	voltage_range_uv = chip->dt.cfg_max_voltage_uv -
-					chip->dt.cfg_v_cutoff_uv;
-	if (voltage_range_uv <= 0)
-		return -EINVAL;
-
-	voltage_remaining_uv = vbat_uv - chip->dt.cfg_v_cutoff_uv;
-	voltage_based_soc = voltage_remaining_uv * 100 / voltage_range_uv;
-
-	voltage_based_soc = clamp(voltage_based_soc, 0, 100);
+	vbat_uv = clamp(vbat_uv, cutoff, maximum);
+	voltage_based_soc = div_s64((s64)(vbat_uv - cutoff) * 100,
+				    maximum - cutoff);
 
 	if (chip->prev_voltage_based_soc != voltage_based_soc) {
 		/* Publish the cache before notifying capacity readers. */
@@ -2211,8 +2207,8 @@ static void voltage_soc_timeout_work(struct work_struct *work)
 		pr_warn("BMS device not opened, using voltage based SOC\n");
 
 		mutex_lock(&chip->last_soc_mutex);
+		ACCESS_ONCE(chip->dt.cfg_use_voltage_soc) = true;
 		calculate_soc_from_voltage(chip, 0);
-		chip->dt.cfg_use_voltage_soc = true;
 		mutex_unlock(&chip->last_soc_mutex);
 
 		/* The original monitor may already have stopped at catch-up. */
