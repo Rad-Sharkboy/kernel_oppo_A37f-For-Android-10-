@@ -769,7 +769,7 @@ static int bam_rmnet_probe(struct platform_device *pdev)
 	struct rmnet_private *p;
 	char name[BAM_DMUX_CH_NAME_MAX_LEN];
 	struct net_device *dev;
-	const char *dev_name;
+	char dev_name[IFNAMSIZ];
 
 	for (i = 0; i < BAM_DMUX_NUM_CHANNELS; ++i) {
 		scnprintf(name, BAM_DMUX_CH_NAME_MAX_LEN, "bam_dmux_ch_%d", i);
@@ -778,15 +778,16 @@ static int bam_rmnet_probe(struct platform_device *pdev)
 	}
 
 	if (((i > BAM_DMUX_DATA_RMNET_7) && (i < BAM_DMUX_DATA_REV_RMNET_0)) ||
-	    (i >= BAM_DMUX_NUM_CHANNELS)) {
+	    (i > BAM_DMUX_DATA_REV_RMNET_8)) {
 		pr_err("%s: wrong netdev %s\n", __func__, pdev->name);
 		return -ENODEV;
 	}
 
 	if (i <= BAM_DMUX_DATA_RMNET_7)
-		dev_name = "rmnet%d";
+		snprintf(dev_name, sizeof(dev_name), "rmnet%d", i - BAM_DMUX_DATA_RMNET_0);
 	else
-		dev_name = "rev_rmnet%d";
+		snprintf(dev_name, sizeof(dev_name), "rev_rmnet%d",
+			 i - BAM_DMUX_DATA_REV_RMNET_0);
 
 	dev = alloc_netdev(sizeof(*p), dev_name, rmnet_setup);
 	if (!dev) {
