@@ -2673,7 +2673,10 @@ static struct clk *bam_get_optional_clk(struct device *dev, const char *name)
 	struct device_node *np = dev->of_node;
 	struct clk *clk = devm_clk_get(dev, name);
 
-	if (!IS_ERR(clk) || PTR_ERR(clk) != -EPROBE_DEFER)
+	if (!IS_ERR(clk))
+		return clk;
+	if (PTR_ERR(clk) != -EPROBE_DEFER && PTR_ERR(clk) != -ENOENT &&
+	    PTR_ERR(clk) != -ENODEV)
 		return clk;
 
 	while (np) {
