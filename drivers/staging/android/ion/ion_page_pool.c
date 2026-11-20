@@ -174,7 +174,8 @@ struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order)
 
 void ion_page_pool_destroy(struct ion_page_pool *pool)
 {
-	ion_page_pool_shrink(pool, __GFP_HIGHMEM, INT_MAX);
+	if (pool)
+		ion_page_pool_shrink(pool, __GFP_HIGHMEM, INT_MAX);
 	kfree(pool);
 }
 
