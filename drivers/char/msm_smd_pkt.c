@@ -639,6 +639,7 @@ static unsigned int smd_pkt_poll(struct file *file, poll_table *wait)
 {
 	struct smd_pkt_dev *smd_pkt_devp;
 	unsigned int mask = 0;
+	int avail;
 
 	smd_pkt_devp = file->private_data;
 	if (!smd_pkt_devp) {
@@ -653,7 +654,10 @@ static unsigned int smd_pkt_poll(struct file *file, poll_table *wait)
 		return POLLERR;
 	}
 
-	if (smd_read_avail(smd_pkt_devp->ch)) {
+	avail = smd_read_avail(smd_pkt_devp->ch);
+	if (avail < 0) {
+		mask = POLLERR;
+	} else if (avail > 0) {
 		mask |= POLLIN | POLLRDNORM;
 		D_POLL("%s sets POLLIN for smd_pkt_dev id: %d\n",
 			__func__, smd_pkt_devp->i);
@@ -680,12 +684,12 @@ static void check_and_wakeup_reader(struct smd_pkt_dev *smd_pkt_devp)
 	}
 
 	sz = smd_cur_packet_size(smd_pkt_devp->ch);
-	if (sz == 0) {
+	if (sz <= 0) {
 		D_READ("%s: No packet in smd_pkt_dev id:%d\n",
 			__func__, smd_pkt_devp->i);
 		return;
 	}
-	if (!smd_read_avail(smd_pkt_devp->ch)) {
+	if (smd_read_avail(smd_pkt_devp->ch) <= 0) {
 		D_READ(
 			"%s: packet size is %d in smd_pkt_dev id:%d - but the data isn't here\n",
 			__func__, sz, smd_pkt_devp->i);
@@ -717,7 +721,7 @@ static void check_and_wakeup_writer(struct smd_pkt_dev *smd_pkt_devp)
 	}
 
 	sz = smd_write_segment_avail(smd_pkt_devp->ch);
-	if (sz) {
+	if (sz > 0) {
 		D_WRITE("%s: %d bytes write space in smd_pkt_dev id:%d\n",
 			__func__, sz, smd_pkt_devp->i);
 		smd_disable_read_intr(smd_pkt_devp->ch);
