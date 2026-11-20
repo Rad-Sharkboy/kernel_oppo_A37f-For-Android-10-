@@ -1645,6 +1645,14 @@ fail:
 	return rc;
 }
 
+static void qpnp_adc_tm_queue_work(struct qpnp_adc_tm_chip *chip,
+		struct workqueue_struct *wq, struct work_struct *work)
+{
+	atomic_inc(&chip->wq_cnt);
+	if (!queue_work(wq, work))
+		atomic_dec(&chip->wq_cnt);
+}
+
 static int qpnp_adc_tm_read_status(struct qpnp_adc_tm_chip *chip)
 {
 	u8 status_low = 0, status_high = 0, qpnp_adc_tm_meas_en = 0;
@@ -1846,22 +1854,19 @@ static int qpnp_adc_tm_read_status(struct qpnp_adc_tm_chip *chip)
 		}
 
 		rc = qpnp_adc_tm_enable_if_channel_meas(chip);
-		if (rc < 0) {
+		if (rc < 0)
 			pr_err("re-enabling measurement failed\n");
-			return rc;
-		}
-	} else
-		pr_debug("No threshold status enable %d for high/low??\n",
-								sensor_mask);
+	} else {
+		/* A coalesced interrupt can leave the bank stopped. */
+		rc = qpnp_adc_tm_enable_if_channel_meas(chip);
+	}
 
 fail:
 	mutex_unlock(&chip->adc->adc_lock);
 
 	if (adc_tm_high_enable || adc_tm_low_enable)
-		queue_work(chip->sensor[sensor_num].req_wq,
-				&chip->sensor[sensor_num].work);
-	if (rc < 0 || (!adc_tm_high_enable && !adc_tm_low_enable))
-		atomic_dec(&chip->wq_cnt);
+		qpnp_adc_tm_queue_work(chip, chip->sensor[sensor_num].req_wq,
+				       &chip->sensor[sensor_num].work);
 
 	return rc;
 }
@@ -1875,8 +1880,7 @@ static void qpnp_adc_tm_high_thr_work(struct work_struct *work)
 	rc = qpnp_adc_tm_read_status(chip);
 	if (rc < 0)
 		pr_err("adc-tm high thr work failed\n");
-
-	return;
+	atomic_dec(&chip->wq_cnt);
 }
 
 static irqreturn_t qpnp_adc_tm_high_thr_isr(int irq, void *data)
@@ -1890,8 +1894,8 @@ static irqreturn_t qpnp_adc_tm_high_thr_isr(int irq, void *data)
 
 	qpnp_adc_tm_disable(chip);
 
-	atomic_inc(&chip->wq_cnt);
-	queue_work(chip->high_thr_wq, &chip->trigger_high_thr_work);
+	qpnp_adc_tm_queue_work(chip, chip->high_thr_wq,
+			       &chip->trigger_high_thr_work);
 
 	return IRQ_HANDLED;
 }
@@ -1905,8 +1909,7 @@ static void qpnp_adc_tm_low_thr_work(struct work_struct *work)
 	rc = qpnp_adc_tm_read_status(chip);
 	if (rc < 0)
 		pr_err("adc-tm low thr work failed\n");
-
-	return;
+	atomic_dec(&chip->wq_cnt);
 }
 
 static irqreturn_t qpnp_adc_tm_low_thr_isr(int irq, void *data)
@@ -1920,8 +1923,8 @@ static irqreturn_t qpnp_adc_tm_low_thr_isr(int irq, void *data)
 
 	qpnp_adc_tm_disable(chip);
 
-	atomic_inc(&chip->wq_cnt);
-	queue_work(chip->low_thr_wq, &chip->trigger_low_thr_work);
+	qpnp_adc_tm_queue_work(chip, chip->low_thr_wq,
+			       &chip->trigger_low_thr_work);
 
 	return IRQ_HANDLED;
 }
