@@ -464,50 +464,20 @@ int opchg_backup_ocv_soc(int soc)
 }
 #endif
 
-static int get_current_time(unsigned long *now_tm_sec)
+/* SOC timing is relative and includes time spent suspended. */
+static unsigned long bms_elapsed_seconds(void)
 {
-	struct rtc_time tm;
-	struct rtc_device *rtc;
-	int rc;
+	struct timespec now;
 
-	rtc = rtc_class_open(CONFIG_RTC_HCTOSYS_DEVICE);
-	if (rtc == NULL) {
-		pr_err("%s: unable to open rtc device (%s)\n",
-			__FILE__, CONFIG_RTC_HCTOSYS_DEVICE);
-		return -EINVAL;
-	}
-
-	rc = rtc_read_time(rtc, &tm);
-	if (rc) {
-		pr_err("Error reading rtc device (%s) : %d\n",
-			CONFIG_RTC_HCTOSYS_DEVICE, rc);
-		goto close_time;
-	}
-
-	rc = rtc_valid_tm(&tm);
-	if (rc) {
-		pr_err("Invalid RTC time (%s): %d\n",
-			CONFIG_RTC_HCTOSYS_DEVICE, rc);
-		goto close_time;
-	}
-	rtc_tm_to_time(&tm, now_tm_sec);
-
-close_time:
-	rtc_class_close(rtc);
-	return rc;
+	get_monotonic_boottime(&now);
+	return now.tv_sec;
 }
 
 static int calculate_delta_time(unsigned long *time_stamp, int *delta_time_s)
 {
-	unsigned long now_tm_sec = 0;
+	unsigned long now_tm_sec = bms_elapsed_seconds();
 
-	/* default to delta time = 0 if anything fails */
 	*delta_time_s = 0;
-
-	if (get_current_time(&now_tm_sec)) {
-		pr_err("RTC read failed\n");
-		return 0;
-	}
 
 	if (*time_stamp && now_tm_sec >= *time_stamp &&
 	    now_tm_sec - *time_stamp <= INT_MAX)
@@ -4377,10 +4347,8 @@ static int bms_resume(struct device *dev)
 	}
 
 	/* Start monitor_soc_work based on when it last executed */
-	rc = get_current_time(&tm_now_sec);
-	if (rc) {
-		pr_err("Could not read current time: %d\n", rc);
-	} else if (chip->tm_sec && tm_now_sec >= chip->tm_sec) {
+	tm_now_sec = bms_elapsed_seconds();
+	if (chip->tm_sec && tm_now_sec >= chip->tm_sec) {
 		unsigned long elapsed = tm_now_sec - chip->tm_sec;
 		int interval = get_calculation_delay_ms(chip);
 
