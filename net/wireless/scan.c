@@ -254,11 +254,14 @@ void __cfg80211_scan_done(struct work_struct *wk)
 
 void cfg80211_scan_done(struct cfg80211_scan_request *request, bool aborted)
 {
+	struct cfg80211_registered_device *rdev = wiphy_to_dev(request->wiphy);
+
 	trace_cfg80211_scan_done(request, aborted);
-	WARN_ON(request != wiphy_to_dev(request->wiphy)->scan_req);
+	if (WARN_ON(request != ACCESS_ONCE(rdev->scan_req)))
+		return;
 
 	request->aborted = aborted;
-	queue_work(cfg80211_wq, &wiphy_to_dev(request->wiphy)->scan_done_wk);
+	queue_work(cfg80211_wq, &rdev->scan_done_wk);
 }
 EXPORT_SYMBOL(cfg80211_scan_done);
 
