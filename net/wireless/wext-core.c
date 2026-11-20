@@ -612,6 +612,7 @@ void wireless_send_event(struct net_device *	dev,
 		return;
 	}
 	compat_event = nla_data(nla);
+	memset(compat_event, 0, hdr_len);
 
 	compat_event->len = event_len;
 	compat_event->cmd = cmd;
