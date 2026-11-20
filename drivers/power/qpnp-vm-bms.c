@@ -231,6 +231,9 @@ struct qpnp_bms_chip {
 	int				uuc_delta_time_s;
 	int				ocv_at_100;
 	int				last_ocv_uv;
+	bool				backup_valid;
+	u16				backed_up_ocv_mv;
+	int				backed_up_soc;
 	int				s2_fifo_length;
 	int				last_acc;
 	int				hi_power_state;
@@ -422,45 +425,52 @@ static int qpnp_secure_write_wrapper(struct qpnp_bms_chip *chip, u8 *val,
 static int backup_ocv_soc(struct qpnp_bms_chip *chip, int ocv_uv, int soc)
 {
 	int rc;
-	u16 ocv_mv = ocv_uv / 1000;
+	u16 ocv_mv;
 
+	if (ocv_uv <= 0 || ocv_uv / 1000 > U16_MAX || soc < 0 || soc > 100)
+		return -EINVAL;
+
+	ocv_mv = ocv_uv / 1000;
+	if (chip->backup_valid && chip->backed_up_ocv_mv == ocv_mv &&
+	    chip->backed_up_soc == soc)
+		return 0;
+
+	chip->backup_valid = false;
 	rc = qpnp_write_wrapper(chip, (u8 *)&ocv_mv,
 				chip->base + BMS_OCV_REG, 2);
 	if (rc)
-		pr_err("Unable to backup OCV rc=%d\n", rc);
+		return rc;
 
 	rc = qpnp_masked_write_base(chip, chip->base + BMS_SOC_REG,
 				SOC_STORAGE_MASK, (soc + 1) << 1);
 	if (rc)
-		pr_err("Unable to backup SOC rc=%d\n", rc);
+		return rc;
 
+	chip->backed_up_ocv_mv = ocv_mv;
+	chip->backed_up_soc = soc;
+	chip->backup_valid = true;
 	pr_debug("ocv_mv=%d soc=%d\n", ocv_mv, soc);
 
-	return rc;
+	return 0;
 }
 
 #ifdef CONFIG_MACH_OPPO
 int opchg_backup_ocv_soc(int soc)
 {
-	int rc;
-	static int soc_temp =0;
+	struct qpnp_bms_chip *chip = ACCESS_ONCE(the_chip);
+	int rc, ocv_uv;
 
-	if (the_chip == NULL) {
-		pr_err("%s the_chip is NULL\n", __func__);
-		return -1;
-	}
-	rc = backup_ocv_soc(the_chip, the_chip->last_ocv_uv, soc);
+	if (!chip)
+		return -ENODEV;
+
+	mutex_lock(&chip->last_soc_mutex);
+	ocv_uv = ACCESS_ONCE(chip->last_ocv_uv);
+	rc = backup_ocv_soc(chip, ocv_uv, soc);
+	mutex_unlock(&chip->last_soc_mutex);
 	if (rc)
-		pr_err("%s fail,rc = %d\n", __func__, rc);
-	else
-	{
-		if(soc_temp != soc )
-		{
-			pr_debug("%s is back soc=%d,last_ocv_uv=%d\n",__func__,soc,the_chip->last_ocv_uv);
-			soc_temp = soc;
-		}
-	}
-	return the_chip->last_ocv_uv;
+		pr_warn_ratelimited("BMS backup failed: %d\n", rc);
+
+	return ocv_uv;
 }
 #endif
 
@@ -2426,6 +2436,10 @@ static void bms_new_battery_setup(struct qpnp_bms_chip *chip)
 		pm_stay_awake(chip->dev);
 
 	mutex_unlock(&chip->bms_data_mutex);
+
+	mutex_lock(&chip->last_soc_mutex);
+	chip->backup_valid = false;
+	mutex_unlock(&chip->last_soc_mutex);
 
 	/* reset aging variables */
 	if (chip->dt.cfg_battery_aging_comp) {
