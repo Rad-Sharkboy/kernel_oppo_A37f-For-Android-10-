@@ -519,15 +519,26 @@ static int apds9921_dd_set_int_cfg(struct i2c_client *client, int int_cfg)
 	return i2c_smbus_write_byte_data(client, APDS9921_DD_INT_CFG_ADDR, int_cfg);
 }
 
-static void apds9921_dd_set_prx_thresh(struct i2c_client *client, int thres_low, int thres_up)
+static int apds9921_dd_set_prx_thresh(struct i2c_client *client,
+				     int low, int high)
 {
 	struct apds9921_data *data = i2c_get_clientdata(client);
+	int ret;
 
-	i2c_smbus_write_word_data(client, APDS9921_DD_PRX_THRES_UP_ADDR, thres_up);
-	i2c_smbus_write_word_data(client, APDS9921_DD_PRX_THRES_LOW_ADDR, thres_low);
-
-	data->pilt = thres_low;
-	data->piht = thres_up;
+	ret = i2c_smbus_write_word_data(client, APDS9921_DD_PRX_THRES_UP_ADDR,
+					high);
+	if (ret < 0)
+		return ret;
+	ret = i2c_smbus_write_word_data(client, APDS9921_DD_PRX_THRES_LOW_ADDR,
+					low);
+	if (ret < 0) {
+		i2c_smbus_write_word_data(client, APDS9921_DD_PRX_THRES_UP_ADDR,
+					  data->piht);
+		return ret;
+	}
+	data->pilt = low;
+	data->piht = high;
+	return 0;
 }
 
 static inline void apds9921_report_abs_ts(struct input_dev *dev,
@@ -566,13 +577,6 @@ static int LuxCalculation(struct i2c_client *client, int clr_data, int als_data)
 	struct apds9921_data *data = i2c_get_clientdata(client);
 	unsigned long long scaled_lux_value, divider;
 	unsigned int luxValue=0;
-	int status1, status2;
-
-	status1 = i2c_smbus_read_byte_data(client, APDS9921_DD_ALS_GAIN_ADDR);
-
-	status2 = i2c_smbus_read_byte_data(client, APDS9921_DD_ALS_MEAS_RATE_ADDR);
-
-	//printk(KERN_ERR"als_res_index = %d, als_gain_index = %d, gain = %x, rate = %x\n", data->als_res_index, data->als_gain_index, status1, status2);
 
 	if (is_project(OPPO_15018))
 		als_data = als_data * 5;
@@ -582,7 +586,7 @@ static int LuxCalculation(struct i2c_client *client, int clr_data, int als_data)
 		als_data = als_data * 3;
 
 	// Apply als calibration gain
-	als_data = als_data * pdev_data->als_gain / 1000;
+	als_data = als_data * data->als_gain / 1000;
 
 	scaled_lux_value = (unsigned long long) als_data * APDS9921_DD_LUX_FACTOR * 1000U * data->als_cal_factor;
 	divider = (unsigned long long) (apds9921_als_meas_rate_tb[data->als_res_index]*apds9921_als_gain_tb[data->als_gain_index] * 100 * 1000);
@@ -758,13 +762,14 @@ static void apds9921_als_polling_work_handler(struct work_struct *work)
 	// the previous als data is not stable after als enable, so we get rid of the first als data .
 	apds9921_change_als_threshold(client);
 
-	if(data->als_just_enable_flag == 1)
-    {
-        apds9921_dd_set_als_meas_rate(client, APDS9921_DD_ALS_DEFAULT_RES|APDS9921_DD_ALS_DEFAULT_MEAS_RATE);
-	data->als_just_enable_flag = 0;
-    }
+	if (data->als_just_enable_flag &&
+	    !apds9921_dd_set_als_meas_rate(client, APDS9921_DD_ALS_DEFAULT_RES |
+						 APDS9921_DD_ALS_DEFAULT_MEAS_RATE))
+		data->als_just_enable_flag = 0;
 
-	queue_delayed_work(apds_workqueue, &data->als_dwork, msecs_to_jiffies(data->als_poll_delay));	// restart timer
+	if (data->enable_als_sensor)
+		queue_delayed_work(apds_workqueue, &data->als_dwork,
+				   max(1UL, msecs_to_jiffies(data->als_poll_delay)));
 }
 
 static void apds9921_irq_work(struct work_struct *work)
@@ -804,83 +809,54 @@ static int apds9921_enable_als_sensor(struct i2c_client *client, int val)
 	struct apds9921_data *data = i2c_get_clientdata(client);
 	int rc;
 
-	printk_x(SHOW_LOG,"%s: ( %d)\n", __func__, val);
-
-	if ((val != APDS_DISABLE_ALS) && (val != APDS_ENABLE_ALS)) {
-		printk_x(SHOW_LOG,"%s: enable als sensor=%d\n", __func__, val);
-		return -1;
-	}
-
-	if (!val && !data->enable_als_sensor && !data->enable_ps_sensor &&
-	    !data->power_on_flag)
+	if (val != APDS_DISABLE_ALS && val != APDS_ENABLE_ALS)
+		return -EINVAL;
+	if (val == data->enable_als_sensor &&
+	    (val || data->enable_ps_sensor || !data->power_on_flag))
 		return 0;
-
-	if (val == APDS_ENABLE_ALS && !data->enable_als_sensor &&
-	    !data->enable_ps_sensor)
-	{
-		/* Power on and initalize the device */
-		if (data->power_on) {
-			rc = data->power_on(true);
-			if (rc)
-				return rc;
-		}
-
-		rc = apds9921_init_client(client);
-		if (rc) {
-			dev_err(&client->dev, "Failed to init apds993x\n");
-			if (data->power_on)
-				data->power_on(false);
-			return rc;
-		}
-	}
-
-	if ((val == APDS_ENABLE_ALS) ) {
-		// turn on light  sensor
-		if (data->enable_als_sensor==APDS_DISABLE_ALS) {
-
-			data->enable_als_sensor = val;
-			if (data->enable_als_sensor == APDS_ENABLE_ALS) {
-
-				printk_x(SHOW_LOG,"%s: enable_als_sensor\n", __func__);
-
-				data->als_just_enable_flag = 1;
-
-                apds9921_dd_set_als_meas_rate(client, APDS9921_DD_ALS_DEFAULT_RES|APDS9921_DD_ALS_MEAS_RATE_50_MS);
-
-				if(data->enable_ps_sensor == 0)     // if ps enable, als also enable.
-					apds9921_dd_set_main_ctrl(client, APDS9921_DD_ALS_EN);
-
-				/*
-				 * If work is already scheduled then subsequent schedules will not
-				 * change the scheduled time that's why we have to cancel it first.
-				 */
-				cancel_delayed_work_sync(&data->als_dwork);
-
-				queue_delayed_work(apds_workqueue, &data->als_dwork, msecs_to_jiffies(data->als_poll_delay));
+	if (val == APDS_ENABLE_ALS) {
+		if (!data->enable_ps_sensor) {
+			if (data->power_on) {
+				rc = data->power_on(true);
+				if (rc)
+					return rc;
 			}
+			rc = apds9921_init_client(client);
+			if (rc)
+				goto power_off;
 		}
-	}
-	else {
-		//turn off light sensor
-		data->enable_als_sensor = APDS_DISABLE_ALS;
 
-		if(data->enable_ps_sensor == 0)     // if ps disable, als disable.
-			apds9921_dd_set_main_ctrl(client, 0);
-
-		/*
-		 * If work is already scheduled then subsequent schedules will not
-		 * change the scheduled time that's why we have to cancel it first.
-		 */
-		cancel_delayed_work_sync(&data->als_dwork);
-	}
-
-	/* Vote off  regulators if both light and prox sensor are off */
-	if ((data->enable_als_sensor == 0) &&(data->enable_ps_sensor == 0) && (data->power_on))
-	{
-		data->power_on(false);
+		rc = apds9921_dd_set_als_meas_rate(client,
+				APDS9921_DD_ALS_DEFAULT_RES |
+				APDS9921_DD_ALS_MEAS_RATE_50_MS);
+		if (rc)
+			goto power_off;
+		if (!data->enable_ps_sensor) {
+			rc = apds9921_dd_set_main_ctrl(client, APDS9921_DD_ALS_EN);
+			if (rc)
+				goto power_off;
+		}
+		data->als_just_enable_flag = 1;
+		data->enable_als_sensor = val;
+		queue_delayed_work(apds_workqueue, &data->als_dwork,
+				   max(1UL, msecs_to_jiffies(data->als_poll_delay)));
+		return 0;
 	}
 
+	data->enable_als_sensor = APDS_DISABLE_ALS;
+	cancel_delayed_work_sync(&data->als_dwork);
+	if (!data->enable_ps_sensor) {
+		rc = apds9921_dd_set_main_ctrl(client, 0);
+		if (data->power_on)
+			return data->power_on(false);
+		return rc;
+	}
 	return 0;
+
+power_off:
+	if (!data->enable_ps_sensor && data->power_on)
+		data->power_on(false);
+	return rc;
 }
 
 static int apds9921_set_als_poll_delay(struct i2c_client *client, unsigned int val)
@@ -990,7 +966,7 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 
 	if ((val != APDS_DISABLE_PS) && (val != APDS_ENABLE_PS)) {
 		printk("%s:invalid value=%d\n", __func__, val);
-		return -1;
+		return -EINVAL;
 	}
 
 	if (!val && !data->enable_als_sensor && !data->enable_ps_sensor &&
@@ -1033,26 +1009,28 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 
 			data->enable_ps_sensor = val;
 
-			apds9921_dd_set_main_ctrl(client, APDS9921_DD_PRX_EN | APDS9921_DD_ALS_EN);     // when open ps, we need open als too.
-
-			apds9921_dd_set_int_cfg(client, APDS9921_DD_PRX_INT_EN);
-
-			if (ps_min != 0 && ps_min + dirty_adjust_high_thd < ps_adjust_max)
-			{
-				apds9921_dd_set_prx_thresh(client, ps_min + dirty_adjust_low_thd, ps_min + dirty_adjust_high_thd);
-			}
+			rc = apds9921_dd_set_main_ctrl(client,
+					APDS9921_DD_PRX_EN | APDS9921_DD_ALS_EN);
+			if (rc)
+				goto disable_on_error;
+			rc = apds9921_dd_set_int_cfg(client, APDS9921_DD_PRX_INT_EN);
+			if (rc)
+				goto disable_on_error;
+			if (ps_min && ps_min + dirty_adjust_high_thd < ps_adjust_max)
+				rc = apds9921_dd_set_prx_thresh(client,
+					ps_min + dirty_adjust_low_thd,
+					ps_min + dirty_adjust_high_thd);
 			else
-			{
-				apds9921_dd_set_prx_thresh(client, ps_thd_low_highlight, ps_thd_high_highlight);
-			}
+				rc = apds9921_dd_set_prx_thresh(client,
+					ps_thd_low_highlight, ps_thd_high_highlight);
+			if (rc)
+				goto disable_on_error;
 
-			msleep(100); // must be more than APDS9921_DD_PRX_DEFAULT_MEAS_RATE
-
+			/* Wait for the first completed proximity measurement. */
+			msleep(100);
 			rc = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
-			if (rc < 0) {
-				apds9921_enable_ps_sensor(client, APDS_DISABLE_PS);
-				return rc;
-			}
+			if (rc < 0)
+				goto disable_on_error;
 			data->ps_data = rc & 0x7FF;
 
 			if (data->ps_data >= data->piht)
@@ -1092,6 +1070,10 @@ static int apds9921_enable_ps_sensor(struct i2c_client *client, int val)
 	}
 
 	return 0;
+
+disable_on_error:
+	apds9921_enable_ps_sensor(client, APDS_DISABLE_PS);
+	return rc;
 }
 
 /*
@@ -1105,6 +1087,8 @@ static ssize_t apds9921_show_clr_data(struct device *dev,
 	int clr_data;
 
 	clr_data = i2c_smbus_read_word_data(client, APDS9921_DD_CLEAR_DATA_ADDR);
+	if (clr_data < 0)
+		return clr_data;
 
 	return sprintf(buf, "%d\n", clr_data);
 }
@@ -1119,6 +1103,8 @@ static ssize_t apds9921_show_als_data(struct device *dev,
 	int als_data;
 
 	als_data = i2c_smbus_read_word_data(client, APDS9921_DD_ALS_DATA_ADDR);
+	if (als_data < 0)
+		return als_data;
 
 	return sprintf(buf, "%d\n", als_data);
 }
@@ -1130,7 +1116,10 @@ static ssize_t apds9921_show_ps_data(struct device *dev, struct device_attribute
 	struct i2c_client *client = to_i2c_client(dev);
 	int ps_data;
 
-	ps_data = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR) & 0x7FF;
+	ps_data = i2c_smbus_read_word_data(client, APDS9921_DD_PRX_DATA_ADDR);
+	if (ps_data < 0)
+		return ps_data;
+	ps_data &= 0x7ff;
 
 	return sprintf(buf, "%d\n", ps_data);
 }
@@ -1151,18 +1140,14 @@ static ssize_t apds9921_store_proximity_enable(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct i2c_client *client = to_i2c_client(dev);
-	unsigned long val = simple_strtoul(buf, NULL, 10);
+	unsigned int val;
+	int ret;
 
-	printk_x(SHOW_LOG,"%s: enable ps senosr ( %ld)\n", __func__, val);
-
-	if ((val != APDS_DISABLE_PS) && (val != APDS_ENABLE_PS) ) {
-		printk("**%s:store invalid value=%ld\n", __func__, val);
-		return count;
-	}
-
-	apds9921_enable_ps_sensor(client, val);
-
-	return count;
+	ret = kstrtouint(buf, 10, &val);
+	if (ret)
+		return ret;
+	ret = apds9921_enable_ps_sensor(client, val);
+	return ret ? ret : count;
 }
 
 static DEVICE_ATTR(proximity_enable, S_IWUGO | S_IRUGO,
@@ -1181,20 +1166,14 @@ static ssize_t apds9921_store_light_enable(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct i2c_client *client = to_i2c_client(dev);
-	unsigned long val = simple_strtoul(buf, NULL, 10);
+	unsigned int val;
+	int ret;
 
-	printk_x(SHOW_LOG,"%s: enable als sensor ( %ld)\n", __func__, val);
-
-	if ((val != APDS_DISABLE_ALS) &&
-			(val != APDS_ENABLE_ALS)) {
-
-		printk("**%s: store invalid value=%ld\n", __func__, val);
-		return count;
-	}
-
-	apds9921_enable_als_sensor(client, val);
-
-	return count;
+	ret = kstrtouint(buf, 10, &val);
+	if (ret)
+		return ret;
+	ret = apds9921_enable_als_sensor(client, val);
+	return ret ? ret : count;
 }
 
 static DEVICE_ATTR(light_enable, S_IWUGO | S_IRUGO,
@@ -1246,6 +1225,8 @@ static int apds9921_init_client(struct i2c_client *client)
 		return err;
 
 	id = i2c_smbus_read_byte_data(client, APDS9921_DD_PART_ID_ADDR);
+	if (id < 0)
+		return id;
 	if (id == 0xB1)
 	{
 		printk_x(SHOW_LOG,"chip APDS-9921.\n");
@@ -1286,7 +1267,9 @@ static int apds9921_init_client(struct i2c_client *client)
 	/* PS_THRES_UP & PS_THRES_DOWN */
 	//	apds9921_dd_set_prx_thresh(client, data->ps_threshold, data->ps_threshold); // init threshold for proximity
 
-	i2c_smbus_write_byte_data(client, APDS9921_DD_ALS_THRES_UP_ADDR, 0);
+	err = i2c_smbus_write_byte_data(client, APDS9921_DD_ALS_THRES_UP_ADDR, 0);
+	if (err < 0)
+		return err;
 
 	/* PS Offset */
 	err = apds9921_dd_set_prx_can(client, data->ps_offset);
@@ -1831,27 +1814,16 @@ static struct kobj_attribute ps_enable =
 };
 static ssize_t apds9921_alsps_ps_thd_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	u32 data[2];
-	struct apds9921_data *p_data = i2c_get_clientdata(apds9921_i2c_client);
+	int low, high, ret;
 
-	if (sscanf(buf, "%d %d", (unsigned int *)&data[0],(unsigned int *)&data[1]) == 2)
-	{
-		//printk(KERN_ERR"algo set --- low_thd:%5d, high_thd:%5d \n", data[0], data[1]);
+	if (sscanf(buf, "%d %d", &low, &high) != 2 ||
+	    low < 0 || high < low || high > 0x7ff)
+		return -EINVAL;
+	if (!pdev_data->enable_ps_sensor)
+		return count;
 
-		if(pdev_data->enable_ps_sensor == 0)
-			return count;
-
-		p_data->piht = data[1];
-		p_data->pilt = data[0];
-
-		apds9921_dd_set_prx_thresh(apds9921_i2c_client, p_data->pilt, p_data->piht);
-	}
-	else
-	{
-		printk("%s the buf format is error.\n", __func__);
-	}
-
-	return count;
+	ret = apds9921_dd_set_prx_thresh(apds9921_i2c_client, low, high);
+	return ret ? ret : count;
 }
 static struct kobj_attribute ps_thd =
 {
