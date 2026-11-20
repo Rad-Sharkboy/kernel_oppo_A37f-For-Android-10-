@@ -1027,18 +1027,23 @@ int msm_isp_proc_buf_cmd(struct msm_isp_buf_mgr *buf_mgr,
 	unsigned int cmd, void *arg)
 {
 	switch (cmd) {
-	case VIDIOC_MSM_ISP_REQUEST_BUF:
-		return buf_mgr->ops->request_buf(buf_mgr, arg);
-	case VIDIOC_MSM_ISP_ENQUEUE_BUF:
-		return buf_mgr->ops->enqueue_buf(buf_mgr, arg);
+	case VIDIOC_MSM_ISP_REQUEST_BUF: {
+		struct msm_isp_buf_request *buf_req = arg;
+		buf_mgr->ops->request_buf(buf_mgr, buf_req);
+		break;
+	}
+	case VIDIOC_MSM_ISP_ENQUEUE_BUF: {
+		struct msm_isp_qbuf_info *qbuf_info = arg;
+		buf_mgr->ops->enqueue_buf(buf_mgr, qbuf_info);
+		break;
+	}
 	case VIDIOC_MSM_ISP_RELEASE_BUF: {
 		struct msm_isp_buf_request *buf_req = arg;
-
-		return buf_mgr->ops->release_buf(buf_mgr, buf_req->handle);
+		buf_mgr->ops->release_buf(buf_mgr, buf_req->handle);
+		break;
 	}
-	default:
-		return -ENOIOCTLCMD;
 	}
+	return 0;
 }
 
 int msm_isp_buf_mgr_debug(struct msm_isp_buf_mgr *buf_mgr)
