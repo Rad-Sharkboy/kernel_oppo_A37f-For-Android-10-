@@ -1144,11 +1144,13 @@ int msm_bam_dmux_open(uint32_t id, void *priv,
 	if (!bam_is_connected) {
 		read_unlock(&ul_wakeup_lock);
 		ul_wakeup();
-		if (unlikely(in_global_reset == 1)) {
-			kfree(hdr);
-			return -EFAULT;
-		}
 		read_lock(&ul_wakeup_lock);
+		if (unlikely(in_global_reset || !bam_is_connected)) {
+			rc = in_global_reset ? -EFAULT : -EBUSY;
+			read_unlock(&ul_wakeup_lock);
+			kfree(hdr);
+			goto open_failed;
+		}
 		notify_all(BAM_DMUX_UL_CONNECTED, (unsigned long)(NULL));
 	}
 
@@ -1161,9 +1163,21 @@ int msm_bam_dmux_open(uint32_t id, void *priv,
 
 	rc = bam_mux_write_cmd((void *)hdr, sizeof(struct bam_mux_hdr));
 	read_unlock(&ul_wakeup_lock);
+	if (rc)
+		goto open_failed;
 
 open_done:
 	DBG("%s: opened ch %d\n", __func__, id);
+	return 0;
+
+open_failed:
+	spin_lock_irqsave(&bam_ch[id].lock, flags);
+	if (bam_ch[id].notify == notify && bam_ch[id].priv == priv) {
+		bam_ch[id].status &= ~BAM_CH_LOCAL_OPEN;
+		bam_ch[id].notify = NULL;
+		bam_ch[id].priv = NULL;
+	}
+	spin_unlock_irqrestore(&bam_ch[id].lock, flags);
 	return rc;
 }
 
