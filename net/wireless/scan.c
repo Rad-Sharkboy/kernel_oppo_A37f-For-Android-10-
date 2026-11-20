@@ -256,10 +256,10 @@ void cfg80211_scan_done(struct cfg80211_scan_request *request, bool aborted)
 {
 	struct cfg80211_registered_device *rdev = wiphy_to_dev(request->wiphy);
 
-	trace_cfg80211_scan_done(request, aborted);
 	if (WARN_ON(request != ACCESS_ONCE(rdev->scan_req)))
 		return;
 
+	trace_cfg80211_scan_done(request, aborted);
 	request->aborted = aborted;
 	queue_work(cfg80211_wq, &rdev->scan_done_wk);
 }
@@ -283,8 +283,8 @@ void __cfg80211_sched_scan_results(struct work_struct *wk)
 			/* flush entries from previous scans */
 			spin_lock_bh(&rdev->bss_lock);
 			__cfg80211_bss_expire(rdev, request->scan_start);
-			spin_unlock_bh(&rdev->bss_lock);
 			request->scan_start = jiffies;
+			spin_unlock_bh(&rdev->bss_lock);
 		}
 		nl80211_send_sched_scan_results(rdev, request->dev);
 	}
@@ -416,7 +416,7 @@ const u8 *cfg80211_find_vendor_ie(unsigned int oui, u8 oui_type,
 		if (size > len)
 			break;
 		if (ies[0] == WLAN_EID_VENDOR_SPECIFIC &&
-		    size >= sizeof(struct ieee80211_vendor_ie) &&
+		    ies[1] >= sizeof(struct ieee80211_vendor_ie) &&
 		    ((ies[2] << 16) | (ies[3] << 8) | ies[4]) == oui &&
 		    ies[5] == oui_type)
 			return ies;
