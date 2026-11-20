@@ -539,14 +539,6 @@ void __hdd_ipv6_notifier_work_queue(struct work_struct *work)
         }
 #endif
     }
-#ifdef WLAN_FEATURE_PACKET_FILTERING
-    /* wlan_hdd_set_mc_addr_list() is called from the early suspend
-     * only so when new ipv6 address is generated the screen may not
-     * on so we need to call it here to update the list in f/w.
-     */
-    if (ACCESS_ONCE(pHddCtx->hdd_wlan_suspended))
-        wlan_hdd_set_mc_addr_list(pAdapter, TRUE);
-#endif
     EXIT();
 }
 

@@ -7547,6 +7547,10 @@ static void __hdd_uninit (struct net_device *dev)
          break;
       }
 
+#ifdef WLAN_FEATURE_PACKET_FILTERING
+      if (pAdapter->mc_filter_work.func)
+         cancel_work_sync(&pAdapter->mc_filter_work);
+#endif
       if (dev != pAdapter->dev)
       {
          hddLog(VOS_TRACE_LEVEL_FATAL,
@@ -8199,6 +8203,9 @@ static hdd_adapter_t* hdd_alloc_station_adapter( hdd_context_t *pHddCtx, tSirMac
       pAdapter->pHddCtx = pHddCtx; 
       pAdapter->magic = WLAN_HDD_ADAPTER_MAGIC;
       spin_lock_init(&pAdapter->lock_for_active_session);
+#ifdef WLAN_FEATURE_PACKET_FILTERING
+      INIT_WORK(&pAdapter->mc_filter_work, hdd_mc_filter_work);
+#endif
 
 #ifdef FEATURE_WLAN_BATCH_SCAN
       pAdapter->pBatchScanRsp = NULL;
@@ -10681,90 +10688,18 @@ v_U8_t hdd_get_operating_channel( hdd_context_t *pHddCtx, device_mode_t mode )
 }
 
 #ifdef WLAN_FEATURE_PACKET_FILTERING
-/**---------------------------------------------------------------------------
-
-  \brief __hdd_set_multicast_list() -
-
-  This used to set the multicast address list.
-
-  \param  - dev - Pointer to the WLAN device.
-  - skb - Pointer to OS packet (sk_buff).
-  \return - success/fail
-
-  --------------------------------------------------------------------------*/
-static void __hdd_set_multicast_list(struct net_device *dev)
-{
-   hdd_adapter_t *pAdapter;
-   hdd_context_t *pHddCtx;
-   int mc_count;
-   int i = 0, ret = 0;
-   struct netdev_hw_addr *ha;
-
-   ENTER();
-
-   pAdapter = WLAN_HDD_GET_PRIV_PTR(dev);
-   if (NULL == pAdapter)
-   {
-      hddLog(VOS_TRACE_LEVEL_ERROR,
-            "%s: Adapter context is Null", __func__);
-      return;
-   }
-   pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
-   ret = wlan_hdd_validate_context(pHddCtx);
-   if (0 != ret)
-   {
-       return;
-   }
-   if (dev->flags & IFF_ALLMULTI)
-   {
-      hddLog(VOS_TRACE_LEVEL_INFO,
-            "%s: allow all multicast frames", __func__);
-      pAdapter->mc_addr_list.mc_cnt = 0;
-   }
-   else
-   {
-      mc_count = netdev_mc_count(dev);
-      hddLog(VOS_TRACE_LEVEL_INFO,
-            "%s: mc_count = %u", __func__, mc_count);
-      if (mc_count > WLAN_HDD_MAX_MC_ADDR_LIST)
-      {
-         hddLog(VOS_TRACE_LEVEL_INFO,
-               "%s: No free filter available; allow all multicast frames", __func__);
-         pAdapter->mc_addr_list.mc_cnt = 0;
-         goto configure;
-      }
-
-      netdev_for_each_mc_addr(ha, dev) {
-         if (i == mc_count)
-            break;
-         memcpy(&(pAdapter->mc_addr_list.addr[i][0]), ha->addr, ETH_ALEN);
-         hddLog(VOS_TRACE_LEVEL_INFO, "%s: mlist[%d] = "MAC_ADDRESS_STR,
-               __func__, i,
-               MAC_ADDR_ARRAY(pAdapter->mc_addr_list.addr[i]));
-         i++;
-      }
-      pAdapter->mc_addr_list.mc_cnt = i;
-   }
-
-configure:
-   if (pHddCtx->hdd_wlan_suspended)
-   {
-       /*
-        * Configure the Mcast address list to FW
-        * If wlan is already in suspend mode
-        */
-       wlan_hdd_set_mc_addr_list(pAdapter, TRUE);
-   }
-   EXIT();
-   return;
-}
-
+/* ndo_set_rx_mode runs under netif_addr_lock_bh(). */
 static void hdd_set_multicast_list(struct net_device *dev)
 {
-   vos_ssr_protect(__func__);
-   __hdd_set_multicast_list(dev);
-   vos_ssr_unprotect(__func__);
+	hdd_adapter_t *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+	hdd_context_t *ctx = WLAN_HDD_GET_CTX(adapter);
+
+	if ((adapter->device_mode == WLAN_HDD_INFRA_STATION ||
+	     adapter->device_mode == WLAN_HDD_P2P_CLIENT) &&
+	    ACCESS_ONCE(ctx->hdd_wlan_suspended))
+		schedule_work(&adapter->mc_filter_work);
 }
+
 #endif
 
 /**---------------------------------------------------------------------------

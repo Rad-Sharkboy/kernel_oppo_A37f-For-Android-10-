@@ -1043,14 +1043,6 @@ typedef struct
    supported by wcnss */
 #define WLAN_HDD_MAX_MC_ADDR_LIST 240
 
-#ifdef WLAN_FEATURE_PACKET_FILTERING
-typedef struct multicast_addr_list
-{
-   v_U8_t isFilterApplied;
-   v_U8_t mc_cnt;
-   v_U8_t addr[WLAN_HDD_MAX_MC_ADDR_LIST][ETH_ALEN];
-} t_multicast_add_list;
-#endif
 
 #ifdef FEATURE_WLAN_BATCH_SCAN
 
@@ -1287,7 +1279,8 @@ struct hdd_adapter_s
    hdd_cfg80211_state_t cfg80211State;
 
 #ifdef WLAN_FEATURE_PACKET_FILTERING
-   t_multicast_add_list mc_addr_list;
+   struct work_struct mc_filter_work;
+   bool mc_filter_applied;
 #endif
 
    //Magic cookie for adapter sanity verification

@@ -9661,37 +9661,65 @@ int wlan_hdd_setIPv6Filter(hdd_context_t *pHddCtx, tANI_U8 filterType,
     return 0;
 }
 
-void wlan_hdd_set_mc_addr_list(hdd_adapter_t *adapter, v_U8_t set)
+static DEFINE_MUTEX(hdd_mc_filter_lock);
+
+static void hdd_program_mc_filter(hdd_adapter_t *adapter, bool set,
+				  bool suspended_only)
 {
 	hdd_context_t *ctx = WLAN_HDD_GET_CTX(adapter);
+	struct net_device *dev = adapter->dev;
+	struct netdev_hw_addr *ha;
 	tSirRcvFltMcAddrList *request;
 	unsigned int count = 0;
 
-	if (!ctx || !ctx->hHal || !ctx->cfg_ini->fEnableMCAddrList)
+	if (!dev || !ctx || !ctx->hHal || !ctx->cfg_ini->fEnableMCAddrList)
 		return;
 
+	mutex_lock(&hdd_mc_filter_lock);
+	if ((suspended_only && !ACCESS_ONCE(ctx->hdd_wlan_suspended)) ||
+	    (!set && !adapter->mc_filter_applied))
+		goto unlock;
+
+	request = vos_mem_malloc(sizeof(*request));
+	if (!request)
+		goto unlock;
+	memset(request, 0, sizeof(*request));
 	if (set && (adapter->device_mode == WLAN_HDD_INFRA_STATION ||
 		    adapter->device_mode == WLAN_HDD_P2P_CLIENT) &&
 	    WLAN_HDD_GET_STATION_CTX_PTR(adapter)->conn_info.connState ==
-		eConnectionState_Associated)
-		count = ACCESS_ONCE(adapter->mc_addr_list.mc_cnt);
-
-	/* An empty or overflowed host list requires removing any old filter. */
-	if (!count && !ACCESS_ONCE(adapter->mc_addr_list.isFilterApplied))
-		return;
-	request = vos_mem_malloc(sizeof(*request));
-	if (!request)
-		return;
-	memset(request, 0, sizeof(*request));
+		eConnectionState_Associated) {
+		netif_addr_lock_bh(dev);
+		if (!(dev->flags & (IFF_ALLMULTI | IFF_PROMISC)) &&
+		    netdev_mc_count(dev) <= ARRAY_SIZE(request->multicastAddr)) {
+			netdev_for_each_mc_addr(ha, dev)
+				memcpy(request->multicastAddr[count++], ha->addr,
+				       ETH_ALEN);
+		}
+		netif_addr_unlock_bh(dev);
+	}
 	request->ulMulticastAddrCnt = count;
-	if (count)
-		memcpy(request->multicastAddr, adapter->mc_addr_list.addr,
-		       count * ETH_ALEN);
-
-	if (sme_8023MulticastList(ctx->hHal, adapter->sessionId, request) ==
-	    eHAL_STATUS_SUCCESS)
-		ACCESS_ONCE(adapter->mc_addr_list.isFilterApplied) = !!count;
+	if ((count || adapter->mc_filter_applied) &&
+	    sme_8023MulticastList(ctx->hHal, adapter->sessionId, request) ==
+		eHAL_STATUS_SUCCESS)
+		adapter->mc_filter_applied = !!count;
 	vos_mem_free(request);
+unlock:
+	mutex_unlock(&hdd_mc_filter_lock);
+}
+
+void wlan_hdd_set_mc_addr_list(hdd_adapter_t *adapter, v_U8_t set)
+{
+	hdd_program_mc_filter(adapter, set, false);
+}
+
+void hdd_mc_filter_work(struct work_struct *work)
+{
+	hdd_adapter_t *adapter = container_of(work, hdd_adapter_t, mc_filter_work);
+
+	vos_ssr_protect(__func__);
+	if (!wlan_hdd_validate_context(WLAN_HDD_GET_CTX(adapter)))
+		hdd_program_mc_filter(adapter, true, true);
+	vos_ssr_unprotect(__func__);
 }
 
 static int __iw_set_packet_filter_params(struct net_device *dev,
