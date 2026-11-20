@@ -133,10 +133,9 @@ struct bam_mux_hdr {
 };
 
 /**
- * struct rx_pkt_info - struct describing an rx packet
+ * struct rx_pkt_info - metadata in the posted RX skb control buffer
  * @skb: socket buffer containing the packet
  * @dma_address: dma mapped address of the packet
- * @work: work_struct for processing the packet
  * @list_node: list_head for placing this on a list
  * @sps_size: size of the sps_iovec for this packet
  * @len: total length of the buffer containing this packet
@@ -144,7 +143,6 @@ struct bam_mux_hdr {
 struct rx_pkt_info {
 	struct sk_buff *skb;
 	dma_addr_t dma_address;
-	struct work_struct work;
 	struct list_head list_node;
 	uint16_t sps_size;
 	uint16_t len;

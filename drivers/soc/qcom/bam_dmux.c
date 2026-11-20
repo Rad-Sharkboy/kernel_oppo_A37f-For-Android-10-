@@ -222,7 +222,7 @@ static DEFINE_MUTEX(bam_pdev_mutexlock);
 
 static void notify_all(int event, unsigned long data);
 static void bam_mux_write_done(struct work_struct *work);
-static void handle_bam_mux_cmd(struct work_struct *work);
+static void handle_bam_mux_cmd(struct rx_pkt_info *info);
 static void rx_timer_work_func(struct work_struct *work);
 static void queue_rx_work_func(struct work_struct *work);
 static int ssrestart_check(void);
@@ -394,6 +394,7 @@ static inline void verify_tx_queue_is_empty(const char *func)
 
 static void __queue_rx(gfp_t alloc_flags)
 {
+	struct sk_buff *skb;
 	void *ptr;
 	struct rx_pkt_info *info;
 	int ret;
@@ -409,28 +410,14 @@ static void __queue_rx(gfp_t alloc_flags)
 		if (in_global_reset)
 			goto fail;
 
-		info = kmalloc(sizeof(struct rx_pkt_info), alloc_flags);
-		if (!info) {
-			DMUX_LOG_KERR(
-			"%s: unable to alloc rx_pkt_info w/ flags %x, will retry later\n",
-								__func__,
-								alloc_flags);
+		skb = __dev_alloc_skb(current_buffer_size, alloc_flags);
+		if (!skb)
 			goto fail;
-		}
-
+		BUILD_BUG_ON(sizeof(*info) > sizeof(skb->cb));
+		info = (struct rx_pkt_info *)skb->cb;
+		info->skb = skb;
 		info->len = current_buffer_size;
-
-		INIT_WORK(&info->work, handle_bam_mux_cmd);
-
-		info->skb = __dev_alloc_skb(info->len, alloc_flags);
-		if (info->skb == NULL) {
-			DMUX_LOG_KERR(
-				"%s: unable to alloc skb w/ flags %x, will retry later\n",
-								__func__,
-								alloc_flags);
-			goto fail_info;
-		}
-		ptr = skb_put(info->skb, info->len);
+		ptr = skb_put(skb, info->len);
 
 		info->dma_address = dma_map_single(dma_dev, ptr, info->len,
 							bam_ops->dma_from);
@@ -452,7 +439,6 @@ static void __queue_rx(gfp_t alloc_flags)
 			dma_unmap_single(dma_dev, info->dma_address, info->len,
 					 bam_ops->dma_from);
 			dev_kfree_skb_any(info->skb);
-			kfree(info);
 			if (retry)
 				schedule_delayed_work(&queue_rx_work,
 					msecs_to_jiffies(RX_REFILL_RETRY_MS));
@@ -482,10 +468,7 @@ static void __queue_rx(gfp_t alloc_flags)
 	return;
 
 fail_skb:
-	dev_kfree_skb_any(info->skb);
-
-fail_info:
-	kfree(info);
+	dev_kfree_skb_any(skb);
 
 fail:
 	if (bam_connection_is_active && !in_global_reset)
@@ -692,20 +675,18 @@ unlock:
 	queue_rx();
 }
 
-static void handle_bam_mux_cmd(struct work_struct *work)
+static void handle_bam_mux_cmd(struct rx_pkt_info *info)
 {
 	unsigned long flags;
 	struct bam_mux_hdr *rx_hdr;
-	struct rx_pkt_info *info;
 	struct sk_buff *rx_skb;
 	uint16_t sps_size;
 
-	info = container_of(work, struct rx_pkt_info, work);
 	rx_skb = info->skb;
 	dma_unmap_single(dma_dev, info->dma_address, info->len,
 			bam_ops->dma_from);
 	sps_size = info->sps_size;
-	kfree(info);
+	memset(rx_skb->cb, 0, sizeof(rx_skb->cb));
 
 	if (rx_skb->len < sizeof(*rx_hdr) || sps_size < sizeof(*rx_hdr))
 		goto drop;
@@ -1400,7 +1381,7 @@ static void rx_switch_to_interrupt_mode(void)
 		if (!info)
 			continue;
 		info->sps_size = iov.size;
-		handle_bam_mux_cmd(&info->work);
+		handle_bam_mux_cmd(info);
 	}
 	return;
 
@@ -1468,7 +1449,7 @@ static void rx_timer_work_func(struct work_struct *work)
 				continue;
 			inactive_cycles = 0;
 			info->sps_size = iov.size;
-			handle_bam_mux_cmd(&info->work);
+			handle_bam_mux_cmd(info);
 		}
 
 		if (!inactive_cycles)
@@ -2137,7 +2118,6 @@ static void disconnect_to_bam(void)
 		dma_unmap_single(dma_dev, info->dma_address, info->len,
 							bam_ops->dma_from);
 		dev_kfree_skb_any(info->skb);
-		kfree(info);
 	}
 	bam_rx_pool_len = 0;
 	mutex_unlock(&bam_rx_pool_mutexlock);
