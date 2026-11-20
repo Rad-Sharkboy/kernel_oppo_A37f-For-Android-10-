@@ -2396,10 +2396,11 @@ static int qpnp_vm_bms_power_set_property(struct power_supply *psy,
 		pr_debug("IBATT = %d\n", val->intval);
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
-		cancel_delayed_work_sync(&chip->monitor_soc_work);
+		mutex_lock(&chip->last_soc_mutex);
 		chip->last_ocv_uv = val->intval;
+		mutex_unlock(&chip->last_soc_mutex);
 		pr_debug("OCV = %d\n", val->intval);
-		schedule_delayed_work(&chip->monitor_soc_work, 0);
+		mod_delayed_work(system_wq, &chip->monitor_soc_work, 0);
 		break;
 	case POWER_SUPPLY_PROP_HI_POWER:
 		rc = qpnp_vm_bms_config_power_state(chip, val->intval, true);
