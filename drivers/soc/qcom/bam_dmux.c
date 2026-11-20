@@ -2732,13 +2732,17 @@ static int bam_dmux_probe(struct platform_device *pdev)
 	dma_dev->coherent_dma_mask = DMA_BIT_MASK(32);
 	dma_dev->dma_mask = &dma_dev->coherent_dma_mask;
 
-	xo_clk = clk_get(&pdev->dev, "xo");
+	xo_clk = devm_clk_get(&pdev->dev, "xo");
 	if (IS_ERR(xo_clk)) {
+		if (PTR_ERR(xo_clk) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
 		BAM_DMUX_LOG("%s: did not get xo clock\n", __func__);
 		xo_clk = NULL;
 	}
-	dfab_clk = clk_get(&pdev->dev, "bus_clk");
+	dfab_clk = devm_clk_get(&pdev->dev, "bus_clk");
 	if (IS_ERR(dfab_clk)) {
+		if (PTR_ERR(dfab_clk) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
 		BAM_DMUX_LOG("%s: did not get dfab clock\n", __func__);
 		dfab_clk = NULL;
 	} else {
