@@ -204,6 +204,8 @@ static LIST_HEAD(xprt_info_list);
 static DECLARE_RWSEM(xprt_info_list_lock_lha5);
 
 static DEFINE_MUTEX(ipc_router_init_lock);
+static DECLARE_RWSEM(ipc_router_xprt_priv_lock);
+static DECLARE_WAIT_QUEUE_HEAD(ipc_router_xprt_open_wait);
 static bool is_ipc_router_inited;
 static int msm_ipc_router_init(void);
 #define IPC_ROUTER_INIT_TIMEOUT (10 * HZ)
@@ -900,6 +902,7 @@ static int post_pkt_to_port(struct msm_ipc_port *port_ptr,
 			    struct rr_packet *pkt, int clone)
 {
 	struct rr_packet *temp_pkt = pkt;
+	unsigned int event;
 	void (*notify)(unsigned event, void *oob_data,
 		       size_t oob_data_len, void *priv);
 
@@ -917,14 +920,16 @@ static int post_pkt_to_port(struct msm_ipc_port *port_ptr,
 		}
 	}
 
+	event = temp_pkt->hdr.type;
 	mutex_lock(&port_ptr->port_rx_q_lock_lhc3);
-	__pm_stay_awake(&port_ptr->port_rx_ws);
+	if (list_empty(&port_ptr->port_rx_q))
+		__pm_stay_awake(&port_ptr->port_rx_ws);
 	list_add_tail(&temp_pkt->list, &port_ptr->port_rx_q);
 	wake_up(&port_ptr->port_rx_wait_q);
 	notify = port_ptr->notify;
 	mutex_unlock(&port_ptr->port_rx_q_lock_lhc3);
 	if (notify)
-		notify(pkt->hdr.type, NULL, 0, port_ptr->priv);
+		notify(event, NULL, 0, port_ptr->priv);
 	return 0;
 }
 
@@ -3564,6 +3569,9 @@ static int msm_ipc_router_add_xprt(struct msm_ipc_router_xprt *xprt)
 {
 	struct msm_ipc_router_xprt_info *xprt_info;
 
+	if (ACCESS_ONCE(xprt->priv))
+		return -EALREADY;
+
 	xprt_info = kmalloc(sizeof(struct msm_ipc_router_xprt_info),
 			    GFP_KERNEL);
 	if (!xprt_info)
@@ -3583,6 +3591,7 @@ static int msm_ipc_router_add_xprt(struct msm_ipc_router_xprt *xprt)
 
 	xprt_info->workqueue = create_singlethread_workqueue(xprt->name);
 	if (!xprt_info->workqueue) {
+		wakeup_source_trash(&xprt_info->ws);
 		kfree(xprt_info);
 		return -ENOMEM;
 	}
@@ -3603,7 +3612,10 @@ static int msm_ipc_router_add_xprt(struct msm_ipc_router_xprt *xprt)
 	}
 	up_write(&routing_table_lock_lha3);
 
-	xprt->priv = xprt_info;
+	down_write(&ipc_router_xprt_priv_lock);
+	ACCESS_ONCE(xprt->priv) = xprt_info;
+	up_write(&ipc_router_xprt_priv_lock);
+	wake_up_all(&ipc_router_xprt_open_wait);
 
 	return 0;
 }
@@ -3611,27 +3623,34 @@ static int msm_ipc_router_add_xprt(struct msm_ipc_router_xprt *xprt)
 static void msm_ipc_router_remove_xprt(struct msm_ipc_router_xprt *xprt)
 {
 	struct msm_ipc_router_xprt_info *xprt_info;
+	struct rr_packet *pkt, *next;
 
-	if (xprt && xprt->priv) {
-		xprt_info = xprt->priv;
+	if (!xprt)
+		return;
 
-		mutex_lock(&xprt_info->rx_lock_lhb2);
-		xprt_info->abort_data_read = 1;
-		mutex_unlock(&xprt_info->rx_lock_lhb2);
+	down_write(&ipc_router_xprt_priv_lock);
+	xprt_info = xprt->priv;
+	ACCESS_ONCE(xprt->priv) = NULL;
+	up_write(&ipc_router_xprt_priv_lock);
+	if (!xprt_info)
+		return;
 
-		down_write(&xprt_info_list_lock_lha5);
-		list_del(&xprt_info->list);
-		up_write(&xprt_info_list_lock_lha5);
+	mutex_lock(&xprt_info->rx_lock_lhb2);
+	xprt_info->abort_data_read = 1;
+	mutex_unlock(&xprt_info->rx_lock_lhb2);
 
-		msm_ipc_cleanup_routing_table(xprt_info);
+	down_write(&xprt_info_list_lock_lha5);
+	list_del(&xprt_info->list);
+	up_write(&xprt_info_list_lock_lha5);
 
-		flush_workqueue(xprt_info->workqueue);
-		destroy_workqueue(xprt_info->workqueue);
-		wakeup_source_trash(&xprt_info->ws);
-
-		xprt->priv = 0;
-		kfree(xprt_info);
+	msm_ipc_cleanup_routing_table(xprt_info);
+	destroy_workqueue(xprt_info->workqueue);
+	list_for_each_entry_safe(pkt, next, &xprt_info->pkt_list, list) {
+		list_del(&pkt->list);
+		release_pkt(pkt);
 	}
+	wakeup_source_trash(&xprt_info->ws);
+	kfree(xprt_info);
 }
 
 
@@ -3663,7 +3682,7 @@ void msm_ipc_router_xprt_notify(struct msm_ipc_router_xprt *xprt,
 				unsigned event,
 				void *data)
 {
-	struct msm_ipc_router_xprt_info *xprt_info = xprt->priv;
+	struct msm_ipc_router_xprt_info *xprt_info;
 	struct msm_ipc_router_xprt_work *xprt_work;
 	struct rr_packet *pkt;
 	int ret;
@@ -3710,20 +3729,33 @@ void msm_ipc_router_xprt_notify(struct msm_ipc_router_xprt *xprt,
 	if (!data)
 		return;
 
-	while (!xprt_info) {
-		msleep(100);
-		xprt_info = xprt->priv;
+	if (!wait_event_timeout(ipc_router_xprt_open_wait,
+				ACCESS_ONCE(xprt->priv),
+				msecs_to_jiffies(2000))) {
+		pr_warn_ratelimited("IPC router: transport %s did not open\n",
+				    xprt->name);
+		return;
 	}
 
 	pkt = clone_pkt((struct rr_packet *)data);
 	if (!pkt)
 		return;
 
+	down_read(&ipc_router_xprt_priv_lock);
+	xprt_info = xprt->priv;
+	if (!xprt_info) {
+		up_read(&ipc_router_xprt_priv_lock);
+		release_pkt(pkt);
+		return;
+	}
+
 	mutex_lock(&xprt_info->rx_lock_lhb2);
+	if (list_empty(&xprt_info->pkt_list))
+		__pm_stay_awake(&xprt_info->ws);
 	list_add_tail(&pkt->list, &xprt_info->pkt_list);
-	__pm_stay_awake(&xprt_info->ws);
-	mutex_unlock(&xprt_info->rx_lock_lhb2);
 	queue_work(xprt_info->workqueue, &xprt_info->read_data);
+	mutex_unlock(&xprt_info->rx_lock_lhb2);
+	up_read(&ipc_router_xprt_priv_lock);
 }
 
 static int msm_ipc_router_init(void)
