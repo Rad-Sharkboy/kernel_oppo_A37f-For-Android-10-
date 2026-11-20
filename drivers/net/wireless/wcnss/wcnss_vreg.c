@@ -470,7 +470,7 @@ fail:
 /* Helper routine to turn off all WCNSS & IRIS vregs */
 static void wcnss_vregs_off(struct vregs_info regulators[], uint size)
 {
-	int i, rc = 0;
+	int i, rc;
 	struct wcnss_wlan_config *cfg;
 
 	cfg = wcnss_get_wlan_config();
@@ -497,15 +497,14 @@ static void wcnss_vregs_off(struct vregs_info regulators[], uint size)
 		/* Set voltage to lowest level */
 		if (regulators[i].state & VREG_SET_VOLTAGE_MASK) {
 
-			if (cfg->vbatt < WCNSS_VBATT_THRESHOLD
-			  && !memcmp(regulators[i].name,
-				VDD_PA, sizeof(VDD_PA))) {
-				regulators[i].max_voltage = WCNSS_VBATT_LOW;
-			}
+			int max_voltage = regulators[i].max_voltage;
+
+			if (cfg->vbatt < WCNSS_VBATT_THRESHOLD &&
+			    !strcmp(regulators[i].name, VDD_PA))
+				max_voltage = WCNSS_VBATT_LOW;
 
 			rc = regulator_set_voltage(regulators[i].regulator,
-					regulators[i].low_power_min,
-					regulators[i].max_voltage);
+					regulators[i].low_power_min, max_voltage);
 			if (rc)
 				pr_err("regulator_set_voltage(%s) failed (%d)\n",
 						regulators[i].name, rc);
@@ -523,6 +522,7 @@ static void wcnss_vregs_off(struct vregs_info regulators[], uint size)
 		if (regulators[i].state & VREG_GET_REGULATOR_MASK)
 			regulator_put(regulators[i].regulator);
 
+		regulators[i].regulator = NULL;
 		regulators[i].state = VREG_NULL_CONFIG;
 	}
 }
@@ -557,16 +557,17 @@ static int wcnss_vregs_on(struct device *dev,
 		if ((regulators[i].nominal_min || regulators[i].max_voltage)
 				&& (reg_cnt > 0)) {
 
-			if (cfg->vbatt < WCNSS_VBATT_THRESHOLD
-			  && !memcmp(regulators[i].name,
-				VDD_PA, sizeof(VDD_PA))) {
-				regulators[i].nominal_min = WCNSS_VBATT_INITIAL;
-				regulators[i].max_voltage = WCNSS_VBATT_LOW;
+			int nominal_min = regulators[i].nominal_min;
+			int max_voltage = regulators[i].max_voltage;
+
+			if (cfg->vbatt < WCNSS_VBATT_THRESHOLD &&
+			    !strcmp(regulators[i].name, VDD_PA)) {
+				nominal_min = WCNSS_VBATT_INITIAL;
+				max_voltage = WCNSS_VBATT_LOW;
 			}
 
 			rc = regulator_set_voltage(regulators[i].regulator,
-					regulators[i].nominal_min,
-					regulators[i].max_voltage);
+					nominal_min, max_voltage);
 			if (rc) {
 				pr_err("regulator_set_voltage(%s) failed (%d)\n",
 						regulators[i].name, rc);
@@ -771,11 +772,11 @@ int wcnss_req_power_on_lock(char *driver_name)
 	struct host_driver *node;
 
 	if (!driver_name)
-		goto err;
+		return -EINVAL;
 
-	node = kmalloc(sizeof(struct host_driver), GFP_KERNEL);
+	node = kmalloc(sizeof(*node), GFP_KERNEL);
 	if (!node)
-		goto err;
+		return -ENOMEM;
 	strlcpy(node->name, driver_name, sizeof(node->name));
 
 	mutex_lock(&list_lock);
@@ -783,41 +784,40 @@ int wcnss_req_power_on_lock(char *driver_name)
 	if (list_empty(&power_on_lock_list))
 		down(&wcnss_power_on_lock);
 	list_add(&node->list, &power_on_lock_list);
-	mutex_unlock(&list_lock);
-
 	if (wlan_indication_led)
 		led_trigger_event(wlan_indication_led, LED_FULL);
+	mutex_unlock(&list_lock);
 
 	return 0;
-
-err:
-	return -EINVAL;
 }
 EXPORT_SYMBOL(wcnss_req_power_on_lock);
 
 int wcnss_free_power_on_lock(char *driver_name)
 {
-	int ret = -1;
 	struct host_driver *node;
+	bool released = false;
+
+	if (!driver_name)
+		return -EINVAL;
 
 	mutex_lock(&list_lock);
 	list_for_each_entry(node, &power_on_lock_list, list) {
-		if (!strncmp(node->name, driver_name, sizeof(node->name))) {
-			list_del(&node->list);
-			kfree(node);
-			ret = 0;
-			break;
+		if (strncmp(node->name, driver_name, sizeof(node->name)))
+			continue;
+
+		list_del(&node->list);
+		kfree(node);
+		released = true;
+		if (list_empty(&power_on_lock_list)) {
+			up(&wcnss_power_on_lock);
+			if (wlan_indication_led)
+				led_trigger_event(wlan_indication_led, LED_OFF);
 		}
+		break;
 	}
-	/* unlock when the last host driver frees the lock */
-	if (list_empty(&power_on_lock_list))
-		up(&wcnss_power_on_lock);
 	mutex_unlock(&list_lock);
 
-	if (wlan_indication_led)
-		led_trigger_event(wlan_indication_led, LED_OFF);
-
-	return ret;
+	return released ? 0 : -ENOENT;
 }
 EXPORT_SYMBOL(wcnss_free_power_on_lock);
 

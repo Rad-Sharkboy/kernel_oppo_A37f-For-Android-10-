@@ -356,6 +356,10 @@ static struct {
 	struct resource	*gpios_5wire;
 	const struct dev_pm_ops *pm_ops;
 	int		triggered;
+	int		trigger_error;
+	bool		wake_initialized;
+	bool		notifier_ready;
+	struct clk	*snoc_qosgen;
 	int		smd_channel_ready;
 	u32		wlan_rx_buff_count;
 	smd_channel_t	*smd_ch;
@@ -426,10 +430,14 @@ static struct {
 	struct mutex pm_qos_mutex;
 } *penv = NULL;
 
+static DEFINE_MUTEX(wcnss_config_lock);
+
 static ssize_t wcnss_wlan_macaddr_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
+	unsigned int octets[WLAN_MAC_ADDR_SIZE];
 	char macAddr[WLAN_MAC_ADDR_SIZE];
+	int i;
 
 	if (!penv)
 		return -ENODEV;
@@ -437,12 +445,18 @@ static ssize_t wcnss_wlan_macaddr_store(struct device *dev,
 	pr_debug("%s: Receive MAC Addr From user space: %s\n", __func__, buf);
 
 	if (WLAN_MAC_ADDR_SIZE != sscanf(buf, MAC_ADDRESS_STR,
-		 (int *)&macAddr[0], (int *)&macAddr[1],
-		 (int *)&macAddr[2], (int *)&macAddr[3],
-		 (int *)&macAddr[4], (int *)&macAddr[5])) {
+		 &octets[0], &octets[1],
+		 &octets[2], &octets[3],
+		 &octets[4], &octets[5])) {
 
 		pr_err("%s: Failed to Copy MAC\n", __func__);
 		return -EINVAL;
+	}
+
+	for (i = 0; i < WLAN_MAC_ADDR_SIZE; i++) {
+		if (octets[i] > 0xff)
+			return -EINVAL;
+		macAddr[i] = octets[i];
 	}
 
 	memcpy(penv->wlan_nv_macAddr, macAddr, sizeof(penv->wlan_nv_macAddr));
@@ -1072,7 +1086,7 @@ void wcnss_log_debug_regs_on_bite(void)
 	struct clk *wcnss_debug_mux;
 	unsigned long clk_rate;
 
-	if (wcnss_hardware_type() != WCNSS_PRONTO_HW)
+	if (!pdev || wcnss_hardware_type() != WCNSS_PRONTO_HW)
 		return;
 
 	measure = clk_get(&pdev->dev, "measure");
@@ -1081,12 +1095,12 @@ void wcnss_log_debug_regs_on_bite(void)
 	if (!IS_ERR(measure) && !IS_ERR(wcnss_debug_mux)) {
 		if (clk_set_parent(measure, wcnss_debug_mux)) {
 			pr_err("Setting measure clk parent failed\n");
-			return;
+			goto put_clocks;
 		}
 
 		if (clk_prepare_enable(measure)) {
 			pr_err("measure clk enable failed\n");
-			return;
+			goto put_clocks;
 		}
 
 		clk_rate = clk_get_rate(measure);
@@ -1103,6 +1117,11 @@ void wcnss_log_debug_regs_on_bite(void)
 
 		clk_disable_unprepare(measure);
 	}
+put_clocks:
+	if (!IS_ERR(wcnss_debug_mux))
+		clk_put(wcnss_debug_mux);
+	if (!IS_ERR(measure))
+		clk_put(measure);
 }
 #endif
 
@@ -1251,8 +1270,7 @@ static void wcnss_smd_notify_event(void *data, unsigned int event)
 				WCNSS_CTRL_CHANNEL);
 		schedule_work(&penv->wcnssctrl_version_work);
 		schedule_work(&penv->wcnss_pm_config_work);
-		cancel_delayed_work(&penv->wcnss_pm_qos_del_req);
-		schedule_delayed_work(&penv->wcnss_pm_qos_del_req, 0);
+		mod_delayed_work(system_wq, &penv->wcnss_pm_qos_del_req, 0);
 		if (penv->wlan_config.is_pronto_v3 && (penv->vadc_dev))
 			schedule_work(&penv->wcnss_vadc_work);
 		break;
@@ -1352,6 +1370,15 @@ wcnss_pronto_gpios_config(struct platform_device *pdev, bool enable)
 	int i, j;
 	int WCNSS_WLAN_NUM_GPIOS = 5;
 
+	if (!enable) {
+		if (penv->use_pinctrl)
+			return wcnss_pinctrl_set_state(false);
+
+		for (i = 0; i < WCNSS_WLAN_NUM_GPIOS; i++)
+			gpio_free(of_get_gpio(pdev->dev.of_node, i));
+		return 0;
+	}
+
 	/* Use Pinctrl to configure 5 wire GPIOs */
 	rc = wcnss_pinctrl_init(pdev);
 	if (rc) {
@@ -1370,23 +1397,17 @@ wcnss_pronto_gpios_config(struct platform_device *pdev, bool enable)
 gpio_probe:
 	for (i = 0; i < WCNSS_WLAN_NUM_GPIOS; i++) {
 		int gpio = of_get_gpio(pdev->dev.of_node, i);
-		if (enable) {
-			rc = gpio_request(gpio, "wcnss_wlan");
-			if (rc) {
-				pr_err("WCNSS gpio_request %d err %d\n",
-					gpio, rc);
-				goto fail;
-			}
-		} else
-			gpio_free(gpio);
+		rc = gpio_request(gpio, "wcnss_wlan");
+		if (rc) {
+			pr_err("WCNSS gpio_request %d err %d\n", gpio, rc);
+			goto fail;
+		}
 	}
 	return rc;
 
 fail:
-	for (j = WCNSS_WLAN_NUM_GPIOS-1; j >= 0; j--) {
-		int gpio = of_get_gpio(pdev->dev.of_node, i);
-		gpio_free(gpio);
-	}
+	for (j = i - 1; j >= 0; j--)
+		gpio_free(of_get_gpio(pdev->dev.of_node, j));
 	return rc;
 }
 
@@ -1748,14 +1769,14 @@ static int wcnss_wlan_resume(struct device *dev)
 
 void wcnss_prevent_suspend()
 {
-	if (penv)
+	if (penv && penv->wake_initialized)
 		wake_lock(&penv->wcnss_wake_lock);
 }
 EXPORT_SYMBOL(wcnss_prevent_suspend);
 
 void wcnss_allow_suspend()
 {
-	if (penv)
+	if (penv && penv->wake_initialized)
 		wake_unlock(&penv->wcnss_wake_lock);
 }
 EXPORT_SYMBOL(wcnss_allow_suspend);
@@ -1860,7 +1881,6 @@ static int wcnss_get_battery_volt(int *result_uv)
 static void wcnss_notify_vbat(enum qpnp_tm_state state, void *ctx)
 {
 	mutex_lock(&penv->vbat_monitor_mutex);
-	cancel_delayed_work_sync(&penv->vbatt_work);
 
 	if (state == ADC_TM_LOW_STATE) {
 		pr_debug("wcnss: low voltage notification triggered\n");
@@ -1888,7 +1908,7 @@ static void wcnss_notify_vbat(enum qpnp_tm_state state, void *ctx)
 
 	qpnp_adc_tm_channel_measure(penv->adc_tm_dev,
 			&penv->vbat_monitor_params);
-	schedule_delayed_work(&penv->vbatt_work, msecs_to_jiffies(2000));
+	mod_delayed_work(system_wq, &penv->vbatt_work, msecs_to_jiffies(2000));
 	mutex_unlock(&penv->vbat_monitor_mutex);
 }
 
@@ -1900,6 +1920,7 @@ static int wcnss_setup_vbat_monitoring(void)
 		pr_err("wcnss: not setting up vbatt\n");
 		return rc;
 	}
+	mutex_lock(&penv->vbat_monitor_mutex);
 	penv->vbat_monitor_params.low_thr = WCNSS_VBATT_THRESHOLD;
 	penv->vbat_monitor_params.high_thr = WCNSS_VBATT_THRESHOLD;
 	penv->vbat_monitor_params.state_request = ADC_TM_HIGH_LOW_THR_ENABLE;
@@ -1915,6 +1936,7 @@ static int wcnss_setup_vbat_monitoring(void)
 					&penv->vbat_monitor_params);
 	if (rc)
 		pr_err("wcnss: tm setup failed: %d\n", rc);
+	mutex_unlock(&penv->vbat_monitor_mutex);
 
 	return rc;
 }
@@ -1943,34 +1965,23 @@ static void wcnss_send_vbatt_indication(struct work_struct *work)
 static void wcnss_update_vbatt(struct work_struct *work)
 {
 	struct vbatt_message vbatt_msg;
-	int ret = 0;
+	int ret;
 
 	vbatt_msg.hdr.msg_type = WCNSS_VBATT_LEVEL_IND;
-	vbatt_msg.hdr.msg_len = sizeof(struct vbatt_message);
+	vbatt_msg.hdr.msg_len = sizeof(vbatt_msg);
 	vbatt_msg.vbatt.threshold = WCNSS_VBATT_THRESHOLD;
 
 	mutex_lock(&penv->vbat_monitor_mutex);
-	if (penv->vbat_monitor_params.low_thr &&
-		(penv->fw_vbatt_state == WCNSS_VBATT_LOW ||
-			penv->fw_vbatt_state == WCNSS_CONFIG_UNSPECIFIED)) {
-		vbatt_msg.vbatt.curr_volt = WCNSS_VBATT_HIGH;
-		penv->fw_vbatt_state = WCNSS_VBATT_HIGH;
-		pr_debug("wcnss: send HIGH BATT to FW\n");
-	} else if (!penv->vbat_monitor_params.low_thr &&
-		(penv->fw_vbatt_state == WCNSS_VBATT_HIGH ||
-			penv->fw_vbatt_state == WCNSS_CONFIG_UNSPECIFIED)){
-		vbatt_msg.vbatt.curr_volt = WCNSS_VBATT_LOW;
-		penv->fw_vbatt_state = WCNSS_VBATT_LOW;
-		pr_debug("wcnss: send LOW BATT to FW\n");
-	} else {
-		mutex_unlock(&penv->vbat_monitor_mutex);
-		return;
+	vbatt_msg.vbatt.curr_volt = penv->vbat_monitor_params.low_thr ?
+				WCNSS_VBATT_HIGH : WCNSS_VBATT_LOW;
+	if (penv->fw_vbatt_state != vbatt_msg.vbatt.curr_volt) {
+		ret = wcnss_smd_tx(&vbatt_msg, vbatt_msg.hdr.msg_len);
+		if (ret < 0)
+			pr_err("wcnss: smd tx failed: %d\n", ret);
+		else
+			penv->fw_vbatt_state = vbatt_msg.vbatt.curr_volt;
 	}
 	mutex_unlock(&penv->vbat_monitor_mutex);
-	ret = wcnss_smd_tx(&vbatt_msg, vbatt_msg.hdr.msg_len);
-	if (ret < 0)
-		pr_err("wcnss: smd tx failed\n");
-	return;
 }
 
 
@@ -2754,6 +2765,7 @@ wcnss_trigger_config(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&penv->wcnss_pm_qos_del_req, wcnss_pm_qos_enable_pc);
 
 	wake_lock_init(&penv->wcnss_wake_lock, WAKE_LOCK_SUSPEND, "wcnss");
+	penv->wake_initialized = true;
 	/* Add pm_qos request to disable power collapse for DDR */
 	wcnss_disable_pc_add_req();
 
@@ -3006,7 +3018,9 @@ wcnss_trigger_config(struct platform_device *pdev)
 	} else {
 		if (clk_prepare_enable(snoc_qosgen)) {
 			pr_err("snoc_qosgen enable failed\n");
+			clk_put(snoc_qosgen);
 		} else {
+			penv->snoc_qosgen = snoc_qosgen;
 			pr_info("snoc_qosgen configured successfully\n");
 		}
 	}
@@ -3028,6 +3042,7 @@ wcnss_trigger_config(struct platform_device *pdev)
 		}
 	}
 
+	penv->notifier_ready = true;
 	do {
 		/* trigger initialization of the WCNSS */
 		penv->pil = subsystem_get(WCNSS_PIL_DEVICE);
@@ -3041,9 +3056,6 @@ wcnss_trigger_config(struct platform_device *pdev)
 
 	if (IS_ERR(penv->pil)) {
 		wcnss_reset_intr();
-		if (penv->wcnss_notif_hdle)
-			subsys_notif_unregister_notifier(penv->wcnss_notif_hdle,
-				&wnb);
 		penv->pil = NULL;
 		goto fail_ioremap2;
 	}
@@ -3057,10 +3069,25 @@ wcnss_trigger_config(struct platform_device *pdev)
 	return 0;
 
 fail_ioremap2:
-	if (penv->fiq_reg)
+	if (penv->fiq_reg) {
 		iounmap(penv->fiq_reg);
+		penv->fiq_reg = NULL;
+	}
 fail_ioremap:
+	if (penv->wcnss_notif_hdle) {
+		subsys_notif_unregister_notifier(penv->wcnss_notif_hdle, &wnb);
+		penv->wcnss_notif_hdle = NULL;
+	}
+	penv->notifier_ready = false;
+	cancel_delayed_work_sync(&penv->wcnss_pm_qos_del_req);
+	wcnss_disable_pc_remove_req();
 	wake_lock_destroy(&penv->wcnss_wake_lock);
+	penv->wake_initialized = false;
+	if (penv->snoc_qosgen) {
+		clk_disable_unprepare(penv->snoc_qosgen);
+		clk_put(penv->snoc_qosgen);
+		penv->snoc_qosgen = NULL;
+	}
 fail_res:
 	if (!has_pronto_hw)
 		wcnss_gpios_config(penv->gpios_5wire, false);
@@ -3069,8 +3096,8 @@ fail_res:
 	else
 		wcnss_pronto_gpios_config(pdev, false);
 fail_gpio_res:
-	wcnss_disable_pc_remove_req();
-	penv = NULL;
+	penv->triggered = 0;
+	penv->trigger_error = ret;
 	return ret;
 }
 
@@ -3113,17 +3140,17 @@ static int wcnss_node_open(struct inode *inode, struct file *file)
 	struct platform_device *pdev;
 	int rc = 0;
 
-	if (!penv)
-		return -EFAULT;
-
-	if (!penv->triggered) {
+	mutex_lock(&wcnss_config_lock);
+	if (!penv) {
+		rc = -ENODEV;
+	} else if (penv->trigger_error) {
+		rc = penv->trigger_error;
+	} else if (!penv->triggered) {
 		pr_info(DEVICE " triggered by userspace\n");
 		pdev = penv->pdev;
 		rc = wcnss_trigger_config(pdev);
-		if (rc)
-			return -EFAULT;
 	}
-
+	mutex_unlock(&wcnss_config_lock);
 	return rc;
 }
 
@@ -3238,15 +3265,19 @@ static int wcnss_notif_cb(struct notifier_block *this, unsigned long code,
 	struct notif_data *data = (struct notif_data *)ss_handle;
 	int ret, xo_mode;
 
+	if (!penv || !penv->notifier_ready)
+		return NOTIFY_DONE;
+
 	pr_info("%s: wcnss notification event: %lu\n", __func__, code);
 
 	if (code == SUBSYS_PROXY_VOTE) {
 		if (pdev && pwlanconfig) {
 			ret = wcnss_wlan_power(&pdev->dev, pwlanconfig,
 					WCNSS_WLAN_SWITCH_ON, &xo_mode);
-			wcnss_set_iris_xo_mode(xo_mode);
 			if (ret)
 				pr_err("Failed to execute wcnss_wlan_power\n");
+			else
+				wcnss_set_iris_xo_mode(xo_mode);
 		}
 	} else if (code == SUBSYS_PROXY_UNVOTE) {
 		if (pdev && pwlanconfig) {
@@ -3319,21 +3350,8 @@ wcnss_wlan_probe(struct platform_device *pdev)
 		devm_kzalloc(&pdev->dev, MAX_CALIBRATED_DATA_SIZE, GFP_KERNEL);
 	if (!penv->user_cal_data) {
 		dev_err(&pdev->dev, "Failed to alloc memory for cal data.\n");
-		return -ENOMEM;
-	}
-
-	/* register sysfs entries */
-	ret = wcnss_create_sysfs(&pdev->dev);
-	if (ret) {
-		penv = NULL;
-		return -ENOENT;
-	}
-
-	/* register wcnss event notification */
-	penv->wcnss_notif_hdle = subsys_notif_register_notifier("wcnss", &wnb);
-	if (IS_ERR(penv->wcnss_notif_hdle)) {
-		pr_err("wcnss: register event notification failed!\n");
-		return PTR_ERR(penv->wcnss_notif_hdle);
+		ret = -ENOMEM;
+		goto clear_env;
 	}
 
 	mutex_init(&penv->dev_lock);
@@ -3347,27 +3365,52 @@ wcnss_wlan_probe(struct platform_device *pdev)
 	penv->user_cal_exp_size = 0;
 	penv->user_cal_available = false;
 
-	/* Since we were built into the kernel we'll be called as part
-	 * of kernel initialization.  We don't know if userspace
-	 * applications are available to service PIL at this time
-	 * (they probably are not), so we simply create a device node
-	 * here.  When userspace is available it should touch the
-	 * device so that we know that WCNSS configuration can take
-	 * place
-	 */
-	pr_info(DEVICE " probed in built-in mode\n");
+	ret = wcnss_create_sysfs(&pdev->dev);
+	if (ret)
+		goto clear_env;
 
-	misc_register(&wcnss_usr_ctrl);
+	penv->wcnss_notif_hdle = subsys_notif_register_notifier("wcnss", &wnb);
+	if (IS_ERR(penv->wcnss_notif_hdle)) {
+		ret = PTR_ERR(penv->wcnss_notif_hdle);
+		goto remove_sysfs;
+	}
 
-	return misc_register(&wcnss_misc);
+	ret = misc_register(&wcnss_usr_ctrl);
+	if (ret)
+		goto unregister_notifier;
+	ret = misc_register(&wcnss_misc);
+	if (!ret)
+		return 0;
 
+	misc_deregister(&wcnss_usr_ctrl);
+unregister_notifier:
+	subsys_notif_unregister_notifier(penv->wcnss_notif_hdle, &wnb);
+remove_sysfs:
+	wcnss_remove_sysfs(&pdev->dev);
+clear_env:
+	penv = NULL;
+	return ret;
 }
 
 static int
 wcnss_wlan_remove(struct platform_device *pdev)
 {
+	if (!penv)
+		return 0;
+
+	misc_deregister(&wcnss_misc);
+	misc_deregister(&wcnss_usr_ctrl);
 	if (penv->wcnss_notif_hdle)
 		subsys_notif_unregister_notifier(penv->wcnss_notif_hdle, &wnb);
+	if (penv->wake_initialized) {
+		cancel_delayed_work_sync(&penv->wcnss_pm_qos_del_req);
+		wcnss_disable_pc_remove_req();
+		wake_lock_destroy(&penv->wcnss_wake_lock);
+	}
+	if (penv->snoc_qosgen) {
+		clk_disable_unprepare(penv->snoc_qosgen);
+		clk_put(penv->snoc_qosgen);
+	}
 	wcnss_remove_sysfs(&pdev->dev);
 	penv = NULL;
 	return 0;
@@ -3401,20 +3444,34 @@ static struct platform_driver wcnss_wlan_driver = {
 
 static int __init wcnss_wlan_init(void)
 {
-	platform_driver_register(&wcnss_wlan_driver);
-	platform_driver_register(&wcnss_wlan_ctrl_driver);
-	platform_driver_register(&wcnss_ctrl_driver);
-	register_pm_notifier(&wcnss_pm_notifier);
+	int ret;
 
-	return 0;
+	ret = platform_driver_register(&wcnss_wlan_driver);
+	if (ret)
+		return ret;
+	ret = platform_driver_register(&wcnss_wlan_ctrl_driver);
+	if (ret)
+		goto unregister_wlan;
+	ret = platform_driver_register(&wcnss_ctrl_driver);
+	if (ret)
+		goto unregister_wlan_ctrl;
+	ret = register_pm_notifier(&wcnss_pm_notifier);
+	if (!ret)
+		return 0;
+
+	platform_driver_unregister(&wcnss_ctrl_driver);
+unregister_wlan_ctrl:
+	platform_driver_unregister(&wcnss_wlan_ctrl_driver);
+unregister_wlan:
+	platform_driver_unregister(&wcnss_wlan_driver);
+	return ret;
 }
 
 static void __exit wcnss_wlan_exit(void)
 {
-	if (penv) {
-		if (penv->pil)
-			subsystem_put(penv->pil);
-		penv = NULL;
+	if (penv && penv->pil) {
+		subsystem_put(penv->pil);
+		penv->pil = NULL;
 	}
 
 	unregister_pm_notifier(&wcnss_pm_notifier);
