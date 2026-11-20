@@ -216,6 +216,7 @@ struct qpnp_adc_tm_chip {
 	struct work_struct		threshold_work;
 	bool				high_irq_wake;
 	bool				low_irq_wake;
+	u32				last_btm_channel;
 	struct qpnp_adc_tm_sensor	sensor[0];
 };
 
@@ -521,37 +522,28 @@ static int32_t qpnp_adc_tm_get_btm_idx(uint32_t btm_chan,
 static int32_t qpnp_adc_tm_check_revision(struct qpnp_adc_tm_chip *chip,
 							uint32_t btm_chan_num)
 {
-	u8 rev, perph_subtype;
-	int rc = 0;
+	u32 limit = ACCESS_ONCE(chip->last_btm_channel);
+	u8 id[QPNP_PERPH_SUBTYPE - QPNP_REVISION3 + 1];
+	int rc;
 
-	rc = qpnp_adc_tm_read_reg(chip, QPNP_REVISION3, &rev);
-	if (rc) {
-		pr_err("adc-tm revision read failed\n");
-		return rc;
-	}
-
-	rc = qpnp_adc_tm_read_reg(chip, QPNP_PERPH_SUBTYPE, &perph_subtype);
-	if (rc) {
-		pr_err("adc-tm perph_subtype read failed\n");
-		return rc;
-	}
-
-	if (perph_subtype == QPNP_PERPH_TYPE2) {
-		if ((rev < QPNP_REVISION_EIGHT_CHANNEL_SUPPORT) &&
-			(btm_chan_num > QPNP_ADC_TM_M4_ADC_CH_SEL_CTL)) {
-			pr_debug("Version does not support more than 5 channels\n");
-			return -EINVAL;
+	if (!limit) {
+		rc = qpnp_adc_tm_read_regs(chip, QPNP_REVISION3, id, sizeof(id));
+		if (rc)
+			return rc;
+		switch (id[QPNP_PERPH_SUBTYPE - QPNP_REVISION3]) {
+		case QPNP_PERPH_SUBTYPE_TWO_CHANNEL_SUPPORT:
+			limit = QPNP_ADC_TM_M1_ADC_CH_SEL_CTL;
+			break;
+		case QPNP_PERPH_TYPE2:
+			limit = id[0] < QPNP_REVISION_EIGHT_CHANNEL_SUPPORT ?
+				QPNP_ADC_TM_M4_ADC_CH_SEL_CTL : QPNP_ADC_TM_M7_ADC_CH_SEL_CTL;
+			break;
+		default:
+			limit = QPNP_ADC_TM_M7_ADC_CH_SEL_CTL;
 		}
+		ACCESS_ONCE(chip->last_btm_channel) = limit;
 	}
-
-	if (perph_subtype == QPNP_PERPH_SUBTYPE_TWO_CHANNEL_SUPPORT) {
-		if (btm_chan_num > QPNP_ADC_TM_M1_ADC_CH_SEL_CTL) {
-			pr_debug("Version does not support more than 2 channels\n");
-			return -EINVAL;
-		}
-	}
-
-	return rc;
+	return btm_chan_num <= limit ? 0 : -EINVAL;
 }
 
 static int32_t qpnp_adc_tm_timer_interval_select(
@@ -1013,11 +1005,10 @@ static int qpnp_adc_tm_get_trip_temp(struct thermal_zone_device *thermal,
 	struct qpnp_adc_tm_sensor *adc_tm_sensor = thermal->devdata;
 	struct qpnp_adc_tm_chip *chip = adc_tm_sensor->chip;
 	int64_t result = 0;
-	u8 trip_cool_thr0, trip_cool_thr1, trip_warm_thr0, trip_warm_thr1;
-	unsigned int reg, rc = 0;
-	uint16_t reg_low_thr_lsb, reg_low_thr_msb;
-	uint16_t reg_high_thr_lsb, reg_high_thr_msb;
-	uint32_t btm_chan_idx = 0, btm_chan = 0;
+	u8 threshold[2];
+	u16 addr;
+	u32 reg, btm_chan_idx;
+	int rc;
 
 	if (qpnp_adc_tm_is_valid(chip))
 		return -ENODEV;
@@ -1025,54 +1016,24 @@ static int qpnp_adc_tm_get_trip_temp(struct thermal_zone_device *thermal,
 	if (qpnp_adc_tm_check_revision(chip, adc_tm_sensor->btm_channel_num))
 		return -EINVAL;
 
-	btm_chan = adc_tm_sensor->btm_channel_num;
-	rc = qpnp_adc_tm_get_btm_idx(btm_chan, &btm_chan_idx);
-	if (rc < 0) {
-		pr_err("Invalid btm channel idx\n");
+	rc = qpnp_adc_tm_get_btm_idx(adc_tm_sensor->btm_channel_num, &btm_chan_idx);
+	if (rc)
 		return rc;
-	}
-
-	reg_low_thr_lsb = adc_tm_data[btm_chan_idx].low_thr_lsb_addr;
-	reg_low_thr_msb = adc_tm_data[btm_chan_idx].low_thr_msb_addr;
-	reg_high_thr_lsb = adc_tm_data[btm_chan_idx].high_thr_lsb_addr;
-	reg_high_thr_msb = adc_tm_data[btm_chan_idx].high_thr_msb_addr;
 
 	switch (trip) {
 	case ADC_TM_TRIP_HIGH_WARM:
-		rc = qpnp_adc_tm_read_reg(chip, reg_low_thr_lsb,
-							&trip_warm_thr0);
-		if (rc) {
-			pr_err("adc-tm low_thr_lsb err\n");
-			return rc;
-		}
-
-		rc = qpnp_adc_tm_read_reg(chip, reg_low_thr_msb,
-							&trip_warm_thr1);
-		if (rc) {
-			pr_err("adc-tm low_thr_msb err\n");
-			return rc;
-		}
-	reg = (trip_warm_thr1 << 8) | trip_warm_thr0;
-	break;
+		addr = adc_tm_data[btm_chan_idx].low_thr_lsb_addr;
+		break;
 	case ADC_TM_TRIP_LOW_COOL:
-		rc = qpnp_adc_tm_read_reg(chip, reg_high_thr_lsb,
-							&trip_cool_thr0);
-		if (rc) {
-			pr_err("adc-tm_tm high_thr_lsb err\n");
-			return rc;
-		}
-
-		rc = qpnp_adc_tm_read_reg(chip, reg_high_thr_msb,
-							&trip_cool_thr1);
-		if (rc) {
-			pr_err("adc-tm_tm high_thr_lsb err\n");
-			return rc;
-		}
-	reg = (trip_cool_thr1 << 8) | trip_cool_thr0;
-	break;
+		addr = adc_tm_data[btm_chan_idx].high_thr_lsb_addr;
+		break;
 	default:
 		return -EINVAL;
 	}
+	rc = qpnp_adc_tm_read_regs(chip, addr, threshold, sizeof(threshold));
+	if (rc)
+		return rc;
+	reg = (threshold[1] << 8) | threshold[0];
 
 	rc = qpnp_adc_tm_scale_voltage_therm_pu2(chip->vadc_dev, reg,
 								&result);
