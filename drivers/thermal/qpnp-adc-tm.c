@@ -297,17 +297,21 @@ static struct qpnp_adc_tm_reverse_scale_fn adc_tm_rscale_fn[] = {
 	[SCALE_QRD_SKUE_RBATT_THERM] = {qpnp_adc_qrd_skue_btm_scaler},
 };
 
-static int32_t qpnp_adc_tm_read_reg(struct qpnp_adc_tm_chip *chip,
-						int16_t reg, u8 *data)
+static int qpnp_adc_tm_read_regs(struct qpnp_adc_tm_chip *chip, u16 reg,
+				 u8 *data, unsigned int len)
 {
-	int rc = 0;
+	int rc;
 
-	rc = spmi_ext_register_readl(chip->adc->spmi->ctrl,
-		chip->adc->slave, (chip->adc->offset + reg), data, 1);
+	rc = spmi_ext_register_readl(chip->adc->spmi->ctrl, chip->adc->slave,
+				     chip->adc->offset + reg, data, len);
 	if (rc < 0)
-		pr_err("adc-tm read reg %d failed with %d\n", reg, rc);
-
+		pr_err("adc-tm read reg %x failed with %d\n", reg, rc);
 	return rc;
+}
+
+static int qpnp_adc_tm_read_reg(struct qpnp_adc_tm_chip *chip, u16 reg, u8 *data)
+{
+	return qpnp_adc_tm_read_regs(chip, reg, data, 1);
 }
 
 static int32_t qpnp_adc_tm_write_reg(struct qpnp_adc_tm_chip *chip,
@@ -777,52 +781,23 @@ static int32_t qpnp_adc_tm_read_thr_value(struct qpnp_adc_tm_chip *chip,
 	return rc;
 }
 
-static int32_t qpnp_adc_tm_thr_update(struct qpnp_adc_tm_chip *chip,
-			uint32_t btm_chan, int32_t high_thr, int32_t low_thr)
+static int qpnp_adc_tm_thr_update(struct qpnp_adc_tm_chip *chip, u32 channel,
+				  int high, int low)
 {
-	int rc = 0;
-	uint32_t btm_chan_idx = 0;
+	u8 values[] = {
+		QPNP_ADC_TM_THR_LSB_MASK(low), QPNP_ADC_TM_THR_MSB_MASK(low),
+		QPNP_ADC_TM_THR_LSB_MASK(high), QPNP_ADC_TM_THR_MSB_MASK(high)
+	};
+	u32 index;
+	int rc;
 
-	rc = qpnp_adc_tm_get_btm_idx(btm_chan, &btm_chan_idx);
-	if (rc < 0) {
-		pr_err("Invalid btm channel idx\n");
+	rc = qpnp_adc_tm_get_btm_idx(channel, &index);
+	if (rc)
 		return rc;
-	}
-
-	rc = qpnp_adc_tm_write_reg(chip,
-			adc_tm_data[btm_chan_idx].low_thr_lsb_addr,
-			QPNP_ADC_TM_THR_LSB_MASK(low_thr));
-	if (rc < 0) {
-		pr_err("low threshold lsb setting failed\n");
-		return rc;
-	}
-
-	rc = qpnp_adc_tm_write_reg(chip,
-		adc_tm_data[btm_chan_idx].low_thr_msb_addr,
-		QPNP_ADC_TM_THR_MSB_MASK(low_thr));
-	if (rc < 0) {
-		pr_err("low threshold msb setting failed\n");
-		return rc;
-	}
-
-	rc = qpnp_adc_tm_write_reg(chip,
-		adc_tm_data[btm_chan_idx].high_thr_lsb_addr,
-		QPNP_ADC_TM_THR_LSB_MASK(high_thr));
-	if (rc < 0) {
-		pr_err("high threshold lsb setting failed\n");
-		return rc;
-	}
-
-	rc = qpnp_adc_tm_write_reg(chip,
-		adc_tm_data[btm_chan_idx].high_thr_msb_addr,
-		QPNP_ADC_TM_THR_MSB_MASK(high_thr));
-	if (rc < 0)
-		pr_err("high threshold msb setting failed\n");
-
-	pr_debug("client requested high:%d and low:%d\n",
-		high_thr, low_thr);
-
-	return rc;
+	/* The four threshold bytes are consecutive in every comparator slot. */
+	return spmi_ext_register_writel(chip->adc->spmi->ctrl, chip->adc->slave,
+			chip->adc->offset + adc_tm_data[index].low_thr_lsb_addr,
+			values, sizeof(values));
 }
 
 static int qpnp_adc_tm_set_client_thresholds(struct qpnp_adc_tm_sensor *sensor)
@@ -1585,7 +1560,7 @@ static int qpnp_adc_tm_handle_threshold(struct qpnp_adc_tm_sensor *sensor,
 
 static int qpnp_adc_tm_read_status(struct qpnp_adc_tm_chip *chip)
 {
-	u8 low, high, meas_en, low_en, high_en;
+	u8 status[2], enables[3], low, high;
 	int i, rc, error = 0;
 
 	if (qpnp_adc_tm_is_valid(chip))
@@ -1597,24 +1572,16 @@ static int qpnp_adc_tm_read_status(struct qpnp_adc_tm_chip *chip)
 	if (rc)
 		goto out;
 
-	rc = qpnp_adc_tm_read_reg(chip, QPNP_ADC_TM_STATUS_LOW, &low);
+	rc = qpnp_adc_tm_read_regs(chip, QPNP_ADC_TM_STATUS_LOW, status,
+				   sizeof(status));
 	if (rc)
 		goto restart;
-	rc = qpnp_adc_tm_read_reg(chip, QPNP_ADC_TM_STATUS_HIGH, &high);
+	rc = qpnp_adc_tm_read_regs(chip, QPNP_ADC_TM_MULTI_MEAS_EN, enables,
+				   sizeof(enables));
 	if (rc)
 		goto restart;
-	rc = qpnp_adc_tm_read_reg(chip, QPNP_ADC_TM_LOW_THR_INT_EN, &low_en);
-	if (rc)
-		goto restart;
-	rc = qpnp_adc_tm_read_reg(chip, QPNP_ADC_TM_HIGH_THR_INT_EN, &high_en);
-	if (rc)
-		goto restart;
-	rc = qpnp_adc_tm_read_reg(chip, QPNP_ADC_TM_MULTI_MEAS_EN, &meas_en);
-	if (rc)
-		goto restart;
-
-	low &= low_en & meas_en;
-	high &= high_en & meas_en;
+	low = status[0] & enables[0] & enables[1];
+	high = status[1] & enables[0] & enables[2];
 	for (i = 0; i < chip->max_channels_available; i++) {
 		struct qpnp_adc_tm_sensor *sensor = &chip->sensor[i];
 		bool handled = false;
