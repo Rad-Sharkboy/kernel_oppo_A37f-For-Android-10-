@@ -1037,10 +1037,9 @@ static int msm_rpm_send_smd_buffer(char *buf, uint32_t size, bool noirq)
 	int ret;
 
 	spin_lock_irqsave(&msm_rpm_data.smd_lock_write, flags);
-	ret = smd_write_avail(msm_rpm_data.ch_info);
-
-	while ((ret = smd_write_avail(msm_rpm_data.ch_info)) < size) {
-		if (ret < 0)
+	for (;;) {
+		ret = smd_write_avail(msm_rpm_data.ch_info);
+		if (ret < 0 || (u32)ret >= size)
 			break;
 		if (!noirq) {
 			spin_unlock_irqrestore(&msm_rpm_data.smd_lock_write,
@@ -1144,7 +1143,8 @@ static int msm_rpm_send_data(struct msm_rpm_request *cdata,
 		return ret;
 	}
 
-	msm_rpm_add_wait_list(cdata->msg_hdr.msg_id);
+	if (msm_rpm_add_wait_list(cdata->msg_hdr.msg_id))
+		return 0;
 
 	ret = msm_rpm_send_smd_buffer(&cdata->buf[0], msg_size, noirq);
 
@@ -1156,14 +1156,14 @@ static int msm_rpm_send_data(struct msm_rpm_request *cdata,
 		trace_rpm_smd_send_active_set(cdata->msg_hdr.msg_id,
 					cdata->msg_hdr.resource_type,
 					cdata->msg_hdr.resource_id);
-	} else if (ret < msg_size) {
+	} else {
 		struct msm_rpm_wait_data *rc;
-		ret = 0;
 		pr_err("Failed to write data msg_size:%d ret:%d msg_id:%d\n",
 				msg_size, ret, cdata->msg_hdr.msg_id);
 		rc = msm_rpm_get_entry_from_msg_id(cdata->msg_hdr.msg_id);
 		if (rc)
 			msm_rpm_free_list_entry(rc);
+		ret = 0;
 	}
 	return ret;
 }
