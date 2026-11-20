@@ -577,8 +577,8 @@ int __wlan_hdd_ipv6_changed(struct notifier_block *nb,
               pAdapterNode->pAdapter->device_mode == WLAN_HDD_P2P_CLIENT))
         {
 
-            if (eConnectionState_Associated ==
-               WLAN_HDD_GET_STATION_CTX_PTR
+            if (data == NETDEV_UP &&
+                eConnectionState_Associated == WLAN_HDD_GET_STATION_CTX_PTR
                (pAdapterNode->pAdapter)->conn_info.connState)
                  sme_dhcp_done_ind(pHddCtx->hHal,
                        pAdapterNode->pAdapter->sessionId);
@@ -1065,9 +1065,6 @@ int __wlan_hdd_ipv4_changed(struct notifier_block *nb,
                             unsigned long data, void *arg)
 {
     struct in_ifaddr *ifa = (struct in_ifaddr *)arg;
-    struct in_ifaddr **ifap = NULL;
-    struct in_device *in_dev;
-
     struct net_device *ndev = ifa->ifa_dev->dev;
     hdd_adapter_list_node_t *pAdapterNode = NULL, *pNext = NULL;
     hdd_context_t *pHddCtx;
@@ -1090,8 +1087,8 @@ int __wlan_hdd_ipv4_changed(struct notifier_block *nb,
               pAdapterNode->pAdapter->device_mode == WLAN_HDD_P2P_CLIENT))
         {
 
-            if (eConnectionState_Associated ==
-               WLAN_HDD_GET_STATION_CTX_PTR
+            if (data == NETDEV_UP &&
+                eConnectionState_Associated == WLAN_HDD_GET_STATION_CTX_PTR
                (pAdapterNode->pAdapter)->conn_info.connState)
                  sme_dhcp_done_ind(pHddCtx->hHal,
                        pAdapterNode->pAdapter->sessionId);
@@ -1105,23 +1102,10 @@ int __wlan_hdd_ipv4_changed(struct notifier_block *nb,
                 return NOTIFY_DONE;
             }
 
-            if ((in_dev =
-                  __in_dev_get_rtnl(pAdapterNode->pAdapter->dev)) != NULL)
-            {
-                for (ifap = &in_dev->ifa_list; (ifa = *ifap) != NULL;
-                       ifap = &ifa->ifa_next)
-                {
-                    if (!strcmp(pAdapterNode->pAdapter->dev->name,
-                          ifa->ifa_label))
-                    {
-                        break; /* found */
-                    }
-                }
-            }
-            if(ifa && ifa->ifa_local)
-            {
+            if (pHddCtx->hdd_wlan_suspended &&
+                eConnectionState_Associated == WLAN_HDD_GET_STATION_CTX_PTR
+                    (pAdapterNode->pAdapter)->conn_info.connState)
                 schedule_work(&pAdapterNode->pAdapter->ipv4NotifierWorkQueue);
-            }
             break;
         }
         vos_status = hdd_get_next_adapter(pHddCtx, pAdapterNode, &pNext);
@@ -1157,31 +1141,42 @@ int wlan_hdd_ipv4_changed(struct notifier_block *nb,
             VOS_STATUS_SUCCESS - on successful operation
             VOS_STATUS_E_FAILURE - on failure of operation
 -----------------------------------------------------------------------------*/
+static __be32 hdd_arp_ipv4_addr(struct net_device *dev)
+{
+	struct in_device *in_dev;
+	struct in_ifaddr *ifa;
+	__be32 addr = 0;
+
+	rcu_read_lock();
+	in_dev = __in_dev_get_rcu(dev);
+	if (in_dev)
+		for (ifa = rcu_dereference(in_dev->ifa_list); ifa;
+		     ifa = rcu_dereference(ifa->ifa_next))
+			if (!strcmp(dev->name, ifa->ifa_label)) {
+				addr = ifa->ifa_local;
+				break;
+			}
+	rcu_read_unlock();
+	return addr;
+}
+
 VOS_STATUS hdd_conf_arp_offload(hdd_adapter_t *pAdapter, int fenable)
 {
-   struct in_ifaddr **ifap = NULL;
-   struct in_ifaddr *ifa = NULL;
-   struct in_device *in_dev;
-   int i = 0;
-   tSirHostOffloadReq  offLoadRequest;
+   __be32 addr = 0;
+   tSirHostOffloadReq offLoadRequest = { 0 };
    hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
 
    hddLog(VOS_TRACE_LEVEL_INFO, FL(" fenable = %d "), fenable);
 
-   if(fenable)
+   if (fenable)
+       addr = hdd_arp_ipv4_addr(pAdapter->dev);
+
+   /* Address changes during suspend can also remove the last IPv4 address. */
+   if (fenable == 2 && !addr)
+       fenable = FALSE;
+   if (fenable)
    {
-       if ((in_dev = __in_dev_get_rtnl(pAdapter->dev)) != NULL)
-       {
-           for (ifap = &in_dev->ifa_list; (ifa = *ifap) != NULL;
-                   ifap = &ifa->ifa_next)
-           {
-               if (!strcmp(pAdapter->dev->name, ifa->ifa_label))
-               {
-                   break; /* found */
-               }
-           }
-       }
-       if(ifa && ifa->ifa_local)
+       if (addr)
        {
            offLoadRequest.offloadType =  SIR_IPV4_ARP_REPLY_OFFLOAD;
            offLoadRequest.enableOrDisable = SIR_OFFLOAD_ENABLE;
@@ -1207,12 +1202,7 @@ VOS_STATUS hdd_conf_arp_offload(hdd_adapter_t *pAdapter, int fenable)
            hddLog(VOS_TRACE_LEVEL_INFO, "offload: arp filter programmed = %d",
                   offLoadRequest.enableOrDisable);
 
-           //converting u32 to IPV4 address
-           for(i = 0 ; i < 4; i++)
-           {
-              offLoadRequest.params.hostIpv4Addr[i] =
-                      (ifa->ifa_local >> (i*8) ) & 0xFF ;
-           }
+           memcpy(offLoadRequest.params.hostIpv4Addr, &addr, sizeof(addr));
            hddLog(VOS_TRACE_LEVEL_INFO, " Enable SME HostOffload: %d.%d.%d.%d",
                   offLoadRequest.params.hostIpv4Addr[0],
                   offLoadRequest.params.hostIpv4Addr[1],
@@ -1238,7 +1228,6 @@ VOS_STATUS hdd_conf_arp_offload(hdd_adapter_t *pAdapter, int fenable)
    }
    else
    {
-       vos_mem_zero((void *)&offLoadRequest, sizeof(tSirHostOffloadReq));
        offLoadRequest.enableOrDisable = SIR_OFFLOAD_DISABLE;
        offLoadRequest.offloadType =  SIR_IPV4_ARP_REPLY_OFFLOAD;
        hdd_wlan_offload_event(SIR_IPV4_ARP_REPLY_OFFLOAD,
@@ -1495,7 +1484,7 @@ static void hdd_suspend_ind_callback(void *context, VOS_STATUS status)
     complete(&adapter->wlan_suspend_comp_var);
 }
 
-static void hdd_conf_suspend_ind(hdd_context_t* pHddCtx,
+static bool hdd_conf_suspend_ind(hdd_context_t* pHddCtx,
                                  hdd_adapter_t *pAdapter)
 {
     eHalStatus halStatus = eHAL_STATUS_FAILURE;
@@ -1507,8 +1496,9 @@ static void hdd_conf_suspend_ind(hdd_context_t* pHddCtx,
     {
         hddLog(VOS_TRACE_LEVEL_FATAL,
            "%s: vos_mem_alloc failed ", __func__);
-        return;
+        return false;
     }
+    vos_mem_zero(wlanSuspendParam, sizeof(*wlanSuspendParam));
 
     hddLog(VOS_TRACE_LEVEL_INFO,
       "%s: send wlan suspend indication", __func__);
@@ -1555,7 +1545,9 @@ static void hdd_conf_suspend_ind(hdd_context_t* pHddCtx,
         hddLog(VOS_TRACE_LEVEL_ERROR,
             FL("sme_ConfigureSuspendInd returned failure %d"), halStatus);
         vos_mem_free(wlanSuspendParam);
+        return false;
     }
+    return true;
 }
 
 static void hdd_conf_resume_ind(hdd_adapter_t *pAdapter)
@@ -1661,9 +1653,10 @@ void hdd_suspend_wlan(void)
    while ( NULL != pAdapterNode && VOS_STATUS_SUCCESS == status )
    {
        pAdapter = pAdapterNode->pAdapter;
-       if ( (WLAN_HDD_INFRA_STATION != pAdapter->device_mode)
-         && (WLAN_HDD_SOFTAP != pAdapter->device_mode)
-         && (WLAN_HDD_P2P_CLIENT != pAdapter->device_mode) )
+       if (!pAdapter ||
+           (WLAN_HDD_INFRA_STATION != pAdapter->device_mode &&
+            WLAN_HDD_SOFTAP != pAdapter->device_mode &&
+            WLAN_HDD_P2P_CLIENT != pAdapter->device_mode))
 
        {  // we skip this registration for modes other than STA, SAP and P2P client modes.
            status = hdd_get_next_adapter ( pHddCtx, pAdapterNode, &pNext );
@@ -1704,14 +1697,14 @@ void hdd_suspend_wlan(void)
 
        INIT_COMPLETION(pAdapter->wlan_suspend_comp_var);
        /*Suspend notification sent down to driver*/
-       hdd_conf_suspend_ind(pHddCtx, pAdapter);
-       ret = wait_for_completion_interruptible_timeout(
-                   &pAdapter->wlan_suspend_comp_var,
-                   msecs_to_jiffies(WLAN_WAIT_TIME_FULL_PWR));
-       if (0 >= ret)
+       if (hdd_conf_suspend_ind(pHddCtx, pAdapter))
        {
-          hddLog(VOS_TRACE_LEVEL_ERROR, "%s:wait on suspend failed %ld",
-                 __func__, ret);
+           ret = wait_for_completion_interruptible_timeout(
+                       &pAdapter->wlan_suspend_comp_var,
+                       msecs_to_jiffies(WLAN_WAIT_TIME_FULL_PWR));
+           if (ret <= 0)
+               hddLog(VOS_TRACE_LEVEL_ERROR, "%s:wait on suspend failed %ld",
+                      __func__, ret);
        }
        status = hdd_get_next_adapter ( pHddCtx, pAdapterNode, &pNext );
        pAdapterNode = pNext;
@@ -2045,9 +2038,10 @@ void hdd_resume_wlan(void)
    while ( NULL != pAdapterNode && VOS_STATUS_SUCCESS == status )
    {
        pAdapter = pAdapterNode->pAdapter;
-       if ( (WLAN_HDD_INFRA_STATION != pAdapter->device_mode)
-         && (WLAN_HDD_SOFTAP != pAdapter->device_mode)
-         && (WLAN_HDD_P2P_CLIENT != pAdapter->device_mode) )
+       if (!pAdapter ||
+           (WLAN_HDD_INFRA_STATION != pAdapter->device_mode &&
+            WLAN_HDD_SOFTAP != pAdapter->device_mode &&
+            WLAN_HDD_P2P_CLIENT != pAdapter->device_mode))
        {  // we skip this registration for modes other than STA, SAP and P2P client modes.
             status = hdd_get_next_adapter ( pHddCtx, pAdapterNode, &pNext );
             pAdapterNode = pNext;

@@ -21277,7 +21277,9 @@ int __wlan_hdd_cfg80211_suspend_wlan(struct wiphy *wiphy,
     MTRACE(vos_trace(VOS_MODULE_ID_HDD,
                      TRACE_CODE_HDD_CFG80211_SUSPEND_WLAN,
                      NO_SESSION, pHddCtx->isWiphySuspended));
+    spin_lock(&pHddCtx->schedScan_lock);
     pHddCtx->isWiphySuspended = TRUE;
+    spin_unlock(&pHddCtx->schedScan_lock);
 
     EXIT();
 
