@@ -2012,9 +2012,12 @@ int32_t qpnp_adc_tm_channel_measure(struct qpnp_adc_tm_chip *chip,
 			chip->adc->adc_channels[dt_index].fast_avg_setup;
 	chip->adc->amux_prop->mode_sel =
 		ADC_OP_MEASUREMENT_INTERVAL << QPNP_OP_MODE_SHIFT;
-	adc_tm_rscale_fn[scale_type].chan(chip->vadc_dev, param,
+	rc = adc_tm_rscale_fn[scale_type].chan(chip->vadc_dev, param,
 			&chip->adc->amux_prop->chan_prop->low_thr,
 			&chip->adc->amux_prop->chan_prop->high_thr);
+	if (rc < 0)
+		goto fail_unlock;
+
 	rc = qpnp_adc_tm_add_to_list(chip, dt_index, param,
 				     chip->adc->amux_prop->chan_prop);
 	if (rc)
