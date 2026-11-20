@@ -389,7 +389,6 @@ struct opchg_charger {
 	int								sw_eoc_count;
 
 	atomic_t						bms_suspended;
-	unsigned long					soc_update_time;
 	unsigned long					soc_update_pre_time;
 	bool							check_stat_again;
 	bool							power_off;
