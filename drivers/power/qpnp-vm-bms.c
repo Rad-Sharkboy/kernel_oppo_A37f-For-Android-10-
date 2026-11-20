@@ -1901,6 +1901,8 @@ static void very_low_voltage_check(struct qpnp_bms_chip *chip, int vbat_uv)
 
 static void cv_voltage_check(struct qpnp_bms_chip *chip, int vbat_uv)
 {
+	bool charging = is_battery_charging(chip);
+
 	if (bms_wake_active(&chip->vbms_cv_wake_source)) {
 		if ((vbat_uv < (chip->dt.cfg_max_voltage_uv -
 				VBATT_ERROR_MARGIN + CV_DROP_MARGIN))
@@ -1908,13 +1910,13 @@ static void cv_voltage_check(struct qpnp_bms_chip *chip, int vbat_uv)
 			pr_debug("Fell below CV, releasing cv ws\n");
 			chip->in_cv_state = false;
 			bms_relax(&chip->vbms_cv_wake_source);
-		} else if (!is_battery_charging(chip)) {
+		} else if (!charging) {
 			pr_debug("charging stopped, releasing cv ws\n");
 			chip->in_cv_state = false;
 			bms_relax(&chip->vbms_cv_wake_source);
 		}
 	} else if (!bms_wake_active(&chip->vbms_cv_wake_source)
-			&& is_battery_charging(chip)
+			&& charging
 			&& ((vbat_uv > (chip->dt.cfg_max_voltage_uv -
 					VBATT_ERROR_MARGIN))
 				|| is_battery_taper_charging(chip))) {
@@ -2535,13 +2537,22 @@ static void qpnp_vm_bms_ext_power_changed(struct power_supply *psy)
 {
 	struct qpnp_bms_chip *chip = container_of(psy, struct qpnp_bms_chip,
 								bms_psy);
+	int old_status = chip->battery_status;
+	int old_present = chip->battery_present;
 
 	pr_debug("Triggered!\n");
 	battery_status_check(chip);
 	battery_insertion_check(chip);
 
 	mutex_lock(&chip->last_soc_mutex);
-	battery_voltage_check(chip);
+	/* The ADC threshold IRQ and SOC worker cover stable discharge. */
+	if (!chip->dt.cfg_use_voltage_soc ||
+	    old_status != chip->battery_status ||
+	    old_present != chip->battery_present ||
+	    is_battery_charging(chip) ||
+	    bms_wake_active(&chip->vbms_lv_wake_source) ||
+	    bms_wake_active(&chip->vbms_cv_wake_source))
+		battery_voltage_check(chip);
 	mutex_unlock(&chip->last_soc_mutex);
 
 	if (chip->reported_soc_in_use)
