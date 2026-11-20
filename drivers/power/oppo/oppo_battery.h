@@ -75,8 +75,6 @@ OPPO_BATTERY_EXT int opchg_inout_charge_parameters(struct opchg_charger *chip);
 OPPO_BATTERY_EXT int opchg_init_charge_parameters(struct opchg_charger *chip);
 #ifdef OPPO_USE_ADC_TM_IRQ
 OPPO_BATTERY_EXT void opchg_get_adc_notification(enum qpnp_tm_state state, void *ctx);
-#else
-OPPO_BATTERY_EXT void opchg_get_adc_notification(struct opchg_charger *chip);
 #endif
 OPPO_BATTERY_EXT void opchg_get_charger_ov_status(struct opchg_charger *chip);
 OPPO_BATTERY_EXT void opchg_get_battery_ov_status(struct opchg_charger *chip);

@@ -447,12 +447,9 @@ void opchg_get_adc_notification(enum qpnp_tm_state state, void *ctx)
 	opchg_get_tm_adc(chip, state, temp);
 }
 #else
-void opchg_get_adc_notification(struct opchg_charger *chip)
+static void opchg_check_temperature(struct opchg_charger *chip, int temp)
 {
-    int temp;
     int state = ADC_TM_STATE_NUM;
-
-    temp = opchg_get_prop_batt_temp(chip);
 
 	#ifdef OPCHARGER_DEBUG_ENABLE
 	pr_debug("temp = %d,state = %s,chip->adc_param.state_request=%d,chip->adc_param.low_temp=%d, chip->adc_param.high_temp=%d\n",
@@ -1472,7 +1469,10 @@ void opchg_check_status(struct opchg_charger *chip)
 	opchg_check_fast_to_standard_charging(chip);
 
 	opchg_check_recharging_voltage(chip);
-	opchg_get_adc_notification(chip);
+	chip->temperature = opchg_get_prop_batt_temp(chip);
+#ifndef OPPO_USE_ADC_TM_IRQ
+	opchg_check_temperature(chip, chip->temperature);
+#endif
     opchg_get_charger_ov_status(chip);
 	opchg_get_battery_ov_status(chip);
 
@@ -1486,7 +1486,6 @@ void opchg_check_status(struct opchg_charger *chip)
     #endif
     chip->bat_temp_status = opchg_get_prop_batt_health(chip);
 	chip->batterynotify = opchg_battery_notify_check(chip);
-    chip->temperature = opchg_get_prop_batt_temp(chip);
     chip->bat_instant_vol = opchg_get_prop_battery_voltage_now(chip);
     chip->charging_current = opchg_get_prop_current_now(chip);//1000;
     chip->charger_vol = opchg_get_prop_charger_voltage_now(chip);
