@@ -1881,7 +1881,7 @@ static int wcnss_get_battery_volt(int *result_uv)
 
 static void wcnss_notify_vbat(enum qpnp_tm_state state, void *ctx)
 {
-	struct wcnss_wlan_env *env = ctx;
+	typeof(penv) env = ctx;
 	int rc;
 
 	mutex_lock(&env->vbat_monitor_mutex);
