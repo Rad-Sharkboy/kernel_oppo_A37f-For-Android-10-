@@ -2595,15 +2595,14 @@ static int read_and_populate_fifo_data(struct qpnp_bms_chip *chip)
 		return 0;
 	}
 
-	/* read the FIFO data */
-	for (i = 0; i < fifo_count * 2; i++) {
+	/* SPMI long reads support eight contiguous bytes per transaction. */
+	for (i = 0; i < fifo_count * 2; i += 8) {
+		int len = min(8, fifo_count * 2 - i);
+
 		rc = qpnp_read_wrapper(chip, &fifo_data_raw[i],
-				chip->base + FIFO_0_LSB_REG + i, 1);
-		if (rc) {
-			pr_err("Unable to read FIFO register(%d) rc=%d\n",
-								i, rc);
+				       chip->base + FIFO_0_LSB_REG + i, len);
+		if (rc)
 			return rc;
-		}
 	}
 
 	/* populate the structure */
@@ -2632,7 +2631,7 @@ static int read_and_populate_fifo_data(struct qpnp_bms_chip *chip)
 		voltage_soc_avg += chip->bms_data.fifo_uv[j];
 	}
 	/* store the fifo average for voltage-based-soc */
-	chip->voltage_soc_uv = div_u64(voltage_soc_avg, fifo_count);
+	ACCESS_ONCE(chip->voltage_soc_uv) = div_u64(voltage_soc_avg, fifo_count);
 
 	return 0;
 }
