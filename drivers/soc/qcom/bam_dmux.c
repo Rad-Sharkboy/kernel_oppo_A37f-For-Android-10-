@@ -226,10 +226,12 @@ static void handle_bam_mux_cmd(struct rx_pkt_info *info);
 static void rx_timer_work_func(struct work_struct *work);
 static void queue_rx_work_func(struct work_struct *work);
 static int ssrestart_check(void);
+static void bam_power_retry_work(struct work_struct *work);
 
 static DECLARE_WORK(rx_timer_work, rx_timer_work_func);
 #define RX_REFILL_RETRY_MS 20
 static DECLARE_DELAYED_WORK(queue_rx_work, queue_rx_work_func);
+static DECLARE_DELAYED_WORK(bam_power_retry, bam_power_retry_work);
 
 static struct workqueue_struct *bam_mux_rx_workqueue;
 static struct workqueue_struct *bam_mux_tx_workqueue;
@@ -243,7 +245,7 @@ static struct srcu_struct bam_dmux_srcu;
 #define UL_WAKEUP_TIMEOUT_MS	2000
 static uint32_t ul_timeout_delay = UL_TIMEOUT_DELAY;
 static void toggle_apps_ack(void);
-static void reconnect_to_bam(void);
+static int reconnect_to_bam(void);
 static void disconnect_to_bam(void);
 static void ul_wakeup(void);
 static void ul_timeout(struct work_struct *work);
@@ -2004,52 +2006,54 @@ out:
 	mutex_unlock(&wakeup_lock);
 }
 
-static void reconnect_to_bam(void)
+static int reconnect_to_bam(void)
 {
-	int i;
+	int rc;
 
 	in_global_reset = 0;
 	in_ssr = 0;
 	vote_dfab();
 
 	if (ssr_skipped_disconnect) {
-		/* delayed to here to prevent bus stall */
+		/* These pipes cannot be touched until the modem powers back up. */
 		bam_ops->sps_disconnect_ptr(bam_tx_pipe);
 		bam_ops->sps_disconnect_ptr(bam_rx_pipe);
 		memset(rx_desc_mem_buf.base, 0, rx_desc_mem_buf.size);
 		memset(tx_desc_mem_buf.base, 0, tx_desc_mem_buf.size);
+		ssr_skipped_disconnect = 0;
 	}
-	ssr_skipped_disconnect = 0;
-	i = bam_ops->sps_device_reset_ptr(a2_device_handle);
-	if (i)
-		pr_err("%s: device reset failed rc = %d\n", __func__,
-								i);
-	i = bam_ops->sps_connect_ptr(bam_tx_pipe, &tx_connection);
-	if (i)
-		pr_err("%s: tx connection failed rc = %d\n", __func__,
-								i);
-	i = bam_ops->sps_connect_ptr(bam_rx_pipe, &rx_connection);
-	if (i)
-		pr_err("%s: rx connection failed rc = %d\n", __func__,
-								i);
-	i = bam_ops->sps_register_event_ptr(bam_tx_pipe,
-			&tx_register_event);
-	if (i)
-		pr_err("%s: tx event reg failed rc = %d\n", __func__,
-								i);
-	i = bam_ops->sps_register_event_ptr(bam_rx_pipe,
-			&rx_register_event);
-	if (i)
-		pr_err("%s: rx event reg failed rc = %d\n", __func__,
-									i);
-	bam_connection_is_active = 1;
+	rc = bam_ops->sps_device_reset_ptr(a2_device_handle);
+	if (rc)
+		goto unvote;
+	rc = bam_ops->sps_connect_ptr(bam_tx_pipe, &tx_connection);
+	if (rc)
+		goto unvote;
+	rc = bam_ops->sps_connect_ptr(bam_rx_pipe, &rx_connection);
+	if (rc)
+		goto disconnect_tx;
+	rc = bam_ops->sps_register_event_ptr(bam_tx_pipe, &tx_register_event);
+	if (rc)
+		goto disconnect_rx;
+	rc = bam_ops->sps_register_event_ptr(bam_rx_pipe, &rx_register_event);
+	if (rc)
+		goto disconnect_rx;
 
+	bam_connection_is_active = 1;
 	if (polling_mode)
 		rx_switch_to_interrupt_mode();
-
 	toggle_apps_ack();
 	complete_all(&bam_connection_completion);
 	queue_rx();
+	return 0;
+
+disconnect_rx:
+	bam_ops->sps_disconnect_ptr(bam_rx_pipe);
+disconnect_tx:
+	bam_ops->sps_disconnect_ptr(bam_tx_pipe);
+unvote:
+	unvote_dfab();
+	pr_err_ratelimited("%s: modem pipes unavailable: %d\n", __func__, rc);
+	return rc;
 }
 
 static void disconnect_to_bam(void)
@@ -2219,6 +2223,7 @@ static int restart_notifier_cb(struct notifier_block *this,
 		complete_all(&ul_wakeup_ack_completion);
 		complete_all(&bam_connection_completion);
 
+		cancel_delayed_work_sync(&bam_power_retry);
 		/* Drain submissions and SPS callbacks before freeing descriptors. */
 		synchronize_srcu(&bam_dmux_srcu);
 		synchronize_rcu();
@@ -2488,45 +2493,53 @@ static void toggle_apps_ack(void)
 	DBG_INC_ACK_OUT_CNT();
 }
 
+/* Called with smsm_cb_lock held. A successful power-up owns one wake hold. */
+static int bam_power_up(void)
+{
+	int rc;
+
+	grab_wakelock();
+	rc = bam_mux_initialized ? reconnect_to_bam() : bam_init();
+	if (rc)
+		release_wakelock();
+	return rc;
+}
+
+static void bam_power_retry_work(struct work_struct *work)
+{
+	mutex_lock(&smsm_cb_lock);
+	if (bam_dmux_power_state && !in_global_reset && !in_ssr &&
+	    !bam_connection_is_active &&
+	    (bam_ops->smsm_get_state_ptr(SMSM_MODEM_STATE) &
+	     SMSM_A2_POWER_CONTROL))
+		bam_power_up();
+	mutex_unlock(&smsm_cb_lock);
+}
+
 static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 {
-	static int last_processed_state;
+	bool power = !!(new_state & SMSM_A2_POWER_CONTROL);
 
 	mutex_lock(&smsm_cb_lock);
-	bam_dmux_power_state = new_state & SMSM_A2_POWER_CONTROL ? 1 : 0;
 	DBG_INC_A2_POWER_CONTROL_IN_CNT();
-	BAM_DMUX_LOG("%s: 0x%08x -> 0x%08x\n", __func__, old_state,
-			new_state);
-	if (last_processed_state == (new_state & SMSM_A2_POWER_CONTROL)) {
-		BAM_DMUX_LOG("%s: already processed this state\n", __func__);
-		mutex_unlock(&smsm_cb_lock);
-		return;
-	}
+	BAM_DMUX_LOG("%s: 0x%08x -> 0x%08x\n", __func__, old_state, new_state);
+	if (power == bam_dmux_power_state)
+		goto out;
 
-	last_processed_state = new_state & SMSM_A2_POWER_CONTROL;
-
-	if (bam_mux_initialized && new_state & SMSM_A2_POWER_CONTROL) {
-		BAM_DMUX_LOG("%s: reconnect\n", __func__);
-		grab_wakelock();
-		reconnect_to_bam();
-	} else if (bam_mux_initialized &&
-					!(new_state & SMSM_A2_POWER_CONTROL)) {
-		BAM_DMUX_LOG("%s: disconnect\n", __func__);
-		disconnect_to_bam();
-		release_wakelock();
-	} else if (new_state & SMSM_A2_POWER_CONTROL) {
-		BAM_DMUX_LOG("%s: init\n", __func__);
-		grab_wakelock();
-		if (bam_init()) {
-			release_wakelock();
-			last_processed_state = 0;
-		}
+	bam_dmux_power_state = power;
+	if (power) {
+		if (bam_power_up())
+			mod_delayed_work(system_wq, &bam_power_retry,
+					 msecs_to_jiffies(100));
 	} else {
-		BAM_DMUX_LOG("%s: bad state change\n", __func__);
-		pr_err("%s: unsupported state change\n", __func__);
+		cancel_delayed_work(&bam_power_retry);
+		if (bam_connection_is_active) {
+			disconnect_to_bam();
+			release_wakelock();
+		}
 	}
+out:
 	mutex_unlock(&smsm_cb_lock);
-
 }
 
 static void bam_dmux_smsm_ack_cb(void *priv, uint32_t old_state,
