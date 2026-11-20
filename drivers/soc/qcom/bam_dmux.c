@@ -1717,11 +1717,11 @@ static void kickoff_ul_wakeup_func(struct work_struct *work)
 	if (!bam_is_connected) {
 		read_unlock(&ul_wakeup_lock);
 		ul_wakeup();
-		if (unlikely(in_global_reset == 1))
-			return;
 		read_lock(&ul_wakeup_lock);
-		record_ul_activity();
-		notify_all(BAM_DMUX_UL_CONNECTED, (unsigned long)(NULL));
+		if (!in_global_reset && bam_is_connected) {
+			record_ul_activity();
+			notify_all(BAM_DMUX_UL_CONNECTED, (unsigned long)(NULL));
+		}
 	}
 	read_unlock(&ul_wakeup_lock);
 }
