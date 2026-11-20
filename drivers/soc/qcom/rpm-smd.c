@@ -555,74 +555,55 @@ static void msm_rpm_notify_sleep_chain(struct rpm_message_header *hdr,
 }
 
 static int msm_rpm_add_kvp_data_common(struct msm_rpm_request *handle,
-		uint32_t key, const uint8_t *data, int size, bool noirq)
+		u32 key, const u8 *data, int size, bool noirq)
 {
-	uint32_t i;
-	uint32_t data_size, msg_size;
+	struct msm_rpm_kvp_data *kvp;
+	u32 i, padded, retained;
+	u8 *value;
 
 	if (probe_status)
 		return probe_status;
-
-	if (!handle || !data) {
-		pr_err("%s(): Invalid handle/data\n", __func__);
+	if (!handle || !data || size < 0 || size > INT_MAX - 3)
 		return -EINVAL;
-	}
-
-	if (size < 0)
-		return  -EINVAL;
-
-	data_size = ALIGN(size, SZ_4);
-	msg_size = data_size + sizeof(struct rpm_request_header);
-
-	for (i = 0; i < handle->write_idx; i++) {
-		if (handle->kvp[i].key != key)
-			continue;
-		if (handle->kvp[i].nbytes != data_size) {
-			kfree(handle->kvp[i].value);
-			handle->kvp[i].value = NULL;
-		} else {
-			if (!memcmp(handle->kvp[i].value, data, data_size))
-				return 0;
-		}
-		break;
-	}
-
-	if (i >= handle->num_elements) {
-		pr_err("%s(): Number of resources exceeds max allocated\n",
-				__func__);
+	padded = ALIGN((u32)size, sizeof(u32));
+	for (i = 0; i < handle->write_idx; i++)
+		if (handle->kvp[i].key == key)
+			break;
+	if (i >= handle->num_elements)
 		return -ENOMEM;
+
+	kvp = &handle->kvp[i];
+	if (kvp->value && kvp->nbytes == padded &&
+	    (!size || !memcmp(kvp->value, data, size)) &&
+	    (padded == size || !memchr_inv(kvp->value + size, 0, padded - size)))
+		return 0;
+
+	retained = handle->msg_hdr.data_len;
+	if (kvp->valid)
+		retained -= sizeof(struct kvp) + kvp->nbytes;
+	if ((u64)retained + sizeof(struct kvp) + padded +
+	    sizeof(handle->req_hdr) + sizeof(handle->msg_hdr) > INT_MAX)
+		return -E2BIG;
+
+	if (!kvp->value || kvp->nbytes != padded) {
+		value = kmalloc(padded, GFP_FLAG(noirq));
+		if (!value)
+			return -ENOMEM;
+		kfree(kvp->value);
+		kvp->value = value;
 	}
+	if (size)
+		memcpy(kvp->value, data, size);
+	if (padded != size)
+		memset(kvp->value + size, 0, padded - size);
 
 	if (i == handle->write_idx)
 		handle->write_idx++;
-
-	if (!handle->kvp[i].value) {
-		handle->kvp[i].value = kzalloc(data_size, GFP_FLAG(noirq));
-
-		if (!handle->kvp[i].value) {
-			pr_err("%s(): Failed malloc\n", __func__);
-			return -ENOMEM;
-		}
-	} else {
-		/* We enter the else case, if a key already exists but the
-		 * data doesn't match. In which case, we should zero the data
-		 * out.
-		 */
-		memset(handle->kvp[i].value, 0, data_size);
-	}
-
-	if (!handle->kvp[i].valid)
-		handle->msg_hdr.data_len += msg_size;
-	else
-		handle->msg_hdr.data_len += (data_size - handle->kvp[i].nbytes);
-
-	handle->kvp[i].nbytes = data_size;
-	handle->kvp[i].key = key;
-	memcpy(handle->kvp[i].value, data, size);
-	handle->kvp[i].valid = true;
-
+	kvp->key = key;
+	kvp->nbytes = padded;
+	kvp->valid = true;
+	handle->msg_hdr.data_len = retained + sizeof(struct kvp) + padded;
 	return 0;
-
 }
 
 static struct msm_rpm_request *msm_rpm_create_request_common(
@@ -633,6 +614,9 @@ static struct msm_rpm_request *msm_rpm_create_request_common(
 
 	if (probe_status)
 		return ERR_PTR(probe_status);
+
+	if (num_elements < 0)
+		return ERR_PTR(-EINVAL);
 
 	cdata = kzalloc(sizeof(struct msm_rpm_request),
 			GFP_FLAG(noirq));
@@ -651,7 +635,7 @@ static struct msm_rpm_request *msm_rpm_create_request_common(
 	cdata->num_elements = num_elements;
 	cdata->write_idx = 0;
 
-	cdata->kvp = kzalloc(sizeof(struct msm_rpm_kvp_data) * num_elements,
+	cdata->kvp = kcalloc(num_elements, sizeof(*cdata->kvp),
 			GFP_FLAG(noirq));
 
 	if (!cdata->kvp) {
@@ -1103,14 +1087,11 @@ static int msm_rpm_send_data(struct msm_rpm_request *cdata,
 
 	/* populate data_len */
 	if (msg_size > cdata->numbytes) {
-		kfree(cdata->buf);
+		tmpbuff = krealloc(cdata->buf, msg_size, GFP_FLAG(noirq));
+		if (!tmpbuff)
+			return 0;
+		cdata->buf = tmpbuff;
 		cdata->numbytes = msg_size;
-		cdata->buf = kzalloc(msg_size, GFP_FLAG(noirq));
-	}
-
-	if (!cdata->buf) {
-		pr_err("%s(): Failed malloc\n", __func__);
-		return 0;
 	}
 
 	tmpbuff = cdata->buf;
