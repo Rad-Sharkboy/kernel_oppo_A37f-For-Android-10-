@@ -813,12 +813,19 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 	struct tx_pkt_info *pkt;
 	dma_addr_t dma_address;
 	unsigned long flags;
+	int rcu_id;
+
+	rcu_id = srcu_read_lock(&bam_dmux_srcu);
+	if (ACCESS_ONCE(in_global_reset)) {
+		rc = -EFAULT;
+		goto free_data;
+	}
 
 	pkt = kmalloc(sizeof(struct tx_pkt_info), GFP_ATOMIC);
 	if (pkt == NULL) {
 		pr_err("%s: mem alloc for tx_pkt_info failed\n", __func__);
-		kfree(data);
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto free_data;
 	}
 
 	dma_address = dma_map_single(dma_dev, data, len,
@@ -826,8 +833,8 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 	if (dma_mapping_error(dma_dev, dma_address)) {
 		pr_err("%s: dma_map_single() failed\n", __func__);
 		kfree(pkt);
-		kfree(data);
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto free_data;
 	}
 	pkt->skb = (struct sk_buff *)(data);
 	pkt->len = len;
@@ -855,6 +862,12 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
 	}
 
+	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
+	return rc;
+
+free_data:
+	kfree(data);
+	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 	return rc;
 }
 
@@ -863,7 +876,6 @@ static void bam_mux_write_done(struct work_struct *work)
 	struct sk_buff *skb;
 	struct bam_mux_hdr *hdr;
 	struct tx_pkt_info *info;
-	struct tx_pkt_info *info_expected;
 	u32 generation;
 	unsigned long flags;
 
@@ -873,27 +885,9 @@ static void bam_mux_write_done(struct work_struct *work)
 	info = container_of(work, struct tx_pkt_info, work);
 
 	spin_lock_irqsave(&bam_tx_pool_spinlock, flags);
-	info_expected = list_first_entry(&bam_tx_pool,
-			struct tx_pkt_info, list_node);
-	if (unlikely(info != info_expected)) {
-		struct tx_pkt_info *errant_pkt;
-
-		DMUX_LOG_KERR("%s: bam_tx_pool mismatch .next=%p,"
-				" list_node=%p, t=%lluns\n",
-				__func__, bam_tx_pool.next, &info->list_node,
-				info->timestamp_ns
-				);
-
-		list_for_each_entry(errant_pkt, &bam_tx_pool, list_node) {
-			DMUX_LOG_KERR("%s: node=%p t=%lluns\n", __func__,
-			&errant_pkt->list_node, errant_pkt->timestamp_ns);
-
-		}
-		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
-		BUG();
-	}
 	list_del(&info->list_node);
 	spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
+	dma_unmap_single(dma_dev, info->dma_address, info->len, bam_ops->dma_to);
 
 	if (info->is_cmd) {
 		kfree(info->skb);
@@ -1025,6 +1019,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	}
 	pkt->skb = skb;
 	pkt->dma_address = dma_address;
+	pkt->len = skb->len;
 	pkt->is_cmd = 0;
 	pkt->generation = generation;
 	set_tx_timestamp(pkt);
@@ -1529,30 +1524,17 @@ static void rx_timer_work_func(struct work_struct *work)
 
 static void bam_mux_tx_notify(struct sps_event_notify *notify)
 {
-	struct tx_pkt_info *pkt;
+	struct tx_pkt_info *pkt = notify->data.transfer.user;
 
-	DBG("%s: event %d notified\n", __func__, notify->event_id);
-
-	if (in_global_reset)
-		return;
-
-	switch (notify->event_id) {
-	case SPS_EVENT_EOT:
-		pkt = notify->data.transfer.user;
-		if (!pkt->is_cmd)
-			dma_unmap_single(dma_dev, pkt->dma_address,
-						pkt->skb->len,
-						bam_ops->dma_to);
+	rcu_read_lock();
+	if (!ACCESS_ONCE(in_global_reset)) {
+		if (likely(notify->event_id == SPS_EVENT_EOT && pkt))
+			queue_work(bam_mux_tx_workqueue, &pkt->work);
 		else
-			dma_unmap_single(dma_dev, pkt->dma_address,
-						pkt->len,
-						bam_ops->dma_to);
-		queue_work(bam_mux_tx_workqueue, &pkt->work);
-		break;
-	default:
-		pr_err("%s: recieved unexpected event id %d\n", __func__,
-			notify->event_id);
+			pr_err_ratelimited("%s: unexpected SPS event %d\n",
+					   __func__, notify->event_id);
 	}
+	rcu_read_unlock();
 }
 
 static void bam_mux_rx_notify(struct sps_event_notify *notify)
@@ -1562,8 +1544,9 @@ static void bam_mux_rx_notify(struct sps_event_notify *notify)
 
 	DBG("%s: event %d notified\n", __func__, notify->event_id);
 
-	if (in_global_reset)
-		return;
+	rcu_read_lock();
+	if (ACCESS_ONCE(in_global_reset))
+		goto out;
 
 	switch (notify->event_id) {
 	case SPS_EVENT_EOT:
@@ -1604,6 +1587,8 @@ static void bam_mux_rx_notify(struct sps_event_notify *notify)
 		pr_err("%s: recieved unexpected event id %d\n", __func__,
 			notify->event_id);
 	}
+out:
+	rcu_read_unlock();
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -2017,6 +2002,8 @@ static void ul_wakeup(void)
 		}
 	}
 	INIT_COMPLETION(ul_wakeup_ack_completion);
+	if (ACCESS_ONCE(in_global_reset))
+		goto out;
 	power_vote(1);
 	BAM_DMUX_LOG("%s waiting for wakeup ack\n", __func__);
 	ret = wait_for_completion_timeout(&ul_wakeup_ack_completion,
@@ -2026,6 +2013,8 @@ static void ul_wakeup(void)
 		BAM_DMUX_LOG("%s timeout wakeup ack\n", __func__);
 		return;
 	}
+	if (ACCESS_ONCE(in_global_reset))
+		goto out;
 	BAM_DMUX_LOG("%s waiting completion\n", __func__);
 	ret = wait_for_completion_timeout(&bam_connection_completion,
 					msecs_to_jiffies(UL_WAKEUP_TIMEOUT_MS));
@@ -2035,8 +2024,9 @@ static void ul_wakeup(void)
 		return;
 	}
 
-	ul_start_idle_timer();
-	BAM_DMUX_LOG("%s complete\n", __func__);
+	if (!ACCESS_ONCE(in_global_reset))
+		ul_start_idle_timer();
+out:
 	mutex_unlock(&wakeup_lock);
 }
 
@@ -2233,7 +2223,7 @@ static int restart_notifier_cb(struct notifier_block *this,
 	int i;
 	struct list_head *node;
 	struct tx_pkt_info *info;
-	int temp_remote_status;
+	bool remote_open;
 	unsigned long flags;
 
 	/*
@@ -2251,12 +2241,22 @@ static int restart_notifier_cb(struct notifier_block *this,
 	 */
 	if (code == SUBSYS_BEFORE_SHUTDOWN) {
 		BAM_DMUX_LOG("%s: begin\n", __func__);
-		in_global_reset = 1;
+		ACCESS_ONCE(in_global_reset) = 1;
 		in_ssr = 1;
-		/* wait till all bam_dmux writes completes */
+		complete_all(&ul_wakeup_ack_completion);
+		complete_all(&bam_connection_completion);
+
+		/* Drain submissions and SPS callbacks before freeing descriptors. */
 		synchronize_srcu(&bam_dmux_srcu);
-		BAM_DMUX_LOG("%s: ssr signaling complete\n", __func__);
+		synchronize_rcu();
+		cancel_delayed_work_sync(&queue_rx_work);
 		flush_workqueue(bam_mux_rx_workqueue);
+		flush_workqueue(bam_mux_tx_workqueue);
+		if (polling_mode) {
+			polling_mode = 0;
+			complete_all(&shutdown_completion);
+			release_wakelock();
+		}
 	}
 	if (code != SUBSYS_AFTER_SHUTDOWN)
 		return NOTIFY_DONE;
@@ -2283,12 +2283,14 @@ static int restart_notifier_cb(struct notifier_block *this,
 	/* Cleanup Channel States */
 	mutex_lock(&bam_pdev_mutexlock);
 	for (i = 0; i < BAM_DMUX_NUM_CHANNELS; ++i) {
-		temp_remote_status = bam_ch_is_remote_open(i);
+		spin_lock_irqsave(&bam_ch[i].lock, flags);
+		remote_open = bam_ch_is_remote_open(i);
 		bam_ch[i].status &= ~BAM_CH_REMOTE_OPEN;
 		bam_ch[i].num_tx_pkts = 0;
 		if (bam_ch_is_local_open(i))
 			bam_ch[i].status |= BAM_CH_IN_RESET;
-		if (temp_remote_status) {
+		spin_unlock_irqrestore(&bam_ch[i].lock, flags);
+		if (remote_open) {
 			platform_device_unregister(bam_ch[i].pdev);
 			bam_ch[i].pdev = platform_device_alloc(
 						bam_ch[i].name, 2);
@@ -2303,17 +2305,12 @@ static int restart_notifier_cb(struct notifier_block *this,
 		list_del(node);
 		info = container_of(node, struct tx_pkt_info,
 							list_node);
-		if (!info->is_cmd) {
-			dma_unmap_single(dma_dev, info->dma_address,
-						info->skb->len,
-						bam_ops->dma_to);
-			dev_kfree_skb_any(info->skb);
-		} else {
-			dma_unmap_single(dma_dev, info->dma_address,
-						info->len,
-						bam_ops->dma_to);
+		dma_unmap_single(dma_dev, info->dma_address, info->len,
+				 bam_ops->dma_to);
+		if (info->is_cmd)
 			kfree(info->skb);
-		}
+		else
+			dev_kfree_skb_any(info->skb);
 		kfree(info);
 	}
 	spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
