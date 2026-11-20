@@ -124,11 +124,23 @@ struct msm_rpm_kvp_data {
 
 struct slp_buf {
 	struct rb_node node;
-	char ubuf[MAX_SLEEP_BUFFER];
+	char ubuf[MAX_SLEEP_BUFFER] __aligned(4);
+	u32 capacity;
 	char *buf;
 	bool valid;
 };
 static struct rb_root tr_root = RB_ROOT;
+static DEFINE_SPINLOCK(slp_buffer_lock);
+static unsigned int sleep_pending;
+static bool sleep_flushing;
+
+static void mark_sleep_pending(struct slp_buf *s)
+{
+	if (!s->valid) {
+		s->valid = true;
+		sleep_pending++;
+	}
+}
 static int msm_rpm_send_smd_buffer(char *buf, uint32_t size, bool noirq);
 static uint32_t msm_rpm_get_next_msg_id(void);
 
@@ -192,7 +204,7 @@ static void delete_kvp(char *msg, struct kvp *d)
 	dec = (void *)n - (void *)d;
 	size = get_data_len(msg) - ((void *)n - (void *)get_first_kvp(msg));
 
-	memcpy((void *)d, (void *)n, size);
+	memmove(d, n, size);
 
 	get_data_len(msg) -= dec;
 	get_req_len(msg) -= dec;
@@ -206,7 +218,6 @@ static inline void update_kvp_data(struct kvp *dest, struct kvp *src)
 static void add_kvp(char *buf, struct kvp *n)
 {
 	uint32_t inc = sizeof(*n) + n->s;
-	BUG_ON((get_req_len(buf) + inc) > MAX_SLEEP_BUFFER);
 
 	memcpy(buf + get_buf_len(buf), n, inc);
 
@@ -268,7 +279,7 @@ static int tr_insert(struct rb_root *root, struct slp_buf *slp)
 
 	rb_link_node(&slp->node, parent, node);
 	rb_insert_color(&slp->node, root);
-	slp->valid = true;
+	mark_sleep_pending(slp);
 	return 0;
 }
 
@@ -278,10 +289,38 @@ static int tr_insert(struct rb_root *root, struct slp_buf *slp)
 		k = get_next_kvp(k))
 
 
-static void tr_update(struct slp_buf *s, char *buf)
+static int tr_update(struct slp_buf *s, char *buf)
 {
 	struct kvp *e, *n;
 
+	u32 length = get_buf_len(s->buf), peak = length;
+	char *grown;
+
+	/* Size the full merge before changing the last accepted sleep vote. */
+	if ((u64)length + get_data_len(buf) > s->capacity) {
+		for_each_kvp(buf, n) {
+			for_each_kvp(s->buf, e) {
+				if (e->k == n->k) {
+					length -= sizeof(*e) + e->s;
+					break;
+				}
+			}
+			if ((u64)length + sizeof(*n) + n->s > INT_MAX)
+				return -E2BIG;
+			length += sizeof(*n) + n->s;
+			peak = max(peak, length);
+		}
+		if (peak > s->capacity) {
+			grown = kmalloc(peak, GFP_ATOMIC);
+			if (!grown)
+				return -ENOMEM;
+			memcpy(grown, s->buf, get_buf_len(s->buf));
+			if (s->buf != s->ubuf)
+				kfree(s->buf);
+			s->buf = grown;
+			s->capacity = peak;
+		}
+	}
 	for_each_kvp(buf, n) {
 		bool found = false;
 		for_each_kvp(s->buf, e) {
@@ -292,12 +331,12 @@ static void tr_update(struct slp_buf *s, char *buf)
 					void *n_data = get_data(n);
 					if (memcmp(e_data, n_data, n->s)) {
 						update_kvp_data(e, n);
-						s->valid = true;
+						mark_sleep_pending(s);
 					}
 				} else {
 					delete_kvp(s->buf, e);
 					add_kvp(s->buf, n);
-					s->valid = true;
+					mark_sleep_pending(s);
 				}
 				break;
 			}
@@ -305,9 +344,10 @@ static void tr_update(struct slp_buf *s, char *buf)
 		}
 		if (!found) {
 			add_kvp(s->buf, n);
-			s->valid = true;
+			mark_sleep_pending(s);
 		}
 	}
+	return 0;
 }
 static atomic_t msm_rpm_msg_id = ATOMIC_INIT(0);
 
@@ -382,45 +422,42 @@ static inline int msm_rpm_get_error_from_ack(uint8_t *buf)
 	return rc;
 }
 
-int msm_rpm_smd_buffer_request(struct msm_rpm_request *cdata,
-		uint32_t size, gfp_t flag)
+static int msm_rpm_smd_buffer_request(struct msm_rpm_request *cdata, u32 size)
 {
 	struct slp_buf *slp;
-	static DEFINE_SPINLOCK(slp_buffer_lock);
 	unsigned long flags;
-	char *buf;
-	buf = cdata->buf;
-
-	if (size > MAX_SLEEP_BUFFER)
-		return -ENOMEM;
+	int rc = 0;
 
 	spin_lock_irqsave(&slp_buffer_lock, flags);
-	slp = tr_search(&tr_root, buf);
-
-	if (!slp) {
-		slp = kzalloc(sizeof(struct slp_buf), GFP_ATOMIC);
-		if (!slp) {
-			spin_unlock_irqrestore(&slp_buffer_lock, flags);
-			return -ENOMEM;
-		}
-		slp->buf = PTR_ALIGN(&slp->ubuf[0], sizeof(u32));
-		memcpy(slp->buf, buf, size);
-		if (tr_insert(&tr_root, slp))
-			pr_err("%s(): Error updating sleep request\n",
-					__func__);
+	slp = tr_search(&tr_root, cdata->buf);
+	if (slp) {
+		rc = tr_update(slp, cdata->buf);
+	} else if (size > MAX_SLEEP_BUFFER) {
+		/* Large standalone messages historically go directly to the RPM. */
+		rc = -EOPNOTSUPP;
 	} else {
-		/* handle unsent requests */
-		tr_update(slp, buf);
+		slp = kzalloc(sizeof(*slp), GFP_ATOMIC);
+		if (!slp) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		slp->buf = slp->ubuf;
+		slp->capacity = sizeof(slp->ubuf);
+		memcpy(slp->buf, cdata->buf, size);
+		rc = tr_insert(&tr_root, slp);
+		if (rc)
+			kfree(slp);
 	}
-	trace_rpm_smd_sleep_set(cdata->msg_hdr.msg_id,
-				cdata->msg_hdr.resource_type,
-				cdata->msg_hdr.resource_id);
-
+	if (!rc)
+		trace_rpm_smd_sleep_set(cdata->msg_hdr.msg_id,
+					cdata->msg_hdr.resource_type,
+					cdata->msg_hdr.resource_id);
+out:
 	spin_unlock_irqrestore(&slp_buffer_lock, flags);
-
-	return 0;
+	return rc;
 }
-static void msm_rpm_print_sleep_buffer(struct slp_buf *s)
+
+static void msm_rpm_print_sleep_buffer(char *request)
 {
 	char buf[DEBUG_PRINT_BUFFER_SIZE] = {0};
 	int pos;
@@ -429,21 +466,15 @@ static void msm_rpm_print_sleep_buffer(struct slp_buf *s)
 	u32 type;
 	struct kvp *e;
 
-	if (!s)
-		return;
-
-	if (!s->valid)
-		return;
-
-	type = get_rsc_type(s->buf);
+	type = get_rsc_type(request);
 	memcpy(ch, &type, sizeof(u32));
 
 	pos = scnprintf(buf, buflen,
 			"Sleep request type = 0x%08x(%s)",
-			get_rsc_type(s->buf), ch);
+			get_rsc_type(request), ch);
 	pos += scnprintf(buf + pos, buflen - pos, " id = 0%x",
-			get_rsc_id(s->buf));
-	for_each_kvp(s->buf, e) {
+			get_rsc_id(request));
+	for_each_kvp(request, e) {
 		uint32_t i;
 		char *data = get_data(e);
 
@@ -460,86 +491,102 @@ static void msm_rpm_print_sleep_buffer(struct slp_buf *s)
 					" 0x%02X", data[i]);
 	}
 	pos += scnprintf(buf + pos, buflen - pos, "\n");
-	printk(buf);
+	printk("%s", buf);
 }
 
 static struct msm_rpm_driver_data msm_rpm_data = {
 	.smd_open = COMPLETION_INITIALIZER(msm_rpm_data.smd_open),
 };
 
+static int msm_rpm_try_sleep_write(char *data, int size)
+{
+	unsigned long flags;
+	int rc;
+
+	spin_lock_irqsave(&msm_rpm_data.smd_lock_write, flags);
+	rc = smd_write_avail(msm_rpm_data.ch_info);
+	if (rc >= size)
+		rc = smd_write(msm_rpm_data.ch_info, data, size);
+	else if (rc >= 0)
+		rc = -EAGAIN;
+	spin_unlock_irqrestore(&msm_rpm_data.smd_lock_write, flags);
+	return rc == size ? 0 : (rc < 0 ? rc : -EIO);
+}
+
 static int msm_rpm_flush_requests(bool print)
 {
-	struct rb_node *t;
-	int ret;
-	int pkt_sz;
-	char buf[MAX_ERR_BUFFER_SIZE] = {0};
-	int count = 0;
+	char local[MAX_SLEEP_BUFFER] __aligned(4), ack[MAX_ERR_BUFFER_SIZE];
+	struct rb_node *node;
+	unsigned long flags;
+	int count = 0, rc = 0;
 
-	for (t = rb_first(&tr_root); t; t = rb_next(t)) {
+	spin_lock_irqsave(&slp_buffer_lock, flags);
+	if (sleep_flushing) {
+		rc = -EBUSY;
+		goto unlock;
+	}
+	if (!sleep_pending)
+		goto unlock;
+	sleep_flushing = true;
 
-		struct slp_buf *s = rb_entry(t, struct slp_buf, node);
+	for (node = rb_first(&tr_root); node && sleep_pending; node = rb_next(node)) {
+		struct slp_buf *s = rb_entry(node, struct slp_buf, node);
+		char *request = local;
+		int size;
 
 		if (!s->valid)
 			continue;
+		size = get_buf_len(s->buf);
+		if (size > sizeof(local)) {
+			request = kmalloc(size, GFP_ATOMIC);
+			if (!request) {
+				rc = -ENOMEM;
+				break;
+			}
+		}
+		memcpy(request, s->buf, size);
+		s->valid = false;
+		sleep_pending--;
+		spin_unlock_irqrestore(&slp_buffer_lock, flags);
 
 		if (print)
-			msm_rpm_print_sleep_buffer(s);
+			msm_rpm_print_sleep_buffer(request);
+		get_msg_id(request) = msm_rpm_get_next_msg_id();
+		rc = msm_rpm_try_sleep_write(request, size);
+		if (!rc)
+			trace_rpm_smd_send_sleep_set(get_msg_id(request),
+					get_rsc_type(request), get_rsc_id(request));
+		if (request != local)
+			kfree(request);
+		if (rc) {
+			spin_lock_irqsave(&slp_buffer_lock, flags);
+			mark_sleep_pending(s);
+			break;
+		}
 
-		get_msg_id(s->buf) = msm_rpm_get_next_msg_id();
-		ret = msm_rpm_send_smd_buffer(s->buf,
-				get_buf_len(s->buf), true);
-
-		WARN_ON(ret != get_buf_len(s->buf));
-		trace_rpm_smd_send_sleep_set(get_msg_id(s->buf),
-					get_rsc_type(s->buf),
-					get_rsc_id(s->buf));
-
-		s->valid = false;
-		count++;
-
-		/*
-		 * RPM acks need to be handled here if we have sent 24
-		 * messages such that we do not overrun SMD buffer. Since
-		 * we expect only sleep sets at this point (RPM PC would be
-		 * disallowed if we had pending active requests), we need not
-		 * process these sleep set acks.
-		 */
-		if (count >= MAX_WAIT_ON_ACK) {
-			int len;
-			int timeout = 10;
-
-			while (timeout) {
-				if (smd_is_pkt_avail(msm_rpm_data.ch_info))
-					break;
-				/*
-				 * Sleep for 50us at a time before checking
-				 * for packet availability. The 50us is based
-				 * on the the time rpm could take to process
-				 * and send an ack for the sleep set request.
-				 */
+		if (++count >= MAX_WAIT_ON_ACK) {
+			int retries = 10, len;
+			while (smd_is_pkt_avail(msm_rpm_data.ch_info) <= 0 && retries--)
 				udelay(50);
-				timeout--;
-			}
-			/*
-			 * On timeout return an error and exit the spinlock
-			 * control on this cpu. This will allow any other
-			 * core that has wokenup and trying to acquire the
-			 * spinlock from being locked out.
-			 */
-			if (!timeout) {
-				pr_err("%s: Timed out waiting for RPM ACK\n",
-					__func__);
-				return -EAGAIN;
-			}
-
-			pkt_sz = smd_cur_packet_size(msm_rpm_data.ch_info);
-			len = smd_read(msm_rpm_data.ch_info, buf, pkt_sz);
+			len = smd_cur_packet_size(msm_rpm_data.ch_info);
+			if (len <= 0 || len > sizeof(ack) ||
+			    smd_read_avail(msm_rpm_data.ch_info) != len ||
+			    smd_read(msm_rpm_data.ch_info, ack, len) != len)
+				rc = -EAGAIN;
 			count--;
 		}
+		spin_lock_irqsave(&slp_buffer_lock, flags);
+		if (rc)
+			break;
 	}
-	return 0;
+	/* A newer vote for a previously visited node belongs to the next try. */
+	if (!rc && sleep_pending)
+		rc = -EAGAIN;
+	sleep_flushing = false;
+unlock:
+	spin_unlock_irqrestore(&slp_buffer_lock, flags);
+	return rc;
 }
-
 
 static void msm_rpm_notify_sleep_chain(struct rpm_message_header *hdr,
 		struct msm_rpm_kvp_data *kvp)
@@ -1121,10 +1168,17 @@ static int msm_rpm_send_data(struct msm_rpm_request *cdata,
 
 	memcpy(cdata->buf, &cdata->req_hdr, req_hdr_sz + msg_hdr_sz);
 
-	if ((cdata->msg_hdr.set == MSM_RPM_CTX_SLEEP_SET) &&
-		!msm_rpm_smd_buffer_request(cdata, msg_size,
-			GFP_FLAG(noirq)))
-		return 1;
+	if (cdata->msg_hdr.set == MSM_RPM_CTX_SLEEP_SET) {
+		ret = msm_rpm_smd_buffer_request(cdata, msg_size);
+		if (!ret) {
+			for (i = 0; i < cdata->write_idx; i++)
+				cdata->kvp[i].valid = false;
+			cdata->msg_hdr.data_len = 0;
+			return 1;
+		}
+		if (ret != -EOPNOTSUPP)
+			return 0;
+	}
 
 	cdata->msg_hdr.msg_id = msm_rpm_get_next_msg_id();
 
