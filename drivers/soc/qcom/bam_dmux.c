@@ -565,7 +565,6 @@ static void bam_mux_process_data(struct sk_buff *rx_skb)
 	if (!bam_mux_notify_channel(ch_id, BAM_DMUX_RECEIVE,
 				     (unsigned long)rx_skb, 0))
 		dev_kfree_skb_any(rx_skb);
-	queue_rx();
 }
 
 /**
@@ -636,7 +635,6 @@ static inline void handle_bam_mux_cmd_open(struct bam_mux_hdr *rx_hdr)
 		BAM_DMUX_LOG("%s: open cid %d aborted due to ssr\n",
 				__func__, rx_hdr->ch_id);
 		mutex_unlock(&bam_pdev_mutexlock);
-		queue_rx();
 		return;
 	}
 	if (rx_hdr->signal & DYNAMIC_MTU_MASK) {
@@ -672,7 +670,6 @@ static inline void handle_bam_mux_cmd_open(struct bam_mux_hdr *rx_hdr)
 	}
 unlock:
 	mutex_unlock(&bam_pdev_mutexlock);
-	queue_rx();
 }
 
 static void handle_bam_mux_cmd(struct rx_pkt_info *info)
@@ -703,7 +700,6 @@ static void handle_bam_mux_cmd(struct rx_pkt_info *info)
 			rx_hdr->cmd, rx_hdr->pad_len, rx_hdr->ch_id,
 			rx_hdr->pkt_len);
 		dev_kfree_skb_any(rx_skb);
-		queue_rx();
 		return;
 	}
 
@@ -713,7 +709,6 @@ static void handle_bam_mux_cmd(struct rx_pkt_info *info)
 			__func__, rx_hdr->ch_id, rx_hdr->signal, rx_hdr->cmd,
 			rx_hdr->pad_len, rx_hdr->ch_id, rx_hdr->pkt_len);
 		dev_kfree_skb_any(rx_skb);
-		queue_rx();
 		return;
 	}
 
@@ -771,7 +766,6 @@ static void handle_bam_mux_cmd(struct rx_pkt_info *info)
 			pr_err("%s: platform_device_alloc failed\n", __func__);
 		mutex_unlock(&bam_pdev_mutexlock);
 		dev_kfree_skb_any(rx_skb);
-		queue_rx();
 		break;
 	default:
 		DMUX_LOG_KERR(
@@ -785,7 +779,6 @@ static void handle_bam_mux_cmd(struct rx_pkt_info *info)
 
 drop:
 	dev_kfree_skb_any(rx_skb);
-	queue_rx();
 }
 
 static int bam_mux_write_cmd(void *data, uint32_t len)
@@ -1331,11 +1324,47 @@ static struct rx_pkt_info *bam_rx_take_completion(dma_addr_t addr)
 	return NULL;
 }
 
+#define BAM_RX_REFILL_BATCH 8
+
+static bool bam_rx_poll(bool interrupt_mode)
+{
+	struct sps_iovec iov;
+	struct rx_pkt_info *info;
+	unsigned int refill = 0;
+	bool received = false;
+	int ret;
+
+	while (bam_connection_is_active && !in_global_reset &&
+	       (!interrupt_mode || !polling_mode)) {
+		ret = bam_ops->sps_get_iovec_ptr(bam_rx_pipe, &iov);
+		if (ret) {
+			pr_err_ratelimited("%s: sps_get_iovec failed %d\n",
+					   __func__, ret);
+			break;
+		}
+		if (!iov.addr)
+			break;
+
+		info = bam_rx_take_completion(iov.addr);
+		if (!info)
+			continue;
+		info->sps_size = iov.size;
+		handle_bam_mux_cmd(info);
+		received = true;
+		if (++refill == BAM_RX_REFILL_BATCH) {
+			queue_rx();
+			refill = 0;
+		}
+	}
+	if (refill)
+		queue_rx();
+
+	return received;
+}
+
 static void rx_switch_to_interrupt_mode(void)
 {
 	struct sps_connect cur_rx_conn;
-	struct sps_iovec iov;
-	struct rx_pkt_info *info;
 	int ret;
 
 	/*
@@ -1366,23 +1395,8 @@ static void rx_switch_to_interrupt_mode(void)
 	complete_all(&shutdown_completion);
 	release_wakelock();
 
-	/* handle any rx packets before interrupt was enabled */
-	while (bam_connection_is_active && !polling_mode) {
-		ret = bam_ops->sps_get_iovec_ptr(bam_rx_pipe, &iov);
-		if (ret) {
-			pr_err("%s: sps_get_iovec failed %d\n",
-					__func__, ret);
-			break;
-		}
-		if (iov.addr == 0)
-			break;
-
-		info = bam_rx_take_completion(iov.addr);
-		if (!info)
-			continue;
-		info->sps_size = iov.size;
-		handle_bam_mux_cmd(info);
-	}
+	/* Handle packets already completed before the interrupt transition. */
+	bam_rx_poll(true);
 	return;
 
 fail:
@@ -1418,42 +1432,21 @@ static void log_rx_timestamp(void)
 
 static void rx_timer_work_func(struct work_struct *work)
 {
-	struct sps_iovec iov;
-	struct rx_pkt_info *info;
 	int inactive_cycles = 0;
 	int ret;
 	u32 buffs_unused, buffs_used;
 
 	if (msm_bam_dmux_debug_enable)
 		BAM_DMUX_LOG("%s: polling start\n", __func__);
-	while (bam_connection_is_active) { /* timer loop */
-		++inactive_cycles;
-		while (bam_connection_is_active) { /* deplete queue loop */
-			if (in_global_reset) {
-				BAM_DMUX_LOG(
-						"%s: polling exit, global reset detected\n",
-						__func__);
-				return;
-			}
-
-			ret = bam_ops->sps_get_iovec_ptr(bam_rx_pipe, &iov);
-			if (ret) {
-				DMUX_LOG_KERR("%s: sps_get_iovec failed %d\n",
-						__func__, ret);
-				break;
-			}
-			if (iov.addr == 0)
-				break;
-			info = bam_rx_take_completion(iov.addr);
-			if (!info)
-				continue;
+	while (bam_connection_is_active && !in_global_reset) {
+		if (bam_rx_poll(false)) {
 			inactive_cycles = 0;
-			info->sps_size = iov.size;
-			handle_bam_mux_cmd(info);
-		}
-
-		if (!inactive_cycles)
 			store_rx_timestamp();
+		} else {
+			inactive_cycles++;
+		}
+		if (!bam_connection_is_active || in_global_reset)
+			break;
 		if (inactive_cycles >= POLLING_INACTIVITY) {
 			if (msm_bam_dmux_debug_enable)
 				BAM_DMUX_LOG("%s: polling exit, no data\n", __func__);
