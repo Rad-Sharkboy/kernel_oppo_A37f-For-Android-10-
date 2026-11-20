@@ -94,6 +94,12 @@
 #define NS_DEFAULT_SLOT_INDEX 4
 #define NS_EXTENDED_SLOT_INDEX 18
 
+#ifdef WLAN_NS_OFFLOAD
+static DEFINE_MUTEX(hdd_ns_offload_lock);
+static void hdd_update_ns_offload(hdd_adapter_t *adapter, bool enable,
+				  bool suspended_only);
+#endif
+
 static eHalStatus g_full_pwr_status;
 static eHalStatus g_standby_status;
 
@@ -516,10 +522,8 @@ void __hdd_ipv6_notifier_work_queue(struct work_struct *work)
 
     pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
     status = wlan_hdd_validate_context(pHddCtx);
-    if (0 != status)
-    {
+    if (status || !ACCESS_ONCE(pHddCtx->hdd_wlan_suspended))
         return;
-    }
 
     if ((eConnectionState_Associated ==
                 (WLAN_HDD_GET_STATION_CTX_PTR(pAdapter))->conn_info.connState)
@@ -531,7 +535,7 @@ void __hdd_ipv6_notifier_work_queue(struct work_struct *work)
 #ifdef WLAN_NS_OFFLOAD
         if (pHddCtx->cfg_ini->fhostNSOffload)
         {
-            hdd_conf_ns_offload(pAdapter, 1);
+            hdd_update_ns_offload(pAdapter, true, true);
         }
 #endif
     }
@@ -540,7 +544,8 @@ void __hdd_ipv6_notifier_work_queue(struct work_struct *work)
      * only so when new ipv6 address is generated the screen may not
      * on so we need to call it here to update the list in f/w.
      */
-    wlan_hdd_set_mc_addr_list(pAdapter, TRUE);
+    if (ACCESS_ONCE(pHddCtx->hdd_wlan_suspended))
+        wlan_hdd_set_mc_addr_list(pAdapter, TRUE);
 #endif
     EXIT();
 }
@@ -577,13 +582,14 @@ int __wlan_hdd_ipv6_changed(struct notifier_block *nb,
               pAdapterNode->pAdapter->device_mode == WLAN_HDD_P2P_CLIENT))
         {
 
-            if (data == NETDEV_UP &&
+            if (data == NETDEV_UP && !(ifa->flags & IFA_F_TENTATIVE) &&
                 eConnectionState_Associated == WLAN_HDD_GET_STATION_CTX_PTR
                (pAdapterNode->pAdapter)->conn_info.connState)
                  sme_dhcp_done_ind(pHddCtx->hHal,
                        pAdapterNode->pAdapter->sessionId);
-            if (pHddCtx->cfg_ini->nEnableSuspend ==
-                  WLAN_MAP_SUSPEND_TO_MCAST_BCAST_FILTER)
+            if (ACCESS_ONCE(pHddCtx->hdd_wlan_suspended) &&
+                pHddCtx->cfg_ini->nEnableSuspend ==
+                    WLAN_MAP_SUSPEND_TO_MCAST_BCAST_FILTER)
             {
                 schedule_work(&pAdapterNode->pAdapter->ipv6NotifierWorkQueue);
             }
@@ -735,281 +741,110 @@ void hdd_conf_hostoffload(hdd_adapter_t *pAdapter, v_BOOL_t fenable)
 
 
 #ifdef WLAN_NS_OFFLOAD
-/**----------------------------------------------------------------------------
-
-  \brief hdd_conf_ns_offload() - Configure NS offload
-
-  Called during SUSPEND to configure the NS offload (MC BC filter) which
-  reduces power consumption.
-
-  \param  - pAdapter - Adapter context for which NS offload is to be configured
-  \param  - fenable - 0 - disable.
-                      1 - enable. (with IPv6 notifier registration)
-                      2 - enable. (without IPv6 notifier registration)
-
-  \return - void
-
-  ---------------------------------------------------------------------------*/
-void hdd_conf_ns_offload(hdd_adapter_t *pAdapter, int fenable)
+static int hdd_get_ns_addresses(hdd_adapter_t *adapter,
+				struct in6_addr *addresses, int slots)
 {
-    struct inet6_dev *in6_dev;
-    struct inet6_ifaddr *ifp;
-    struct list_head *p;
-    int slot_index = NS_DEFAULT_SLOT_INDEX;
-    tANI_U8 **selfIPv6Addr = NULL;
-    tANI_U8 *selfIPv6AddrValid = NULL;
-    tSirHostOffloadReq offLoadRequest;
-    hdd_context_t *pHddCtx;
-    tHalHandle halHandle;
+	struct inet6_dev *idev;
+	struct inet6_ifaddr *ifa;
+	int count = 0;
 
-    int i = 0, slot = 0;
-    int ret = 0;
-    eHalStatus returnStatus;
+	idev = in6_dev_get(adapter->dev);
+	if (!idev)
+		return 0;
 
-    ENTER();
-    hddLog(LOG1, FL(" fenable = %d"), fenable);
+	read_lock_bh(&idev->lock);
+	list_for_each_entry(ifa, &idev->addr_list, if_list) {
+		int scope = ipv6_addr_src_scope(&ifa->addr);
 
-    if (NULL == pAdapter)
-    {
-        hddLog(VOS_TRACE_LEVEL_ERROR, FL("HDD adapter is Null"));
-        return;
-    }
+		if (ACCESS_ONCE(ifa->flags) & (IFA_F_TENTATIVE | IFA_F_DADFAILED))
+			continue;
+		if (scope != IPV6_ADDR_SCOPE_LINKLOCAL &&
+		    scope != IPV6_ADDR_SCOPE_GLOBAL)
+			continue;
+		addresses[count++] = ifa->addr;
+		if (count == slots)
+			break;
+	}
+	read_unlock_bh(&idev->lock);
+	in6_dev_put(idev);
 
-    halHandle = WLAN_HDD_GET_HAL_CTX(pAdapter);
-    pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
+	return count;
+}
 
-    ret = wlan_hdd_validate_context(pHddCtx);
-    if (0 != ret)
-    {
-        return;
-    }
+static void hdd_update_ns_offload(hdd_adapter_t *adapter, bool enable,
+				  bool suspended_only)
+{
+	struct in6_addr targets[NS_EXTENDED_SLOT_INDEX];
+	struct in6_addr solicited;
+	tSirHostOffloadReq request;
+	hdd_context_t *ctx;
+	int count = 0, previous, slots, match_mode, active = 0, i;
 
-    if (sme_IsFeatureSupportedByFW(EXTENDED_NSOFFLOAD_SLOT))
-    {
-        slot_index = NS_EXTENDED_SLOT_INDEX;
-    }
+	if (!adapter)
+		return;
+	ctx = WLAN_HDD_GET_CTX(adapter);
 
-    hddLog(VOS_TRACE_LEVEL_INFO, FL("slot_idex = %d"), slot_index);
+	mutex_lock(&hdd_ns_offload_lock);
+	if (wlan_hdd_validate_context(ctx) ||
+	    (suspended_only && !ACCESS_ONCE(ctx->hdd_wlan_suspended)))
+		goto unlock;
 
-    selfIPv6AddrValid =
-            (tANI_U8 *)vos_mem_malloc(sizeof(tANI_U8) * slot_index);
+	previous = adapter->ns_slots;
+	if (enable) {
+		slots = sme_IsFeatureSupportedByFW(EXTENDED_NSOFFLOAD_SLOT) ?
+			NS_EXTENDED_SLOT_INDEX : NS_DEFAULT_SLOT_INDEX;
+		count = hdd_get_ns_addresses(adapter, targets, slots);
+	}
 
-    if (NULL == selfIPv6AddrValid)
-    {
-        hddLog (VOS_TRACE_LEVEL_ERROR, FL("Failed to allocate memory for"
-                                         " selfIPv6AddrValid"));
-        goto end;
-    }
+	match_mode = SIR_OFFLOAD_ENABLE;
+	if (ctx->sus_res_mcastbcast_filter_valid &&
+	    (ctx->sus_res_mcastbcast_filter &
+	     HDD_MCASTBCASTFILTER_FILTER_ALL_MULTICAST) &&
+	    !(WDA_IS_MCAST_FLT_ENABLE_IN_FW && ctx->cfg_ini->fEnableMCAddrList))
+		match_mode = SIR_OFFLOAD_NS_AND_MCAST_FILTER_ENABLE;
 
-    vos_mem_zero(selfIPv6AddrValid, slot_index * sizeof(tANI_U8));
+	for (i = 0; i < max(count, previous); i++) {
+		memset(&request, 0, sizeof(request));
+		request.offloadType = SIR_IPV6_NS_OFFLOAD;
+		request.nsOffloadInfo.slotIdx = i;
+		request.enableOrDisable = SIR_OFFLOAD_DISABLE;
+		if (i < count) {
+			addrconf_addr_solict_mult(&targets[i], &solicited);
+			memcpy(request.nsOffloadInfo.selfIPv6Addr, &solicited,
+			       sizeof(solicited));
+			memcpy(request.nsOffloadInfo.targetIPv6Addr[0],
+			       &targets[i], sizeof(targets[i]));
+			memcpy(request.params.hostIpv6Addr, &targets[i],
+			       sizeof(targets[i]));
+			memcpy(request.nsOffloadInfo.selfMacAddr,
+			       adapter->macAddressCurrent.bytes, ETH_ALEN);
+			request.nsOffloadInfo.targetIPv6AddrValid[0] =
+				SIR_IPV6_ADDR_VALID;
+			request.enableOrDisable = match_mode;
+		}
 
-    selfIPv6Addr = (tANI_U8 **)vos_mem_malloc(sizeof(tANI_U8 *) * slot_index);
+		if (sme_SetHostOffload(ctx->hHal, adapter->sessionId, &request) !=
+		    eHAL_STATUS_SUCCESS) {
+			/* Keep a possibly live slot tracked so it can be cleared. */
+			if (i < previous)
+				active = i + 1;
+			hddLog(LOGE, FL("NS offload slot %d update failed"), i);
+		} else if (i < count) {
+			active = i + 1;
+		}
+	}
 
-    if (NULL == selfIPv6Addr)
-    {
-        hddLog (VOS_TRACE_LEVEL_ERROR, FL("Failed to allocate memory for"
-                                         " selfIPv6Addr"));
-        goto end;
-    }
+	adapter->ns_slots = active;
+	if (count || previous)
+		hdd_wlan_offload_event(SIR_IPV6_NS_OFFLOAD,
+				       enable ? SIR_OFFLOAD_ENABLE : SIR_OFFLOAD_DISABLE);
+unlock:
+	mutex_unlock(&hdd_ns_offload_lock);
+}
 
-    vos_mem_zero(selfIPv6Addr, slot_index * sizeof(tANI_U8 *));
-
-    for (slot = 0; slot < slot_index; slot++)
-    {
-        selfIPv6Addr[slot] =
-           (tANI_U8 *)vos_mem_malloc(SIR_MAC_IPV6_ADDR_LEN);
-        if (NULL == selfIPv6Addr[slot])
-        {
-            hddLog (VOS_TRACE_LEVEL_ERROR, FL("Failed to allocate memory"
-                                              "for selfIPv6Addr"));
-            goto end;
-        }
-        vos_mem_zero(selfIPv6Addr[slot], SIR_MAC_IPV6_ADDR_LEN);
-    }
-
-    i = 0;
-
-    if (fenable)
-    {
-        in6_dev = __in6_dev_get(pAdapter->dev);
-        if (NULL != in6_dev)
-        {
-            read_lock_bh(&in6_dev->lock);
-            list_for_each(p, &in6_dev->addr_list)
-            {
-                if (i >= slot_index)
-                {
-                    hddLog (VOS_TRACE_LEVEL_ERROR,
-                            FL("IPv6 address list is greater than IPv6"
-                               "address supported by firmware"));
-                    hddLog (VOS_TRACE_LEVEL_ERROR,
-                            FL("FW supported IPv6 address = %d"), slot_index);
-                    break;
-                }
-                ifp = list_entry(p, struct inet6_ifaddr, if_list);
-                switch(ipv6_addr_src_scope(&ifp->addr))
-                {
-                    case IPV6_ADDR_SCOPE_LINKLOCAL:
-                        vos_mem_copy(selfIPv6Addr[i], &ifp->addr.s6_addr,
-                                sizeof(ifp->addr.s6_addr));
-                        selfIPv6AddrValid[i] = SIR_IPV6_ADDR_VALID;
-                        hddLog (VOS_TRACE_LEVEL_INFO,
-                           FL("Found IPV6_ADDR_SCOPE_LINKLOCAL Address : %pI6"),
-                               selfIPv6Addr[i]);
-                        break;
-                    case IPV6_ADDR_SCOPE_GLOBAL:
-                        vos_mem_copy(selfIPv6Addr[i], &ifp->addr.s6_addr,
-                                sizeof(ifp->addr.s6_addr));
-                        selfIPv6AddrValid[i] = SIR_IPV6_ADDR_VALID;
-                        hddLog (VOS_TRACE_LEVEL_INFO,
-                           FL("Found IPV6_ADDR_SCOPE_GLOBAL Address : %pI6"),
-                               selfIPv6Addr[i]);
-                        break;
-                    default:
-                        hddLog(VOS_TRACE_LEVEL_ERROR,
-                           FL("The Scope %d is not supported"),
-                               ipv6_addr_src_scope(&ifp->addr));
-                }
-                if (selfIPv6AddrValid[i] == SIR_IPV6_ADDR_VALID)
-                {
-                    i++;
-                }
-            }
-            /* store actual slots being used */
-            pAdapter->ns_slots = i;
-            read_unlock_bh(&in6_dev->lock);
-
-            vos_mem_zero(&offLoadRequest, sizeof(offLoadRequest));
-            for (i =0; i < slot_index; i++)
-            {
-                if (selfIPv6AddrValid[i])
-                {
-                    //Filling up the request structure
-                    /* Filling the selfIPv6Addr with solicited address
-                     * A Solicited-Node multicast address is created by
-                     * taking the last 24 bits of a unicast or anycast
-                     * address and appending them to the prefix
-                     *
-                     * FF02:0000:0000:0000:0000:0001:FFXX:XX
-                     *
-                     * here XX is the unicast/anycast bits
-                     */
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr[0] = 0xFF;
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr[1] = 0x02;
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr[11] = 0x01;
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr[12] = 0xFF;
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr[13] =
-                                                          selfIPv6Addr[i][13];
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr[14] =
-                                                          selfIPv6Addr[i][14];
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr[15] =
-                                                          selfIPv6Addr[i][15];
-                    offLoadRequest.nsOffloadInfo.slotIdx = i;
-
-                    vos_mem_copy(&offLoadRequest.nsOffloadInfo.targetIPv6Addr[0],
-                        selfIPv6Addr[i], sizeof(tANI_U8)*SIR_MAC_IPV6_ADDR_LEN);
-                    vos_mem_copy(&offLoadRequest.nsOffloadInfo.selfMacAddr,
-                                &pAdapter->macAddressCurrent.bytes,
-                                sizeof(tANI_U8)*SIR_MAC_ADDR_LEN);
-
-                    offLoadRequest.nsOffloadInfo.targetIPv6AddrValid[0] =
-                                                          SIR_IPV6_ADDR_VALID;
-                    offLoadRequest.offloadType =  SIR_IPV6_NS_OFFLOAD;
-                    offLoadRequest.enableOrDisable = SIR_OFFLOAD_ENABLE;
-                    hdd_wlan_offload_event(SIR_IPV6_NS_OFFLOAD,
-                                                     SIR_OFFLOAD_ENABLE);
-
-                    hddLog (VOS_TRACE_LEVEL_INFO,
-                       FL("configuredMcastBcastFilter: %d"
-                       "NSOffload Slot = %d"),
-                       pHddCtx->configuredMcastBcastFilter, i);
-
-                    if ((VOS_TRUE == pHddCtx->sus_res_mcastbcast_filter_valid)
-                        && ((HDD_MCASTBCASTFILTER_FILTER_ALL_MULTICAST ==
-                             pHddCtx->sus_res_mcastbcast_filter) ||
-                            (HDD_MCASTBCASTFILTER_FILTER_ALL_MULTICAST_BROADCAST ==
-                             pHddCtx->sus_res_mcastbcast_filter)) &&
-                        (!WDA_IS_MCAST_FLT_ENABLE_IN_FW ||
-                         (WDA_IS_MCAST_FLT_ENABLE_IN_FW &&
-                          !(pHddCtx->cfg_ini->fEnableMCAddrList))))
-                    {
-                        offLoadRequest.enableOrDisable =
-                            SIR_OFFLOAD_NS_AND_MCAST_FILTER_ENABLE;
-                    }
-                    hdd_wlan_offload_event(
-                                  SIR_OFFLOAD_NS_AND_MCAST_FILTER_ENABLE,
-                                  SIR_OFFLOAD_ENABLE);
-                    hddLog(VOS_TRACE_LEVEL_INFO,
-                        FL("offload: NS filter programmed %d"),
-                        offLoadRequest.enableOrDisable);
-                    vos_mem_copy(&offLoadRequest.params.hostIpv6Addr,
-                                &offLoadRequest.nsOffloadInfo.targetIPv6Addr[0],
-                                sizeof(tANI_U8)*SIR_MAC_IPV6_ADDR_LEN);
-
-                    hddLog (VOS_TRACE_LEVEL_INFO,
-                    FL("Setting NSOffload with solicitedIp: %pI6,"
-                       "targetIp: %pI6"),
-                    offLoadRequest.nsOffloadInfo.selfIPv6Addr,
-                    offLoadRequest.nsOffloadInfo.targetIPv6Addr[0]);
-
-                    //Configure the Firmware with this
-                    returnStatus = sme_SetHostOffload(halHandle,
-                                    pAdapter->sessionId, &offLoadRequest);
-                    if(eHAL_STATUS_SUCCESS != returnStatus)
-                    {
-                        hddLog(VOS_TRACE_LEVEL_ERROR,
-                        FL("Failed to enable HostOffload feature with"
-                           " status: %d"), returnStatus);
-                    }
-                    vos_mem_zero(&offLoadRequest, sizeof(offLoadRequest));
-                }
-            }
-        }
-        else
-        {
-            hddLog(VOS_TRACE_LEVEL_ERROR,
-                    FL("IPv6 dev does not exist. Failed to request NSOffload"));
-              goto end;
-        }
-    }
-    else
-    {
-        //Disable NSOffload
-        vos_mem_zero((void *)&offLoadRequest, sizeof(tSirHostOffloadReq));
-        offLoadRequest.enableOrDisable = SIR_OFFLOAD_DISABLE;
-        offLoadRequest.offloadType =  SIR_IPV6_NS_OFFLOAD;
-        hdd_wlan_offload_event(SIR_IPV6_NS_OFFLOAD,
-                                           SIR_OFFLOAD_DISABLE);
-
-        for (i = 0; i <  pAdapter->ns_slots; i++)
-        {
-            hddLog(VOS_TRACE_LEVEL_INFO, FL("Disable Slot= %d"), i);
-            offLoadRequest.nsOffloadInfo.slotIdx = i;
-            if (eHAL_STATUS_SUCCESS !=
-                 sme_SetHostOffload(WLAN_HDD_GET_HAL_CTX(pAdapter),
-                 pAdapter->sessionId, &offLoadRequest))
-            {
-                hddLog(VOS_TRACE_LEVEL_ERROR, FL("Failure to disable"
-                                                 " %d Slot"), i);
-            }
-        }
-        pAdapter->ns_slots = 0;
-    }
-end:
-    while (slot > 0 && selfIPv6Addr[--slot])
-    {
-       vos_mem_free(selfIPv6Addr[slot]);
-    }
-    if (selfIPv6Addr)
-    {
-       vos_mem_free(selfIPv6Addr);
-    }
-    if (selfIPv6AddrValid)
-    {
-       vos_mem_free(selfIPv6AddrValid);
-    }
-    EXIT();
-    return;
+void hdd_conf_ns_offload(hdd_adapter_t *adapter, int enable)
+{
+	hdd_update_ns_offload(adapter, !!enable, false);
 }
 #endif
 
