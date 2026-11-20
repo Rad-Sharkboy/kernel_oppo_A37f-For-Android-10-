@@ -65,6 +65,13 @@ static struct zcomp_backend *find_backend(const char *compress)
 	return backends[i];
 }
 
+const char *zcomp_algorithm_name(const char *compress)
+{
+	struct zcomp_backend *backend = find_backend(compress);
+
+	return backend ? backend->name : NULL;
+}
+
 static void zcomp_strm_free(struct zcomp *comp, struct zcomp_strm *zstrm)
 {
 	if (zstrm->private)
@@ -117,7 +124,8 @@ static struct zcomp_strm *zcomp_strm_multi_find(struct zcomp *comp)
 		/* zstrm streams limit reached, wait for idle stream */
 		if (zs->avail_strm >= zs->max_strm) {
 			spin_unlock(&zs->strm_lock);
-			wait_event(zs->strm_wait, !list_empty(&zs->idle_strm));
+			wait_event(zs->strm_wait, !list_empty(&zs->idle_strm) ||
+				   ACCESS_ONCE(zs->avail_strm) < ACCESS_ONCE(zs->max_strm));
 			continue;
 		}
 		/* allocate new zstrm stream */
@@ -159,9 +167,12 @@ static void zcomp_strm_multi_release(struct zcomp *comp, struct zcomp_strm *zstr
 static bool zcomp_strm_multi_set_max_streams(struct zcomp *comp, int num_strm)
 {
 	struct zcomp_strm_multi *zs = comp->stream;
-	struct zcomp_strm *zstrm;
+	struct zcomp_strm *zstrm, *tmp;
+	LIST_HEAD(reclaim);
+	int old_max;
 
 	spin_lock(&zs->strm_lock);
+	old_max = zs->max_strm;
 	zs->max_strm = num_strm;
 	/*
 	 * if user has lowered the limit and there are idle streams,
@@ -170,11 +181,17 @@ static bool zcomp_strm_multi_set_max_streams(struct zcomp *comp, int num_strm)
 	while (zs->avail_strm > num_strm && !list_empty(&zs->idle_strm)) {
 		zstrm = list_entry(zs->idle_strm.next,
 				struct zcomp_strm, list);
-		list_del(&zstrm->list);
-		zcomp_strm_free(comp, zstrm);
+		list_move(&zstrm->list, &reclaim);
 		zs->avail_strm--;
 	}
 	spin_unlock(&zs->strm_lock);
+
+	if (num_strm > old_max)
+		wake_up_all(&zs->strm_wait);
+	list_for_each_entry_safe(zstrm, tmp, &reclaim, list) {
+		list_del(&zstrm->list);
+		zcomp_strm_free(comp, zstrm);
+	}
 	return true;
 }
 

@@ -103,8 +103,12 @@ static ssize_t disksize_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct zram *zram = dev_to_zram(dev);
+	u64 size;
 
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", zram->disksize);
+	down_read(&zram->init_lock);
+	size = zram->disksize;
+	up_read(&zram->init_lock);
+	return scnprintf(buf, PAGE_SIZE, "%llu\n", size);
 }
 
 static ssize_t initstate_show(struct device *dev,
@@ -174,16 +178,61 @@ static ssize_t mem_limit_show(struct device *dev,
 	return scnprintf(buf, PAGE_SIZE, "%llu\n", val << PAGE_SHIFT);
 }
 
+/* Accept byte counts and the conventional binary size suffixes. */
+static int zram_parse_size(const char *buf, u64 *bytes)
+{
+	char value[32];
+	char *number, *suffix;
+	int shift, ret;
+
+	if (strlcpy(value, buf, sizeof(value)) >= sizeof(value))
+		return -EINVAL;
+	number = strim(value);
+
+	ret = kstrtoull(number, 0, bytes);
+	if (ret != -EINVAL)
+		return ret;
+
+	suffix = number + strlen(number);
+	if (suffix > number && (suffix[-1] == 'B' || suffix[-1] == 'b')) {
+		suffix--;
+		if (suffix > number && (suffix[-1] == 'I' || suffix[-1] == 'i'))
+			suffix--;
+	}
+	if (suffix == number)
+		return -EINVAL;
+	switch (suffix[-1]) {
+	case 'K': case 'k': shift = 10; break;
+	case 'M': case 'm': shift = 20; break;
+	case 'G': case 'g': shift = 30; break;
+	case 'T': case 't': shift = 40; break;
+	case 'P': case 'p': shift = 50; break;
+	case 'E': case 'e': shift = 60; break;
+	default: return -EINVAL;
+	}
+
+	*--suffix = '\0';
+	ret = kstrtoull(number, 0, bytes);
+	if (ret)
+		return ret;
+	if (*bytes > (U64_MAX >> shift))
+		return -EOVERFLOW;
+	*bytes <<= shift;
+	return 0;
+}
+
 static ssize_t mem_limit_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
 	u64 limit;
-	char *tmp;
 	struct zram *zram = dev_to_zram(dev);
+	int ret;
 
-	limit = memparse(buf, &tmp);
-	if (buf == tmp || limit > U64_MAX - (PAGE_SIZE - 1))
-		return -EINVAL;
+	ret = zram_parse_size(buf, &limit);
+	if (ret)
+		return ret;
+	if (limit > U64_MAX - (PAGE_SIZE - 1))
+		return -EOVERFLOW;
 	limit = PAGE_ALIGN(limit) >> PAGE_SHIFT;
 	if (limit > ULONG_MAX)
 		return -EINVAL;
@@ -278,13 +327,21 @@ static ssize_t comp_algorithm_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
 	struct zram *zram = dev_to_zram(dev);
+	const char *algorithm;
+
 	down_write(&zram->init_lock);
 	if (init_done(zram)) {
 		up_write(&zram->init_lock);
 		pr_info("Can't change algorithm for initialized device\n");
 		return -EBUSY;
 	}
-	strlcpy(zram->compressor, buf, sizeof(zram->compressor));
+
+	algorithm = zcomp_algorithm_name(buf);
+	if (!algorithm) {
+		up_write(&zram->init_lock);
+		return -EINVAL;
+	}
+	strlcpy(zram->compressor, algorithm, sizeof(zram->compressor));
 	up_write(&zram->init_lock);
 	return len;
 }
@@ -424,11 +481,14 @@ static void update_position(u32 *index, int *offset, struct bio_vec *bvec)
 
 static int page_same_filled(void *ptr, unsigned long *element)
 {
-	unsigned int pos;
+	unsigned int pos, last = PAGE_SIZE / sizeof(unsigned long) - 1;
 	unsigned long *page = ptr;
 	unsigned long value = page[0];
 
-	for (pos = 1; pos != PAGE_SIZE / sizeof(*page); pos++)
+	/* Quickly rule out pages with a long uniform prefix. */
+	if (page[last] != value)
+		return 0;
+	for (pos = 1; pos < last; pos++)
 		if (page[pos] != value)
 			return 0;
 
@@ -457,16 +517,19 @@ static void zram_copy_partial_same(struct bio_vec *bvec, int offset,
 	if (!element) {
 		memset(dst, 0, remaining);
 	} else {
+		u8 pattern[sizeof(element)];
 		unsigned int pos = offset % sizeof(element);
+		unsigned int tail = sizeof(element) - pos;
+		unsigned int copied = min_t(unsigned int, sizeof(element), remaining);
 
-		while (remaining) {
-			unsigned int copy = min_t(unsigned int, remaining,
-						  sizeof(element) - pos);
+		memcpy(pattern, word + pos, tail);
+		memcpy(pattern + tail, word, pos);
+		memcpy(dst, pattern, copied);
+		while (copied < remaining) {
+			unsigned int count = min(copied, remaining - copied);
 
-			memcpy(dst, word + pos, copy);
-			dst += copy;
-			remaining -= copy;
-			pos = 0;
+			memcpy(dst + copied, dst, count);
+			copied += count;
 		}
 	}
 	kunmap_atomic(base);
@@ -501,6 +564,7 @@ static void zram_free_page(struct zram *zram, size_t index)
 			zram_clear_flag(meta, index, ZRAM_ZERO);
 			atomic64_dec(&zram->stats.zero_pages);
 			atomic64_dec(&zram->stats.same_pages);
+			atomic64_dec(&zram->stats.pages_stored);
 		}
 		return;
 	}
@@ -666,12 +730,12 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 		if (element) {
 			meta->table[index].handle = element;
 			zram_set_flag(meta, index, ZRAM_SAME);
-			atomic64_inc(&zram->stats.pages_stored);
 		} else {
 			zram_set_flag(meta, index, ZRAM_ZERO);
 			atomic64_inc(&zram->stats.zero_pages);
 		}
 		atomic64_inc(&zram->stats.same_pages);
+		atomic64_inc(&zram->stats.pages_stored);
 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
 		ret = 0;
 		goto out;
@@ -846,6 +910,8 @@ static void zram_reset_device(struct zram *zram)
 
 	/* Reset stats */
 	memset(&zram->stats, 0, sizeof(zram->stats));
+	zram->meta = NULL;
+	zram->comp = NULL;
 	zram->disksize = 0;
 	zram->max_comp_streams = 1;
 
@@ -867,7 +933,9 @@ static ssize_t disksize_store(struct device *dev,
 	struct zram *zram = dev_to_zram(dev);
 	int err;
 
-	disksize = memparse(buf, NULL);
+	err = zram_parse_size(buf, &disksize);
+	if (err)
+		return err;
 	if (!disksize)
 		return -EINVAL;
 	if (disksize > U64_MAX - (PAGE_SIZE - 1))
@@ -932,6 +1000,12 @@ static ssize_t reset_store(struct device *dev,
 	struct zram *zram;
 	struct block_device *bdev;
 
+	ret = kstrtou16(buf, 10, &do_reset);
+	if (ret)
+		return ret;
+	if (!do_reset)
+		return -EINVAL;
+
 	zram = dev_to_zram(dev);
 	bdev = bdget_disk(zram->disk, 0);
 
@@ -945,17 +1019,10 @@ static ssize_t reset_store(struct device *dev,
 		goto out;
 	}
 
-	ret = kstrtou16(buf, 10, &do_reset);
+	/* Failed writeback must leave the existing device intact. */
+	ret = fsync_bdev(bdev);
 	if (ret)
 		goto out;
-
-	if (!do_reset) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	/* Make sure all pending I/O is finished */
-	fsync_bdev(bdev);
 	zram_reset_device(zram);
 
 	mutex_unlock(&bdev->bd_mutex);
@@ -1114,7 +1181,7 @@ static ssize_t mm_stat_show(struct device *dev,
 {
 	struct zram *zram = dev_to_zram(dev);
 	u64 orig_size, mem_used = 0;
-	long max_used;
+	u64 max_used;
 	ssize_t ret;
 
 	down_read(&zram->init_lock);
@@ -1125,11 +1192,11 @@ static ssize_t mm_stat_show(struct device *dev,
 	max_used = atomic_long_read(&zram->stats.max_used_pages);
 
 	ret = scnprintf(buf, PAGE_SIZE,
-			"%8llu %8llu %8llu %8lu %8ld %8llu %8llu\n",
+			"%8llu %8llu %8llu %8llu %8llu %8llu %8llu\n",
 			orig_size << PAGE_SHIFT,
 			(u64)atomic64_read(&zram->stats.compr_data_size),
 			mem_used << PAGE_SHIFT,
-			zram->limit_pages << PAGE_SHIFT,
+			(u64)zram->limit_pages << PAGE_SHIFT,
 			max_used << PAGE_SHIFT,
 			(u64)atomic64_read(&zram->stats.zero_pages),
 			(u64)atomic64_read(&zram->stats.num_migrated));
@@ -1292,10 +1359,9 @@ static void destroy_devices(unsigned int nr)
 		sysfs_remove_group(&disk_to_dev(zram->disk)->kobj,
 				&zram_disk_attr_group);
 
-		zram_reset_device(zram);
-
-		blk_cleanup_queue(zram->disk->queue);
 		del_gendisk(zram->disk);
+		zram_reset_device(zram);
+		blk_cleanup_queue(zram->disk->queue);
 		put_disk(zram->disk);
 	}
 
@@ -1308,7 +1374,7 @@ static int __init zram_init(void)
 {
 	int ret, dev_id;
 
-	if (num_devices > max_num_devices) {
+	if (!num_devices || num_devices > max_num_devices) {
 		pr_warn("Invalid value for num_devices: %u\n",
 				num_devices);
 		return -EINVAL;
