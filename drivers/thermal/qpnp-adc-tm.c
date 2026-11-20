@@ -555,79 +555,47 @@ static int32_t qpnp_adc_tm_timer_interval_select(
 		struct qpnp_adc_tm_chip *chip, uint32_t btm_chan,
 		struct qpnp_vadc_chan_properties *chan_prop)
 {
-	int rc, chan_idx = 0, i = 0;
-	bool chan_found = false;
-	u8 meas_interval_timer2 = 0, timer_interval_store = 0;
-	uint32_t btm_chan_idx = 0;
+	struct qpnp_adc_tm_sensor *sensor = NULL;
+	u32 btm_chan_idx;
+	u8 reg, value, mask;
+	int i, rc;
 
-	while (i < chip->max_channels_available) {
+	for (i = 0; i < chip->max_channels_available; i++)
 		if (chip->sensor[i].btm_channel_num == btm_chan) {
-			chan_idx = i;
-			chan_found = true;
-			i++;
-		} else
-			i++;
-	}
-
-	if (!chan_found) {
-		pr_err("Channel not found\n");
+			sensor = &chip->sensor[i];
+			break;
+		}
+	if (!sensor)
 		return -EINVAL;
-	}
 
-	switch (chip->sensor[chan_idx].timer_select) {
+	value = sensor->meas_interval;
+	switch (sensor->timer_select) {
 	case ADC_MEAS_TIMER_SELECT1:
-		rc = qpnp_adc_tm_write_reg(chip,
-				QPNP_ADC_TM_MEAS_INTERVAL_CTL,
-				chip->sensor[chan_idx].meas_interval);
-		if (rc < 0) {
-			pr_err("timer1 configure failed\n");
-			return rc;
-		}
-	break;
+		rc = qpnp_adc_tm_write_reg(chip, QPNP_ADC_TM_MEAS_INTERVAL_CTL,
+					   value);
+		break;
 	case ADC_MEAS_TIMER_SELECT2:
-		/* Thermal channels uses timer2, default to 1 second */
-		rc = qpnp_adc_tm_read_reg(chip,
-				QPNP_ADC_TM_MEAS_INTERVAL_CTL2,
-				&meas_interval_timer2);
-		if (rc < 0) {
-			pr_err("timer2 configure read failed\n");
-			return rc;
-		}
-		timer_interval_store = chip->sensor[chan_idx].meas_interval;
-		timer_interval_store <<= QPNP_ADC_TM_MEAS_INTERVAL_CTL2_SHIFT;
-		timer_interval_store &= QPNP_ADC_TM_MEAS_INTERVAL_CTL2_MASK;
-		meas_interval_timer2 |= timer_interval_store;
-		rc = qpnp_adc_tm_write_reg(chip,
-			QPNP_ADC_TM_MEAS_INTERVAL_CTL2,
-			meas_interval_timer2);
-		if (rc < 0) {
-			pr_err("timer2 configure failed\n");
-			return rc;
-		}
-	break;
 	case ADC_MEAS_TIMER_SELECT3:
-		rc = qpnp_adc_tm_read_reg(chip,
-				QPNP_ADC_TM_MEAS_INTERVAL_CTL2,
-				&meas_interval_timer2);
-		if (rc < 0) {
-			pr_err("timer3 read failed\n");
-			return rc;
+		if (sensor->timer_select == ADC_MEAS_TIMER_SELECT2) {
+			mask = QPNP_ADC_TM_MEAS_INTERVAL_CTL2_MASK;
+			value <<= QPNP_ADC_TM_MEAS_INTERVAL_CTL2_SHIFT;
+		} else {
+			mask = QPNP_ADC_TM_MEAS_INTERVAL_CTL3_MASK;
 		}
-		timer_interval_store = chip->sensor[chan_idx].meas_interval;
-		timer_interval_store &= QPNP_ADC_TM_MEAS_INTERVAL_CTL3_MASK;
-		meas_interval_timer2 |= timer_interval_store;
-		rc = qpnp_adc_tm_write_reg(chip,
-			QPNP_ADC_TM_MEAS_INTERVAL_CTL2,
-			meas_interval_timer2);
-		if (rc < 0) {
-			pr_err("timer3 configure failed\n");
+		rc = qpnp_adc_tm_read_reg(chip, QPNP_ADC_TM_MEAS_INTERVAL_CTL2,
+					  &reg);
+		if (rc)
 			return rc;
-		}
-	break;
+		value = (reg & ~mask) | (value & mask);
+		if (value != reg)
+			rc = qpnp_adc_tm_write_reg(chip, QPNP_ADC_TM_MEAS_INTERVAL_CTL2,
+						   value);
+		break;
 	default:
-		pr_err("Invalid timer selection\n");
 		return -EINVAL;
 	}
+	if (rc)
+		return rc;
 
 	/* Select the timer to use for the corresponding channel */
 	rc = qpnp_adc_tm_get_btm_idx(btm_chan, &btm_chan_idx);
@@ -637,15 +605,15 @@ static int32_t qpnp_adc_tm_timer_interval_select(
 	}
 	rc = qpnp_adc_tm_write_reg(chip,
 			adc_tm_data[btm_chan_idx].meas_interval_ctl,
-				chip->sensor[chan_idx].timer_select);
+				sensor->timer_select);
 	if (rc < 0) {
 		pr_err("TM channel timer configure failed\n");
 		return rc;
 	}
 
 	pr_debug("timer select:%d, timer_value_within_select:%d, channel:%x\n",
-			chip->sensor[chan_idx].timer_select,
-			chip->sensor[chan_idx].meas_interval,
+			sensor->timer_select,
+			sensor->meas_interval,
 			btm_chan);
 
 	return rc;
