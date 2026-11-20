@@ -414,6 +414,7 @@ static struct {
 	struct qpnp_adc_tm_chip *adc_tm_dev;
 	struct qpnp_vadc_chip *vadc_dev;
 	struct mutex vbat_monitor_mutex;
+	bool vbat_monitor_stopping;
 	u16 unsafe_ch_count;
 	u16 unsafe_ch_list[WCNSS_MAX_CH_NUM];
 	void *wcnss_notif_hdle;
@@ -1880,36 +1881,43 @@ static int wcnss_get_battery_volt(int *result_uv)
 
 static void wcnss_notify_vbat(enum qpnp_tm_state state, void *ctx)
 {
-	mutex_lock(&penv->vbat_monitor_mutex);
+	struct wcnss_wlan_env *env = ctx;
+	int rc;
+
+	mutex_lock(&env->vbat_monitor_mutex);
+	if (env->vbat_monitor_stopping)
+		goto out;
 
 	if (state == ADC_TM_LOW_STATE) {
 		pr_debug("wcnss: low voltage notification triggered\n");
-		penv->vbat_monitor_params.state_request =
+		env->vbat_monitor_params.state_request =
 			ADC_TM_HIGH_THR_ENABLE;
-		penv->vbat_monitor_params.high_thr = WCNSS_VBATT_THRESHOLD +
+		env->vbat_monitor_params.high_thr = WCNSS_VBATT_THRESHOLD +
 		WCNSS_VBATT_GUARD;
-		penv->vbat_monitor_params.low_thr = 0;
+		env->vbat_monitor_params.low_thr = 0;
 	} else if (state == ADC_TM_HIGH_STATE) {
-		penv->vbat_monitor_params.state_request =
+		env->vbat_monitor_params.state_request =
 			ADC_TM_LOW_THR_ENABLE;
-		penv->vbat_monitor_params.low_thr = WCNSS_VBATT_THRESHOLD -
+		env->vbat_monitor_params.low_thr = WCNSS_VBATT_THRESHOLD -
 		WCNSS_VBATT_GUARD;
-		penv->vbat_monitor_params.high_thr = 0;
+		env->vbat_monitor_params.high_thr = 0;
 		pr_debug("wcnss: high voltage notification triggered\n");
 	} else {
 		pr_debug("wcnss: unknown voltage notification state: %d\n",
 				state);
-		mutex_unlock(&penv->vbat_monitor_mutex);
-		return;
+		goto out;
 	}
 	pr_debug("wcnss: set low thr to %d and high to %d\n",
-			penv->vbat_monitor_params.low_thr,
-			penv->vbat_monitor_params.high_thr);
+			env->vbat_monitor_params.low_thr,
+			env->vbat_monitor_params.high_thr);
 
-	qpnp_adc_tm_channel_measure(penv->adc_tm_dev,
-			&penv->vbat_monitor_params);
-	mod_delayed_work(system_wq, &penv->vbatt_work, msecs_to_jiffies(2000));
-	mutex_unlock(&penv->vbat_monitor_mutex);
+	rc = qpnp_adc_tm_channel_measure(env->adc_tm_dev,
+					 &env->vbat_monitor_params);
+	if (rc)
+		pr_warn_ratelimited("wcnss: VBAT rearm failed: %d\n", rc);
+	mod_delayed_work(system_wq, &env->vbatt_work, msecs_to_jiffies(2000));
+out:
+	mutex_unlock(&env->vbat_monitor_mutex);
 }
 
 static int wcnss_setup_vbat_monitoring(void)
@@ -1921,6 +1929,12 @@ static int wcnss_setup_vbat_monitoring(void)
 		return rc;
 	}
 	mutex_lock(&penv->vbat_monitor_mutex);
+	if (penv->vbat_monitor_stopping) {
+		mutex_unlock(&penv->vbat_monitor_mutex);
+		return -ESHUTDOWN;
+	}
+	/* Start with no cached state after firmware reload. */
+	penv->fw_vbatt_state = WCNSS_CONFIG_UNSPECIFIED;
 	penv->vbat_monitor_params.low_thr = WCNSS_VBATT_THRESHOLD;
 	penv->vbat_monitor_params.high_thr = WCNSS_VBATT_THRESHOLD;
 	penv->vbat_monitor_params.state_request = ADC_TM_HIGH_LOW_THR_ENABLE;
@@ -1972,6 +1986,8 @@ static void wcnss_update_vbatt(struct work_struct *work)
 	vbatt_msg.vbatt.threshold = WCNSS_VBATT_THRESHOLD;
 
 	mutex_lock(&penv->vbat_monitor_mutex);
+	if (penv->vbat_monitor_stopping)
+		goto out;
 	vbatt_msg.vbatt.curr_volt = penv->vbat_monitor_params.low_thr ?
 				WCNSS_VBATT_HIGH : WCNSS_VBATT_LOW;
 	if (penv->fw_vbatt_state != vbatt_msg.vbatt.curr_volt) {
@@ -1981,6 +1997,7 @@ static void wcnss_update_vbatt(struct work_struct *work)
 		else
 			penv->fw_vbatt_state = vbatt_msg.vbatt.curr_volt;
 	}
+out:
 	mutex_unlock(&penv->vbat_monitor_mutex);
 }
 
@@ -3402,6 +3419,21 @@ wcnss_wlan_remove(struct platform_device *pdev)
 	misc_deregister(&wcnss_usr_ctrl);
 	if (penv->wcnss_notif_hdle)
 		subsys_notif_unregister_notifier(penv->wcnss_notif_hdle, &wnb);
+	if (penv->adc_tm_dev) {
+		int rc;
+
+		mutex_lock(&penv->vbat_monitor_mutex);
+		penv->vbat_monitor_stopping = true;
+		mutex_unlock(&penv->vbat_monitor_mutex);
+
+		if (penv->vbat_monitor_params.threshold_notification) {
+			rc = qpnp_adc_tm_unregister_client(penv->adc_tm_dev,
+						   &penv->vbat_monitor_params);
+			if (rc)
+				dev_warn(&pdev->dev, "VBAT detach failed: %d\n", rc);
+		}
+		cancel_delayed_work_sync(&penv->vbatt_work);
+	}
 	if (penv->wake_initialized) {
 		cancel_delayed_work_sync(&penv->wcnss_pm_qos_del_req);
 		wcnss_disable_pc_remove_req();
