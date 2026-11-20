@@ -647,7 +647,8 @@ void hdd_conf_hostoffload(hdd_adapter_t *pAdapter, v_BOOL_t fenable)
     {
         if (fenable)
         {
-            if (((WLAN_HDD_INFRA_STATION == pAdapter->device_mode) &&
+            if ((((WLAN_HDD_INFRA_STATION == pAdapter->device_mode) ||
+                  (WLAN_HDD_P2P_CLIENT == pAdapter->device_mode)) &&
                 (eConnectionState_Associated ==
                 (WLAN_HDD_GET_STATION_CTX_PTR(pAdapter))->conn_info.connState))
                 || (WLAN_HDD_SOFTAP == pAdapter->device_mode))
@@ -987,88 +988,48 @@ static __be32 hdd_arp_ipv4_addr(struct net_device *dev)
 	return addr;
 }
 
-VOS_STATUS hdd_conf_arp_offload(hdd_adapter_t *pAdapter, int fenable)
+static DEFINE_MUTEX(hdd_arp_offload_lock);
+
+VOS_STATUS hdd_conf_arp_offload(hdd_adapter_t *adapter, int enable)
 {
-   __be32 addr = 0;
-   tSirHostOffloadReq offLoadRequest = { 0 };
-   hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
+	hdd_context_t *ctx = WLAN_HDD_GET_CTX(adapter);
+	tSirHostOffloadReq request = { 0 };
+	VOS_STATUS status = VOS_STATUS_SUCCESS;
+	__be32 addr = 0;
+	bool missing = false;
 
-   hddLog(VOS_TRACE_LEVEL_INFO, FL(" fenable = %d "), fenable);
+	mutex_lock(&hdd_arp_offload_lock);
+	/* Address work queued before resume must not re-enable the filter. */
+	if (enable == 2 && !ACCESS_ONCE(ctx->hdd_wlan_suspended))
+		goto out;
+	if (enable) {
+		addr = hdd_arp_ipv4_addr(adapter->dev);
+		missing = !addr;
+	}
+	request.offloadType = SIR_IPV4_ARP_REPLY_OFFLOAD;
+	request.enableOrDisable = SIR_OFFLOAD_DISABLE;
+	if (addr) {
+		request.enableOrDisable = SIR_OFFLOAD_ENABLE;
+		if (ctx->sus_res_mcastbcast_filter_valid &&
+		    (ctx->sus_res_mcastbcast_filter &
+		     HDD_MCASTBCASTFILTER_FILTER_ALL_BROADCAST))
+			request.enableOrDisable = SIR_OFFLOAD_ARP_AND_BCAST_FILTER_ENABLE;
+		memcpy(request.params.hostIpv4Addr, &addr, sizeof(addr));
+	}
 
-   if (fenable)
-       addr = hdd_arp_ipv4_addr(pAdapter->dev);
-
-   /* Address changes during suspend can also remove the last IPv4 address. */
-   if (fenable == 2 && !addr)
-       fenable = FALSE;
-   if (fenable)
-   {
-       if (addr)
-       {
-           offLoadRequest.offloadType =  SIR_IPV4_ARP_REPLY_OFFLOAD;
-           offLoadRequest.enableOrDisable = SIR_OFFLOAD_ENABLE;
-           hdd_wlan_offload_event(SIR_IPV4_ARP_REPLY_OFFLOAD,
-                                           SIR_OFFLOAD_ENABLE);
-
-           hddLog(VOS_TRACE_LEVEL_INFO, "%s: Enabled", __func__);
-
-           if (((HDD_MCASTBCASTFILTER_FILTER_ALL_BROADCAST ==
-                pHddCtx->sus_res_mcastbcast_filter) ||
-               (HDD_MCASTBCASTFILTER_FILTER_ALL_MULTICAST_BROADCAST ==
-                pHddCtx->sus_res_mcastbcast_filter)) &&
-               (VOS_TRUE == pHddCtx->sus_res_mcastbcast_filter_valid))
-           {
-               offLoadRequest.enableOrDisable =
-                   SIR_OFFLOAD_ARP_AND_BCAST_FILTER_ENABLE;
-               hddLog(VOS_TRACE_LEVEL_INFO,
-                      "offload: inside arp offload conditional check");
-           }
-           hdd_wlan_offload_event(SIR_OFFLOAD_ARP_AND_BCAST_FILTER_ENABLE,
-                                           SIR_OFFLOAD_ENABLE);
-
-           hddLog(VOS_TRACE_LEVEL_INFO, "offload: arp filter programmed = %d",
-                  offLoadRequest.enableOrDisable);
-
-           memcpy(offLoadRequest.params.hostIpv4Addr, &addr, sizeof(addr));
-           hddLog(VOS_TRACE_LEVEL_INFO, " Enable SME HostOffload: %d.%d.%d.%d",
-                  offLoadRequest.params.hostIpv4Addr[0],
-                  offLoadRequest.params.hostIpv4Addr[1],
-                  offLoadRequest.params.hostIpv4Addr[2],
-                  offLoadRequest.params.hostIpv4Addr[3]);
-
-          if (eHAL_STATUS_SUCCESS !=
-                    sme_SetHostOffload(WLAN_HDD_GET_HAL_CTX(pAdapter),
-                    pAdapter->sessionId, &offLoadRequest))
-          {
-              hddLog(VOS_TRACE_LEVEL_ERROR, "%s: Failed to enable HostOffload "
-                      "feature", __func__);
-              return VOS_STATUS_E_FAILURE;
-          }
-       }
-       else
-       {
-           hddLog(VOS_TRACE_LEVEL_WARN, FL("IP Address is not assigned"));
-           return VOS_STATUS_E_AGAIN;
-       }
-
-       return VOS_STATUS_SUCCESS;
-   }
-   else
-   {
-       offLoadRequest.enableOrDisable = SIR_OFFLOAD_DISABLE;
-       offLoadRequest.offloadType =  SIR_IPV4_ARP_REPLY_OFFLOAD;
-       hdd_wlan_offload_event(SIR_IPV4_ARP_REPLY_OFFLOAD,
-                                           SIR_OFFLOAD_DISABLE);
-       if (eHAL_STATUS_SUCCESS !=
-                 sme_SetHostOffload(WLAN_HDD_GET_HAL_CTX(pAdapter),
-                 pAdapter->sessionId, &offLoadRequest))
-       {
-            hddLog(VOS_TRACE_LEVEL_ERROR, "%s: Failure to disable host "
-                             "offload feature", __func__);
-            return VOS_STATUS_E_FAILURE;
-       }
-       return VOS_STATUS_SUCCESS;
-   }
+	if (sme_SetHostOffload(ctx->hHal, adapter->sessionId, &request) !=
+	    eHAL_STATUS_SUCCESS) {
+		hddLog(LOGE, FL("ARP offload update failed"));
+		status = VOS_STATUS_E_FAILURE;
+	} else {
+		hdd_wlan_offload_event(SIR_IPV4_ARP_REPLY_OFFLOAD,
+				       request.enableOrDisable);
+		if (missing && enable != 2)
+			status = VOS_STATUS_E_AGAIN;
+	}
+out:
+	mutex_unlock(&hdd_arp_offload_lock);
+	return status;
 }
 
 /*
@@ -1473,7 +1434,7 @@ void hdd_suspend_wlan(void)
       return;
    }
 
-   pHddCtx->hdd_wlan_suspended = TRUE;
+   ACCESS_ONCE(pHddCtx->hdd_wlan_suspended) = TRUE;
    hdd_wlan_suspend_resume_event(HDD_WLAN_EARLY_SUSPEND);
    hdd_set_pwrparams(pHddCtx);
    status =  hdd_get_front_adapter ( pHddCtx, &pAdapterNode );
@@ -1837,7 +1798,7 @@ void hdd_resume_wlan(void)
       return;
    }
 
-   pHddCtx->hdd_wlan_suspended = FALSE;
+   ACCESS_ONCE(pHddCtx->hdd_wlan_suspended) = FALSE;
    hdd_wlan_suspend_resume_event(HDD_WLAN_EARLY_RESUME);
 
    /* Get first valid adapter for disable/enable  bmps purpose */
