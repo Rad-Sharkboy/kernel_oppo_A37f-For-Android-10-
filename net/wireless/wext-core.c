@@ -441,6 +441,14 @@ static struct nlmsghdr *rtnetlink_ifinfo_prep(struct net_device *dev,
 }
 
 
+static struct sk_buff *wireless_event_alloc(unsigned int event_len)
+{
+	unsigned int payload = NLMSG_ALIGN(sizeof(struct ifinfomsg)) +
+			       nla_total_size(IFNAMSIZ) + nla_total_size(event_len);
+
+	return nlmsg_new(payload, GFP_ATOMIC);
+}
+
 /*
  * Main event dispatcher. Called from other parts and drivers.
  * Send the event on the appropriate channels.
@@ -550,7 +558,7 @@ void wireless_send_event(struct net_device *	dev,
 	 * On 32-bit, all the padding shouldn't be there.
 	 */
 
-	skb = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
+	skb = wireless_event_alloc(event_len);
 	if (!skb)
 		return;
 
@@ -582,7 +590,7 @@ void wireless_send_event(struct net_device *	dev,
 	hdr_len = compat_event_type_size[descr->header_type];
 	event_len = hdr_len + extra_len;
 
-	compskb = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
+	compskb = wireless_event_alloc(event_len);
 	if (!compskb) {
 		kfree_skb(skb);
 		return;
