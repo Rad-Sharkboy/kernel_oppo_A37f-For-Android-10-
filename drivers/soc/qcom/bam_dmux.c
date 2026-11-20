@@ -284,6 +284,7 @@ static DEFINE_MUTEX(smsm_cb_lock);
 static DEFINE_MUTEX(delayed_ul_vote_lock);
 static int need_delayed_ul_vote;
 static int in_ssr;
+static bool modem_stopping;
 static int ssr_skipped_disconnect;
 static struct completion shutdown_completion;
 
@@ -2000,7 +2001,7 @@ static void ul_wakeup(void)
 		return;
 	}
 
-	if (!ACCESS_ONCE(in_global_reset))
+	if (!ACCESS_ONCE(in_global_reset) && ACCESS_ONCE(bam_connection_is_active))
 		ul_start_idle_timer();
 out:
 	mutex_unlock(&wakeup_lock);
@@ -2010,8 +2011,6 @@ static int reconnect_to_bam(void)
 {
 	int rc;
 
-	in_global_reset = 0;
-	in_ssr = 0;
 	vote_dfab();
 
 	if (ssr_skipped_disconnect) {
@@ -2216,10 +2215,19 @@ static int restart_notifier_cb(struct notifier_block *this,
 	 * processing.  We do not wat to access the bam hardware during SSR
 	 * because a watchdog crash from a bus stall would likely occur.
 	 */
+	if (code == SUBSYS_BEFORE_POWERUP) {
+		mutex_lock(&smsm_cb_lock);
+		modem_stopping = false;
+		mutex_unlock(&smsm_cb_lock);
+		return NOTIFY_DONE;
+	}
 	if (code == SUBSYS_BEFORE_SHUTDOWN) {
 		BAM_DMUX_LOG("%s: begin\n", __func__);
+		mutex_lock(&smsm_cb_lock);
+		modem_stopping = true;
 		ACCESS_ONCE(in_global_reset) = 1;
 		in_ssr = 1;
+		mutex_unlock(&smsm_cb_lock);
 		complete_all(&ul_wakeup_ack_completion);
 		complete_all(&bam_connection_completion);
 
@@ -2305,8 +2313,6 @@ static int bam_init(void)
 	void *a2_virt_addr;
 	int skip_iounmap = 0;
 
-	in_global_reset = 0;
-	in_ssr = 0;
 	vote_dfab();
 	/* init BAM */
 	a2_virt_addr = ioremap_nocache(a2_phys_base, a2_phys_size);
@@ -2523,11 +2529,13 @@ static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 	mutex_lock(&smsm_cb_lock);
 	DBG_INC_A2_POWER_CONTROL_IN_CNT();
 	BAM_DMUX_LOG("%s: 0x%08x -> 0x%08x\n", __func__, old_state, new_state);
-	if (power == bam_dmux_power_state)
+	if ((power && modem_stopping) || power == bam_dmux_power_state)
 		goto out;
 
 	bam_dmux_power_state = power;
 	if (power) {
+		ACCESS_ONCE(in_global_reset) = 0;
+		in_ssr = 0;
 		if (bam_power_up())
 			mod_delayed_work(system_wq, &bam_power_retry,
 					 msecs_to_jiffies(100));
@@ -2577,8 +2585,11 @@ void msm_bam_dmux_deinit(void)
 {
 	restart_notifier_cb(NULL, SUBSYS_BEFORE_SHUTDOWN, NULL);
 	restart_notifier_cb(NULL, SUBSYS_AFTER_SHUTDOWN, NULL);
+	mutex_lock(&smsm_cb_lock);
+	modem_stopping = false;
 	in_global_reset = 0;
 	in_ssr = 0;
+	mutex_unlock(&smsm_cb_lock);
 }
 EXPORT_SYMBOL(msm_bam_dmux_deinit);
 
