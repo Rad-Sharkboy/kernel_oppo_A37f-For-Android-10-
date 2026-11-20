@@ -361,6 +361,12 @@ do { \
 	} \
 } while (0)
 
+#define BAM_DMUX_TRACE(fmt, args...) \
+do { \
+	if (unlikely(msm_bam_dmux_debug_enable)) \
+		BAM_DMUX_LOG(fmt, args); \
+} while (0)
+
 #define DMUX_LOG_KERR(fmt, args...) \
 do { \
 	BAM_DMUX_LOG(fmt, args); \
@@ -1672,7 +1678,7 @@ static void notify_all(int event, unsigned long data)
 	struct outside_notify_func *func;
 	int i;
 
-	BAM_DMUX_LOG("%s: event=%d, data=%lu\n", __func__, event, data);
+	BAM_DMUX_TRACE("%s: event=%d, data=%lu\n", __func__, event, data);
 
 	for (i = 0; i < BAM_DMUX_NUM_CHANNELS; i++)
 		bam_mux_notify_channel(i, event, data, 0);
@@ -1723,7 +1729,7 @@ int msm_bam_dmux_kickoff_ul_wakeup(void)
 
 static void power_vote(int vote)
 {
-	BAM_DMUX_LOG("%s: curr=%d, vote=%d\n", __func__,
+	BAM_DMUX_TRACE("%s: curr=%d, vote=%d\n", __func__,
 			bam_dmux_uplink_vote, vote);
 
 	if (bam_dmux_uplink_vote == vote)
@@ -1743,7 +1749,7 @@ static void power_vote(int vote)
  */
 static inline void ul_powerdown(void)
 {
-	BAM_DMUX_LOG("%s: powerdown\n", __func__);
+	BAM_DMUX_TRACE("%s: powerdown\n", __func__);
 	verify_tx_queue_is_empty(__func__);
 
 	if (a2_pc_disabled) {
@@ -1906,7 +1912,7 @@ static void ul_wakeup(void)
 
 	mutex_lock(&wakeup_lock);
 	if (bam_is_connected) { /* bam got connected before lock grabbed */
-		BAM_DMUX_LOG("%s Already awake\n", __func__);
+		BAM_DMUX_TRACE("%s Already awake\n", __func__);
 		mutex_unlock(&wakeup_lock);
 		return;
 	}
@@ -1967,7 +1973,7 @@ static void ul_wakeup(void)
 	 * instead of waiting
 	 */
 	if (wait_for_ack) {
-		BAM_DMUX_LOG("%s waiting for previous ack\n", __func__);
+		BAM_DMUX_TRACE("%s waiting for previous ack\n", __func__);
 		ret = wait_for_completion_timeout(
 					&ul_wakeup_ack_completion,
 					msecs_to_jiffies(UL_WAKEUP_TIMEOUT_MS));
@@ -1982,7 +1988,7 @@ static void ul_wakeup(void)
 	if (ACCESS_ONCE(in_global_reset))
 		goto out;
 	power_vote(1);
-	BAM_DMUX_LOG("%s waiting for wakeup ack\n", __func__);
+	BAM_DMUX_TRACE("%s waiting for wakeup ack\n", __func__);
 	ret = wait_for_completion_timeout(&ul_wakeup_ack_completion,
 					msecs_to_jiffies(UL_WAKEUP_TIMEOUT_MS));
 	if (unlikely(ret == 0) && ssrestart_check()) {
@@ -1992,7 +1998,7 @@ static void ul_wakeup(void)
 	}
 	if (ACCESS_ONCE(in_global_reset))
 		goto out;
-	BAM_DMUX_LOG("%s waiting completion\n", __func__);
+	BAM_DMUX_TRACE("%s waiting completion\n", __func__);
 	ret = wait_for_completion_timeout(&bam_connection_completion,
 					msecs_to_jiffies(UL_WAKEUP_TIMEOUT_MS));
 	if (unlikely(ret == 0) && ssrestart_check()) {
@@ -2093,13 +2099,13 @@ static void disconnect_to_bam(void)
 
 	/* in_ssr documentation/assumptions found in restart_notifier_cb */
 	if (likely(!in_ssr)) {
-		BAM_DMUX_LOG("%s: disconnect tx\n", __func__);
+		BAM_DMUX_TRACE("%s: disconnect tx\n", __func__);
 		bam_ops->sps_disconnect_ptr(bam_tx_pipe);
-		BAM_DMUX_LOG("%s: disconnect rx\n", __func__);
+		BAM_DMUX_TRACE("%s: disconnect rx\n", __func__);
 		bam_ops->sps_disconnect_ptr(bam_rx_pipe);
 		memset(rx_desc_mem_buf.base, 0, rx_desc_mem_buf.size);
 		memset(tx_desc_mem_buf.base, 0, tx_desc_mem_buf.size);
-		BAM_DMUX_LOG("%s: device reset\n", __func__);
+		BAM_DMUX_TRACE("%s: device reset\n", __func__);
 		bam_ops->sps_device_reset_ptr(a2_device_handle);
 	} else {
 		ssr_skipped_disconnect = 1;
@@ -2125,7 +2131,7 @@ static void vote_dfab(void)
 {
 	int rc;
 
-	BAM_DMUX_LOG("%s\n", __func__);
+	BAM_DMUX_TRACE("%s\n", __func__);
 	mutex_lock(&dfab_status_lock);
 	if (dfab_clk && !dfab_clk_voted) {
 		rc = clk_prepare_enable(dfab_clk);
@@ -2146,7 +2152,7 @@ static void vote_dfab(void)
 
 static void unvote_dfab(void)
 {
-	BAM_DMUX_LOG("%s\n", __func__);
+	BAM_DMUX_TRACE("%s\n", __func__);
 	mutex_lock(&dfab_status_lock);
 	if (dfab_clk_voted) {
 		clk_disable_unprepare(dfab_clk);
@@ -2165,7 +2171,7 @@ static void grab_wakelock(void)
 	unsigned long flags;
 
 	spin_lock_irqsave(&wakelock_reference_lock, flags);
-	BAM_DMUX_LOG("%s: ref count = %d\n", __func__,
+	BAM_DMUX_TRACE("%s: ref count = %d\n", __func__,
 						wakelock_reference_count);
 	if (wakelock_reference_count == 0)
 		wake_lock(&bam_wakelock);
@@ -2184,7 +2190,7 @@ static void release_wakelock(void)
 		spin_unlock_irqrestore(&wakelock_reference_lock, flags);
 		return;
 	}
-	BAM_DMUX_LOG("%s: ref count = %d\n", __func__,
+	BAM_DMUX_TRACE("%s: ref count = %d\n", __func__,
 						wakelock_reference_count);
 	--wakelock_reference_count;
 	if (wakelock_reference_count == 0)
@@ -2490,7 +2496,7 @@ static void toggle_apps_ack(void)
 		return;
 	}
 
-	BAM_DMUX_LOG("%s: apps ack %d->%d\n", __func__,
+	BAM_DMUX_TRACE("%s: apps ack %d->%d\n", __func__,
 			clear_bit & 0x1, ~clear_bit & 0x1);
 	bam_ops->smsm_change_state_ptr(SMSM_APPS_STATE,
 				clear_bit & SMSM_A2_POWER_CONTROL_ACK,
@@ -2528,7 +2534,7 @@ static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 
 	mutex_lock(&smsm_cb_lock);
 	DBG_INC_A2_POWER_CONTROL_IN_CNT();
-	BAM_DMUX_LOG("%s: 0x%08x -> 0x%08x\n", __func__, old_state, new_state);
+	BAM_DMUX_TRACE("%s: 0x%08x -> 0x%08x\n", __func__, old_state, new_state);
 	if ((power && modem_stopping) || power == bam_dmux_power_state)
 		goto out;
 
@@ -2554,7 +2560,7 @@ static void bam_dmux_smsm_ack_cb(void *priv, uint32_t old_state,
 						uint32_t new_state)
 {
 	DBG_INC_ACK_IN_CNT();
-	BAM_DMUX_LOG("%s: 0x%08x -> 0x%08x\n", __func__, old_state,
+	BAM_DMUX_TRACE("%s: 0x%08x -> 0x%08x\n", __func__, old_state,
 			new_state);
 	complete_all(&ul_wakeup_ack_completion);
 }
