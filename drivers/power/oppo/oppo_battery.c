@@ -1490,7 +1490,8 @@ void opchg_check_status(struct opchg_charger *chip)
     chip->bat_instant_vol = opchg_get_prop_battery_voltage_now(chip);
     chip->charging_current = opchg_get_prop_current_now(chip);//1000;
     chip->charger_vol = opchg_get_prop_charger_voltage_now(chip);
-    chip->bat_volt_check_point = opchg_get_prop_batt_capacity(chip);
+    chip->bat_volt_check_point = opchg_get_prop_batt_capacity(chip,
+						chip->bat_instant_vol);
 
 	if (chip->bat_volt_check_point >= 90 && chip->chg_present && !chip->bypass)
 		opchg_set_bypass(chip, true);

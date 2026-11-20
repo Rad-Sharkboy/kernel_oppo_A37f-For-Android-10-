@@ -167,7 +167,8 @@ static void opchg_soc_resume_decrement(struct opchg_charger *chip,
 		chip->bat_volt_check_point--;
 }
 
-int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
+static int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip,
+						int vbat_uv)
 {
 	static char is_pon_on = 0;
 	static char sync_up_count = 0;
@@ -175,7 +176,7 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 	static char sync_down_limit = 0;
 	union power_supply_propval ret = {0, };
 	unsigned long now, previous;
-	int rc = 0, vbat_uv;
+	int rc = 0;
 	bool low_voltage;
 
 	if (!chip->bms_psy)
@@ -200,7 +201,6 @@ int opchg_get_prop_batt_capacity_from_bms(struct opchg_charger *chip)
 		return chip->bat_volt_check_point;
 	}
 
-	vbat_uv = opchg_get_prop_battery_voltage_now(chip);
 	low_voltage = vbat_uv > 0 && vbat_uv < 3300 * 1000 &&
 			opchg_get_prop_batt_present(chip) == true;
 
@@ -412,12 +412,12 @@ int opchg_get_prop_batt_capacity_from_bms_bq24157(struct opchg_charger *chip)
 	return chip->bat_volt_check_point;
 }
 
-int opchg_get_prop_batt_capacity(struct opchg_charger *chip)
+int opchg_get_prop_batt_capacity(struct opchg_charger *chip, int vbat_uv)
 {
 	int soc;
 
 	if(is_project(OPPO_15109)|| is_project(OPPO_15399)){
-		soc = opchg_get_prop_batt_capacity_from_bms(chip);
+		soc = opchg_get_prop_batt_capacity_from_bms(chip, vbat_uv);
 	} else {
 		if (qpnp_batt_gauge && qpnp_batt_gauge->get_battery_soc){
 			soc = qpnp_batt_gauge->get_battery_soc();

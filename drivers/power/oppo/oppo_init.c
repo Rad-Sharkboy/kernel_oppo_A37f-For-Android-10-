@@ -660,10 +660,13 @@ static int opcharger_resume(struct device *dev)
     #endif
 
     #ifdef CONFIG_MACH_OPPO
-    if (chip->bms_psy)
-    {
-        opchg_get_prop_batt_capacity(chip);
-        power_supply_changed(&chip->batt_psy);
+    if (chip->bms_psy) {
+	int previous = chip->bat_volt_check_point;
+	int voltage = opchg_get_prop_battery_voltage_now(chip);
+
+	chip->bat_volt_check_point = opchg_get_prop_batt_capacity(chip, voltage);
+	if (chip->bat_volt_check_point != previous)
+		power_supply_changed(&chip->batt_psy);
     }
     #endif
 	atomic_set(&chip->bms_suspended, 0);
