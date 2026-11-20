@@ -40,6 +40,15 @@
 
 static struct device_attribute power_supply_attrs[];
 
+static ssize_t show_supply_enum(char *buf, char *const *names,
+				size_t count, int value)
+{
+	if ((unsigned int)value >= count)
+		value = 0;
+
+	return sprintf(buf, "%s\n", names[value]);
+}
+
 static ssize_t power_supply_show_property(struct device *dev,
 					  struct device_attribute *attr,
 					  char *buf) {
@@ -90,21 +99,28 @@ static ssize_t power_supply_show_property(struct device *dev,
 	}
 
 	if (off == POWER_SUPPLY_PROP_STATUS)
-		return sprintf(buf, "%s\n", status_text[value.intval]);
+		return show_supply_enum(buf, status_text, ARRAY_SIZE(status_text),
+					value.intval);
 	else if (off == POWER_SUPPLY_PROP_CHARGE_TYPE)
-		return sprintf(buf, "%s\n", charge_type[value.intval]);
+		return show_supply_enum(buf, charge_type, ARRAY_SIZE(charge_type),
+					value.intval);
 	else if (off == POWER_SUPPLY_PROP_HEALTH)
-		return sprintf(buf, "%s\n", health_text[value.intval]);
+		return show_supply_enum(buf, health_text, ARRAY_SIZE(health_text),
+					value.intval);
 	else if (off == POWER_SUPPLY_PROP_TECHNOLOGY)
-		return sprintf(buf, "%s\n", technology_text[value.intval]);
+		return show_supply_enum(buf, technology_text, ARRAY_SIZE(technology_text),
+					value.intval);
 	else if (off == POWER_SUPPLY_PROP_CAPACITY_LEVEL)
-		return sprintf(buf, "%s\n", capacity_level_text[value.intval]);
+		return show_supply_enum(buf, capacity_level_text, ARRAY_SIZE(capacity_level_text),
+					value.intval);
 	else if (off == POWER_SUPPLY_PROP_TYPE)
-		return sprintf(buf, "%s\n", type_text[value.intval]);
+		return show_supply_enum(buf, type_text, ARRAY_SIZE(type_text),
+					value.intval);
 	else if (off == POWER_SUPPLY_PROP_SCOPE)
-		return sprintf(buf, "%s\n", scope_text[value.intval]);
+		return show_supply_enum(buf, scope_text, ARRAY_SIZE(scope_text),
+					value.intval);
 	else if (off >= POWER_SUPPLY_PROP_MODEL_NAME)
-		return sprintf(buf, "%s\n", value.strval);
+		return scnprintf(buf, PAGE_SIZE, "%s\n", value.strval);
 
 	if (off == POWER_SUPPLY_PROP_CHARGE_COUNTER_EXT)
 		return sprintf(buf, "%lld\n", value.int64val);
