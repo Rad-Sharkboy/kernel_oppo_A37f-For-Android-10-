@@ -480,8 +480,10 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 
 	spin_lock(&cluster->sync_lock);
 
-	if (!cpumask_equal(&cluster->num_childs_in_sync, &cluster->child_cpus)
-			|| is_IPI_pending(&cluster->num_childs_in_sync)) {
+	if (!cpumask_equal(&cluster->num_childs_in_sync, &cluster->child_cpus) ||
+	    !cpumask_equal(&level->num_cpu_votes, &cluster->child_cpus) ||
+	    is_IPI_pending(&cluster->num_childs_in_sync) ||
+	    (level->suspend_only && !msm_mpm_suspend_wakes_mapped())) {
 		spin_unlock(&cluster->sync_lock);
 		return -EPERM;
 	}

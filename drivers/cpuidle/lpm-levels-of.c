@@ -674,7 +674,7 @@ struct lpm_cluster *parse_cluster(struct device_node *node,
 		}
 	}
 
-	c->last_level = c->nlevels-1;
+	c->last_level = c->default_level;
 
 	return c;
 
