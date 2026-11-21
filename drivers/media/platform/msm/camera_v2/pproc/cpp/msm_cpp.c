@@ -1463,7 +1463,6 @@ static int msm_cpp_send_frame_to_hardware(struct cpp_device *cpp_dev,
 			  jiffies + msecs_to_jiffies(CPP_CMD_TIMEOUT_MS));
 		msm_cpp_write(0x6, cpp_dev->base);
 		msm_cpp_dump_frame_cmd(process_frame);
-		msm_cpp_poll_rx_empty(cpp_dev->base);
 		for (i = 0; i < process_frame->msg_len; i++) {
 			if (i % MSM_CPP_RX_FIFO_LEVEL == 0)
 				msm_cpp_poll_rx_empty(cpp_dev->base);
