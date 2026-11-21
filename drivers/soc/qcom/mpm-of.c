@@ -13,6 +13,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/types.h>
 #include <linux/init.h>
 #include <linux/bitmap.h>
@@ -540,22 +541,33 @@ bool msm_mpm_suspend_wakes_mapped(void)
 	return ready;
 }
 
+static u64 mpm_wakeup_counter(u64 ticks, u64 now)
+{
+	u32 remainder;
+	u64 seconds, fraction;
+
+	if (!ticks)
+		return ~0ULL;
+
+	seconds = div_u64_rem(ticks, SCLK_HZ, &remainder);
+	fraction = div_u64((u64)remainder * ARCH_TIMER_HZ, SCLK_HZ);
+	if (fraction > ~0ULL - now ||
+	    seconds > div_u64(~0ULL - now - fraction, ARCH_TIMER_HZ))
+		return ~0ULL;
+	return now + seconds * ARCH_TIMER_HZ + fraction;
+}
+
 void msm_mpm_enter_sleep(uint64_t sclk_count, bool from_idle,
 		const struct cpumask *cpumask)
 {
-	cycle_t wakeup = (u64)sclk_count * ARCH_TIMER_HZ;
+	cycle_t wakeup;
 
 	if (!msm_mpm_is_initialized()) {
 		pr_err("%s(): MPM not initialized\n", __func__);
 		return;
 	}
 
-	if (sclk_count) {
-		do_div(wakeup, SCLK_HZ);
-		wakeup += arch_counter_get_cntpct();
-	} else {
-		wakeup = (~0ULL);
-	}
+	wakeup = mpm_wakeup_counter(sclk_count, arch_counter_get_cntpct());
 
 	msm_mpm_set(wakeup, !from_idle);
 	if (cpumask)

@@ -22,6 +22,7 @@
 #include <linux/irqchip/msm-mpm-irq.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/tick.h>
 #include <linux/suspend.h>
 #include <linux/pm_qos.h>
@@ -336,6 +337,7 @@ static uint64_t get_cluster_sleep_time(struct lpm_cluster *cluster,
 	int cpu;
 	int next_cpu = raw_smp_processor_id();
 	ktime_t next_event;
+	s64 remaining_us;
 	struct tick_device *td;
 	struct cpumask online_cpus_in_cluster;
 
@@ -344,10 +346,10 @@ static uint64_t get_cluster_sleep_time(struct lpm_cluster *cluster,
 	if (!from_idle) {
 		if (mask)
 			cpumask_copy(mask, cpumask_of(raw_smp_processor_id()));
-		if (!msm_pm_sleep_time_override)
+		if (msm_pm_sleep_time_override <= 0)
 			return ~0ULL;
 		else
-			return USEC_PER_SEC * msm_pm_sleep_time_override;
+			return (u64)msm_pm_sleep_time_override * USEC_PER_SEC;
 	}
 
 	BUG_ON(!cpumask_and(&online_cpus_in_cluster,
@@ -364,11 +366,8 @@ static uint64_t get_cluster_sleep_time(struct lpm_cluster *cluster,
 	if (mask)
 		cpumask_copy(mask, cpumask_of(next_cpu));
 
-
-	if (ktime_to_us(next_event) > ktime_to_us(ktime_get()))
-		return ktime_to_us(ktime_sub(next_event, ktime_get()));
-	else
-		return 0;
+	remaining_us = ktime_to_us(ktime_sub(next_event, ktime_get()));
+	return remaining_us > 0 ? remaining_us : 0;
 }
 
 enum cluster_entry {
@@ -391,7 +390,8 @@ static int cluster_select(struct lpm_cluster *cluster, enum cluster_entry entry)
 	if (!cluster)
 		return -EINVAL;
 
-	sleep_us = (uint32_t)get_cluster_sleep_time(cluster, NULL, from_idle);
+	sleep_us = min_t(u64, get_cluster_sleep_time(cluster, NULL, from_idle),
+			~0U);
 
 	if (cpumask_and(&mask, cpu_online_mask, &cluster->child_cpus))
 		latency_us = pm_qos_request_for_cpumask(PM_QOS_CPU_DMA_LATENCY,
@@ -429,7 +429,7 @@ static int cluster_select(struct lpm_cluster *cluster, enum cluster_entry entry)
 		if (from_idle && latency_us < pwr_params->latency_us)
 			continue;
 
-		if (sleep_us < pwr_params->time_overhead_us)
+		if (!sleep_us || sleep_us < pwr_params->time_overhead_us)
 			continue;
 
 		if (suspend_in_progress && from_idle && level->notify_rpm)
@@ -457,6 +457,18 @@ static int cluster_select(struct lpm_cluster *cluster, enum cluster_entry entry)
 	}
 
 	return best_level;
+}
+
+static u64 lpm_sleep_ticks(u64 us)
+{
+	u32 remainder;
+	u64 seconds;
+
+	if (us == ~0ULL)
+		return 0; /* MPM wakes only on an interrupt. */
+	seconds = div_u64_rem(us, USEC_PER_SEC, &remainder);
+	return max_t(u64, 1, seconds * SCLK_HZ +
+			div_u64((u64)remainder * SCLK_HZ, USEC_PER_SEC));
 }
 
 static int cluster_configure(struct lpm_cluster *cluster, int idx,
@@ -502,8 +514,7 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 			goto failed_set_mode;
 		}
 
-		do_div(us, USEC_PER_SEC/SCLK_HZ);
-		msm_mpm_enter_sleep(us, from_idle, &nextcpu);
+		msm_mpm_enter_sleep(lpm_sleep_ticks(us), from_idle, &nextcpu);
 	}
 	cluster->last_level = idx;
 	spin_unlock(&cluster->sync_lock);
