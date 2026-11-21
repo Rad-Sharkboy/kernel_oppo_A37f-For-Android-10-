@@ -1492,54 +1492,22 @@ static int msm_cpp_flush_frames(struct cpp_device *cpp_dev)
 static struct msm_cpp_frame_info_t *msm_cpp_get_frame(
 	struct msm_camera_v4l2_ioctl_t *ioctl_ptr)
 {
-	uint32_t *cpp_frame_msg;
-	struct msm_cpp_frame_info_t *new_frame = NULL;
-	int32_t rc = 0;
+	struct msm_cpp_frame_info_t *frame;
+	uint32_t *msg;
 
-	new_frame = kzalloc(sizeof(struct msm_cpp_frame_info_t), GFP_KERNEL);
-
-	if (!new_frame) {
-		pr_err("Insufficient memory\n");
-		rc = -ENOMEM;
-		goto no_mem_err;
-	}
-
-	rc = (copy_from_user(new_frame, (void __user *)ioctl_ptr->ioctl_ptr,
-			sizeof(struct msm_cpp_frame_info_t)) ? -EFAULT : 0);
-	if (rc) {
-		ERR_COPY_FROM_USER();
-		goto frame_err;
-	}
-
-	if ((new_frame->msg_len == 0) ||
-		(new_frame->msg_len > MSM_CPP_MAX_FRAME_LENGTH)) {
-		pr_err("%s:%d: Invalid frame len:%d\n", __func__,
-			__LINE__, new_frame->msg_len);
-		goto frame_err;
-	}
-
-	cpp_frame_msg = kzalloc(sizeof(uint32_t) * new_frame->msg_len,
-		GFP_KERNEL);
-	if (!cpp_frame_msg) {
-		pr_err("Insufficient memory\n");
-		goto frame_err;
-	}
-
-	rc = (copy_from_user(cpp_frame_msg,
-		(void __user *)new_frame->cpp_cmd_msg,
-		sizeof(uint32_t) * new_frame->msg_len) ? -EFAULT : 0);
-	if (rc) {
-		ERR_COPY_FROM_USER();
-		goto frame_msg_err;
-	}
-	new_frame->cpp_cmd_msg = cpp_frame_msg;
-	return new_frame;
-
-frame_msg_err:
-	kfree(cpp_frame_msg);
-frame_err:
-	kfree(new_frame);
-no_mem_err:
+	frame = memdup_user((void __user *)ioctl_ptr->ioctl_ptr, sizeof(*frame));
+	if (IS_ERR(frame))
+		return NULL;
+	if (!frame->msg_len || frame->msg_len > MSM_CPP_MAX_FRAME_LENGTH)
+		goto drop;
+	msg = memdup_user((void __user *)frame->cpp_cmd_msg,
+			  sizeof(*msg) * frame->msg_len);
+	if (IS_ERR(msg))
+		goto drop;
+	frame->cpp_cmd_msg = msg;
+	return frame;
+drop:
+	kfree(frame);
 	return NULL;
 }
 
@@ -2397,110 +2365,71 @@ static long msm_cpp_subdev_fops_ioctl(struct file *file, unsigned int cmd,
 static struct msm_cpp_frame_info_t *get_64bit_cpp_frame_from_compat(
 	struct msm_camera_v4l2_ioctl_t *kp_ioctl)
 {
-	struct msm_cpp_frame_info32_t *new_frame32 = NULL;
-	struct msm_cpp_frame_info_t *new_frame = NULL;
+	struct msm_cpp_frame_info32_t input;
+	struct msm_cpp_frame_info_t *new_frame;
 	uint32_t *cpp_frame_msg;
-	void *cpp_cmd_msg_64bit;
-	int32_t rc;
+	void __user *cpp_cmd_msg_64bit;
 
-	new_frame32 = kzalloc(sizeof(struct msm_cpp_frame_info32_t),
-		GFP_KERNEL);
-	if (!new_frame32) {
-		pr_err("Insufficient memory\n");
-		goto no_mem32;
-	}
-	new_frame = kzalloc(sizeof(struct msm_cpp_frame_info_t), GFP_KERNEL);
-	if (!new_frame) {
-		pr_err("Insufficient memory\n");
-		goto no_mem;
-	}
+	if (copy_from_user(&input, (void __user *)kp_ioctl->ioctl_ptr,
+			   sizeof(input)))
+		return NULL;
+	if (!input.msg_len || input.msg_len > MSM_CPP_MAX_FRAME_LENGTH)
+		return NULL;
+	new_frame = kzalloc(sizeof(*new_frame), GFP_KERNEL);
+	if (!new_frame)
+		return NULL;
 
-	rc = (copy_from_user(new_frame32, (void __user *)kp_ioctl->ioctl_ptr,
-			sizeof(struct msm_cpp_frame_info32_t)) ? -EFAULT : 0);
-	if (rc) {
-		ERR_COPY_FROM_USER();
-		goto frame_err;
-	}
+	new_frame->frame_id = input.frame_id;
+	new_frame->inst_id = input.inst_id;
+	new_frame->client_id = input.client_id;
+	new_frame->frame_type = input.frame_type;
+	new_frame->num_strips = input.num_strips;
+	new_frame->strip_info = compat_ptr(input.strip_info);
 
-	new_frame->frame_id = new_frame32->frame_id;
-	new_frame->inst_id = new_frame32->inst_id;
-	new_frame->client_id = new_frame32->client_id;
-	new_frame->frame_type = new_frame32->frame_type;
-	new_frame->num_strips = new_frame32->num_strips;
-	new_frame->strip_info = compat_ptr(new_frame32->strip_info);
-
-	new_frame->src_fd =  new_frame32->src_fd;
-	new_frame->dst_fd =  new_frame32->dst_fd;
+	new_frame->src_fd =  input.src_fd;
+	new_frame->dst_fd =  input.dst_fd;
 
 	new_frame->timestamp.tv_sec =
-		(unsigned long)new_frame32->timestamp.tv_sec;
+		(unsigned long)input.timestamp.tv_sec;
 	new_frame->timestamp.tv_usec =
-		(unsigned long)new_frame32->timestamp.tv_usec;
+		(unsigned long)input.timestamp.tv_usec;
 
 	new_frame->in_time.tv_sec =
-		(unsigned long)new_frame32->in_time.tv_sec;
+		(unsigned long)input.in_time.tv_sec;
 	new_frame->in_time.tv_usec =
-		(unsigned long)new_frame32->in_time.tv_usec;
+		(unsigned long)input.in_time.tv_usec;
 
 	new_frame->out_time.tv_sec =
-		(unsigned long)new_frame32->out_time.tv_sec;
+		(unsigned long)input.out_time.tv_sec;
 	new_frame->out_time.tv_usec =
-		(unsigned long)new_frame32->out_time.tv_usec;
+		(unsigned long)input.out_time.tv_usec;
 
-	new_frame->msg_len = new_frame32->msg_len;
-	new_frame->identity = new_frame32->identity;
-	new_frame->input_buffer_info = new_frame32->input_buffer_info;
+	new_frame->msg_len = input.msg_len;
+	new_frame->identity = input.identity;
+	new_frame->input_buffer_info = input.input_buffer_info;
 	new_frame->output_buffer_info[0] =
-		new_frame32->output_buffer_info[0];
+		input.output_buffer_info[0];
 	new_frame->output_buffer_info[1] =
-		new_frame32->output_buffer_info[1];
+		input.output_buffer_info[1];
 	new_frame->tnr_scratch_buffer_info[0] =
-		new_frame32->tnr_scratch_buffer_info[0];
+		input.tnr_scratch_buffer_info[0];
 	new_frame->tnr_scratch_buffer_info[1] =
-		new_frame32->tnr_scratch_buffer_info[1];
-	new_frame->duplicate_output = new_frame32->duplicate_output;
-	new_frame->duplicate_identity = new_frame32->duplicate_identity;
+		input.tnr_scratch_buffer_info[1];
+	new_frame->duplicate_output = input.duplicate_output;
+	new_frame->duplicate_identity = input.duplicate_identity;
 
 	/* Convert the 32 bit pointer to 64 bit pointer */
-	new_frame->cookie = compat_ptr(new_frame32->cookie);
-	new_frame->status = compat_ptr(new_frame32->status);
-	cpp_cmd_msg_64bit = compat_ptr(new_frame32->cpp_cmd_msg);
-	if ((new_frame->msg_len == 0) ||
-		(new_frame->msg_len > MSM_CPP_MAX_FRAME_LENGTH)) {
-		pr_err("%s:%d: Invalid frame len:%d\n", __func__,
-			__LINE__, new_frame->msg_len);
-		goto strip_err;
-	}
-
-	cpp_frame_msg = kzalloc(sizeof(uint32_t)*new_frame->msg_len,
-		GFP_KERNEL);
-	if (!cpp_frame_msg) {
-		pr_err("Insufficient memory\n");
-		goto strip_err;
-	}
-
-	rc = (copy_from_user(cpp_frame_msg,
-		(void __user *)cpp_cmd_msg_64bit,
-		sizeof(uint32_t)*new_frame->msg_len) ? -EFAULT : 0);
-	if (rc) {
-		ERR_COPY_FROM_USER();
-		goto frame_msg_err;
+	new_frame->cookie = compat_ptr(input.cookie);
+	new_frame->status = compat_ptr(input.status);
+	cpp_cmd_msg_64bit = compat_ptr(input.cpp_cmd_msg);
+	cpp_frame_msg = memdup_user(cpp_cmd_msg_64bit,
+				    sizeof(*cpp_frame_msg) * new_frame->msg_len);
+	if (IS_ERR(cpp_frame_msg)) {
+		kfree(new_frame);
+		return NULL;
 	}
 	new_frame->cpp_cmd_msg = cpp_frame_msg;
-
-	kfree(new_frame32);
 	return new_frame;
-
-frame_msg_err:
-	kfree(cpp_frame_msg);
-strip_err:
-	kfree(new_frame->strip_info);
-frame_err:
-	kfree(new_frame);
-no_mem:
-	kfree(new_frame32);
-no_mem32:
-	return NULL;
 }
 
 static void get_compat_frame_from_64bit(struct msm_cpp_frame_info_t *frame,
