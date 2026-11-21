@@ -235,16 +235,18 @@ void rmnet_map_aggregate(struct sk_buff *skb,
 
 	if (!skb || !config)
 		BUG();
-	size = config->egress_agg_size-skb->len;
-
-	if (size < 2000) {
-		LOGL("Invalid length %d", size);
-		return;
-	}
 
 new_packet:
 	spin_lock_irqsave(&config->agg_lock, flags);
 	if (!config->agg_skb) {
+		size = (int)config->egress_agg_size - (int)skb->len;
+		if (size < 2000 || config->egress_agg_count == 1) {
+			spin_unlock_irqrestore(&config->agg_lock, flags);
+			rmnet_stats_agg_pkts(1);
+			rc = dev_queue_xmit(skb);
+			rmnet_stats_queue_xmit(rc, RMNET_STATS_QUEUE_XMIT_EGRESS);
+			return;
+		}
 		config->agg_skb = skb_copy_expand(skb, 0, size, GFP_ATOMIC);
 		if (!config->agg_skb) {
 			config->agg_skb = 0;
@@ -263,7 +265,10 @@ new_packet:
 		goto schedule;
 	}
 
-	if (skb->len > (config->egress_agg_size - config->agg_skb->len)) {
+	if (skb->len > skb_tailroom(config->agg_skb) ||
+	    config->agg_skb->len + skb->len > config->egress_agg_size ||
+	    (config->egress_agg_count &&
+	     config->agg_count >= config->egress_agg_count)) {
 		rmnet_stats_agg_pkts(config->agg_count);
 		if (config->agg_count > 1)
 			LOGL("Agg count: %d", config->agg_count);
@@ -272,15 +277,20 @@ new_packet:
 		config->agg_skb = 0;
 		config->agg_count = 0;
 		spin_unlock_irqrestore(&config->agg_lock, flags);
-		trace_rmnet_map_aggregate(skb, agg_count);
+		trace_rmnet_map_aggregate(agg_skb, agg_count);
 		rc = dev_queue_xmit(agg_skb);
 		rmnet_stats_queue_xmit(rc,
 					RMNET_STATS_QUEUE_XMIT_AGG_FILL_BUFFER);
 		goto new_packet;
 	}
 
-	dest_buff = skb_put(config->agg_skb, skb->len);
-	memcpy(dest_buff, skb->data, skb->len);
+	dest_buff = skb_tail_pointer(config->agg_skb);
+	if (skb_copy_bits(skb, 0, dest_buff, skb->len)) {
+		spin_unlock_irqrestore(&config->agg_lock, flags);
+		rmnet_kfree_skb(skb, RMNET_STATS_SKBFREE_EGR_MAPFAIL);
+		return;
+	}
+	skb_put(config->agg_skb, skb->len);
 	config->agg_count++;
 	rmnet_kfree_skb(skb, RMNET_STATS_SKBFREE_AGG_INTO_BUFF);
 
@@ -289,10 +299,14 @@ schedule:
 		work = (struct agg_work *)
 			kmalloc(sizeof(struct agg_work), GFP_ATOMIC);
 		if (!work) {
-			LOGE("Failed to allocate work item for packet %s",
-			     "transfer. DATA PATH LIKELY BROKEN!");
-			config->agg_state = RMNET_MAP_AGG_IDLE;
+			agg_skb = config->agg_skb;
+			agg_count = config->agg_count;
+			config->agg_skb = NULL;
+			config->agg_count = 0;
 			spin_unlock_irqrestore(&config->agg_lock, flags);
+			rmnet_stats_agg_pkts(agg_count);
+			rc = dev_queue_xmit(agg_skb);
+			rmnet_stats_queue_xmit(rc, RMNET_STATS_QUEUE_XMIT_AGG_CPY_EXP_FAIL);
 			return;
 		}
 		INIT_DELAYED_WORK((struct delayed_work *)work,
