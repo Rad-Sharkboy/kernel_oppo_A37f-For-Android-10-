@@ -88,7 +88,8 @@ static int lpm_cpu_callback(struct notifier_block *cpu_nb,
 				unsigned long action, void *hcpu);
 
 static void cluster_unprepare(struct lpm_cluster *cluster,
-		const struct cpumask *cpu, int child_idx, bool from_idle);
+		const struct cpumask *cpu, int child_idx, bool from_idle,
+		bool success);
 
 static struct notifier_block __refdata lpm_cpu_nblk = {
 	.notifier_call = lpm_cpu_callback,
@@ -162,7 +163,7 @@ static int lpm_cpu_callback(struct notifier_block *cpu_nb,
 	switch (action & ~CPU_TASKS_FROZEN) {
 	case CPU_STARTING:
 		cluster_unprepare(cluster, get_cpu_mask((unsigned int) cpu),
-				NR_LPM_LEVELS, false);
+				NR_LPM_LEVELS, false, true);
 		break;
 	case CPU_ONLINE:
 		smp_call_function_single(cpu, setup_broadcast_timer,
@@ -485,16 +486,6 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 		return -EPERM;
 	}
 
-	if (idx != cluster->default_level) {
-		update_debug_pc_event(CLUSTER_ENTER, idx,
-			cluster->num_childs_in_sync.bits[0],
-			cluster->child_cpus.bits[0], from_idle);
-		trace_cluster_enter(cluster->cluster_name, idx,
-			cluster->num_childs_in_sync.bits[0],
-			cluster->child_cpus.bits[0], from_idle);
-		lpm_stats_cluster_enter(cluster->stats, idx);
-	}
-
 	for (i = 0; i < cluster->ndevices; i++) {
 		ret = cluster->lpm_dev[i].set_mode(&cluster->lpm_dev[i],
 				level->mode[i],
@@ -516,6 +507,16 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 
 		msm_mpm_enter_sleep(lpm_sleep_ticks(us), from_idle, &nextcpu);
 	}
+	if (idx != cluster->default_level) {
+		update_debug_pc_event(CLUSTER_ENTER, idx,
+			cluster->num_childs_in_sync.bits[0],
+			cluster->child_cpus.bits[0], from_idle);
+		trace_cluster_enter(cluster->cluster_name, idx,
+			cluster->num_childs_in_sync.bits[0],
+			cluster->child_cpus.bits[0], from_idle);
+		lpm_stats_cluster_enter(cluster->stats, idx);
+	}
+
 	cluster->last_level = idx;
 	spin_unlock(&cluster->sync_lock);
 	return 0;
@@ -583,7 +584,8 @@ static void cluster_prepare(struct lpm_cluster *cluster,
 }
 
 static void cluster_unprepare(struct lpm_cluster *cluster,
-		const struct cpumask *cpu, int child_idx, bool from_idle)
+		const struct cpumask *cpu, int child_idx, bool from_idle,
+		bool success)
 {
 	struct lpm_cluster_level *level;
 	bool first_cpu;
@@ -613,7 +615,7 @@ static void cluster_unprepare(struct lpm_cluster *cluster,
 	if (!first_cpu || cluster->last_level == cluster->default_level)
 		goto unlock_return;
 
-	lpm_stats_cluster_exit(cluster->stats, cluster->last_level, true);
+	lpm_stats_cluster_exit(cluster->stats, cluster->last_level, success);
 
 	level = &cluster->levels[cluster->last_level];
 	if (level->notify_rpm) {
@@ -641,7 +643,7 @@ static void cluster_unprepare(struct lpm_cluster *cluster,
 unlock_return:
 	spin_unlock(&cluster->sync_lock);
 	cluster_unprepare(cluster->parent, &cluster->child_cpus,
-			last_level, from_idle);
+			last_level, from_idle, success);
 }
 
 static inline void cpu_prepare(struct lpm_cluster *cluster, int cpu_index,
@@ -710,7 +712,7 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 	success = msm_cpu_pm_enter_sleep(cluster->cpu->levels[idx].mode, true);
 	lpm_stats_cpu_exit(idx, success);
 	trace_cpu_idle_exit(idx, success);
-	cluster_unprepare(cluster, cpumask, idx, true);
+	cluster_unprepare(cluster, cpumask, idx, true, success);
 	cpu_unprepare(cluster, idx, true);
 
 	sched_set_cpu_cstate(smp_processor_id(), 0, 0, 0);
@@ -906,6 +908,7 @@ static int lpm_suspend_enter(suspend_state_t state)
 	struct lpm_cluster *cluster = per_cpu(cpu_cluster, cpu);
 	struct lpm_cpu *lpm_cpu = cluster->cpu;
 	const struct cpumask *cpumask = get_cpu_mask(cpu);
+	bool success;
 	int idx;
 
 	for (idx = lpm_cpu->nlevels - 1; idx >= 0; idx--) {
@@ -916,14 +919,14 @@ static int lpm_suspend_enter(suspend_state_t state)
 	}
 	if (idx < 0) {
 		pr_err("Failed suspend\n");
-		return 0;
+		return -EBUSY;
 	}
 	cpu_prepare(cluster, idx, false);
 	cluster_prepare(cluster, cpumask, idx, CLUSTER_SUSPEND);
-	msm_cpu_pm_enter_sleep(cluster->cpu->levels[idx].mode, false);
-	cluster_unprepare(cluster, cpumask, idx, false);
+	success = msm_cpu_pm_enter_sleep(cluster->cpu->levels[idx].mode, false);
+	cluster_unprepare(cluster, cpumask, idx, false, success);
 	cpu_unprepare(cluster, idx, false);
-	return 0;
+	return success ? 0 : -EBUSY;
 }
 
 static const struct platform_suspend_ops lpm_suspend_ops = {
