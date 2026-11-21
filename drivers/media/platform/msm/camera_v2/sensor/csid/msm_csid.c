@@ -127,20 +127,25 @@ static void msm_csid_set_debug_reg(struct csid_device *csid_dev,
 	struct msm_camera_csid_params *csid_params) {}
 #endif
 
-static void msm_csid_reset(struct csid_device *csid_dev)
+static int msm_csid_reset(struct csid_device *csid_dev)
 {
-	msm_camera_io_w(csid_dev->ctrl_reg->csid_reg.csid_rst_stb_all,
-		csid_dev->base +
-		csid_dev->ctrl_reg->csid_reg.csid_rst_cmd_addr);
-	wait_for_completion(&csid_dev->reset_complete);
-	return;
+	INIT_COMPLETION(csid_dev->reset_complete);
+	msm_camera_io_w_mb(csid_dev->ctrl_reg->csid_reg.csid_rst_stb_all,
+		csid_dev->base + csid_dev->ctrl_reg->csid_reg.csid_rst_cmd_addr);
+	if (!wait_for_completion_timeout(&csid_dev->reset_complete,
+					 msecs_to_jiffies(500))) {
+		pr_err("%s: receiver reset timed out\n", __func__);
+		return -ETIMEDOUT;
+	}
+	return 0;
 }
 
 static int msm_csid_config(struct csid_device *csid_dev,
 	struct msm_camera_csid_params *csid_params)
 {
 	int rc = 0;
-	uint32_t val = 0, clk_rate = 0, round_rate = 0;
+	uint32_t val = 0, clk_rate = 0;
+	long round_rate;
 	struct clk **csid_clk_ptr;
 	void __iomem *csidbase;
 	csidbase = csid_dev->base;
@@ -157,8 +162,12 @@ static int msm_csid_config(struct csid_device *csid_dev,
 	CDBG("%s csid_params phy_sel = %d\n", __func__,
 		csid_params->phy_sel);
 
+	if (!csid_params->lane_cnt || csid_params->lane_cnt > 4)
+		return -EINVAL;
+	rc = msm_csid_reset(csid_dev);
+	if (rc)
+		return rc;
 	csid_dev->csid_lane_cnt = csid_params->lane_cnt;
-	msm_csid_reset(csid_dev);
 
 	csid_clk_ptr = csid_dev->csid_clk;
 	if (!csid_clk_ptr) {
@@ -170,9 +179,11 @@ static int msm_csid_config(struct csid_device *csid_dev,
 				(csid_params->csi_clk) : csid_dev->csid_max_clk;
 	round_rate = clk_round_rate(csid_clk_ptr[csid_dev->csid_clk_index],
 					clk_rate);
+	if (round_rate < 0)
+		return round_rate;
 	if (round_rate > csid_dev->csid_max_clk)
 		round_rate = csid_dev->csid_max_clk;
-	pr_debug("usr set rate csi_clk clk_rate = %u round_rate = %u\n",
+	pr_debug("usr set rate csi_clk clk_rate = %u round_rate = %ld\n",
 					clk_rate, round_rate);
 	rc = clk_set_rate(csid_clk_ptr[csid_dev->csid_clk_index],
 				round_rate);
@@ -352,7 +363,13 @@ static int msm_csid_init(struct csid_device *csid_dev, uint32_t *csid_version)
 
 	enable_irq(csid_dev->irq->start);
 
-	msm_csid_reset(csid_dev);
+	rc = msm_csid_reset(csid_dev);
+	if (rc) {
+		disable_irq(csid_dev->irq->start);
+		msm_cam_clk_enable(&csid_dev->pdev->dev, csid_clk_info,
+				   csid_dev->csid_clk, csid_dev->num_clk, 0);
+		goto clk_enable_failed;
+	}
 	csid_dev->csid_state = CSID_POWER_UP;
 	return rc;
 
