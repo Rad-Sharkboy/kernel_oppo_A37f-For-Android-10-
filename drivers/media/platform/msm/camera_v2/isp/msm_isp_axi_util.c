@@ -407,7 +407,7 @@ int msm_isp_axi_check_stream_state(
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-		> MAX_NUM_STREAM) {
+		>= MAX_NUM_STREAM) {
 			return -EINVAL;
 		}
 		stream_info = &axi_data->stream_info[
@@ -888,40 +888,45 @@ static void msm_isp_reload_ping_pong_offset(struct vfe_device *vfe_dev,
 	}
 }
 
-void msm_isp_axi_cfg_update(struct vfe_device *vfe_dev)
+void msm_isp_axi_cfg_update(struct vfe_device *vfe_dev, uint32_t sources)
 {
-	int i, j;
-	uint32_t update_state;
+	struct msm_vfe_axi_shared_data *axi = &vfe_dev->axi_data;
 	unsigned long flags;
-	struct msm_vfe_axi_shared_data *axi_data = &vfe_dev->axi_data;
-	struct msm_vfe_axi_stream *stream_info;
-	for (i = 0; i < MAX_NUM_STREAM; i++) {
-		stream_info = &axi_data->stream_info[i];
-		if (stream_info->stream_type == BURST_STREAM ||
-			stream_info->state == AVALIABLE)
-			continue;
-		spin_lock_irqsave(&stream_info->lock, flags);
-		if (stream_info->state == PAUSING) {
-			/*AXI Stopped, apply update*/
-			stream_info->state = PAUSED;
-			msm_isp_reload_ping_pong_offset(vfe_dev, stream_info);
-			for (j = 0; j < stream_info->num_planes; j++)
-				vfe_dev->hw_info->vfe_ops.axi_ops.
-					cfg_wm_reg(vfe_dev, stream_info, j);
-			/*Resume AXI*/
-			stream_info->state = RESUME_PENDING;
-			msm_isp_axi_stream_enable_cfg(
-				vfe_dev, &axi_data->stream_info[i]);
-			stream_info->state = RESUMING;
-		} else if (stream_info->state == RESUMING) {
-			stream_info->runtime_output_format =
-				stream_info->output_format;
-			stream_info->state = ACTIVE;
-		}
-		spin_unlock_irqrestore(&stream_info->lock, flags);
-	}
+	bool pending = false;
+	int i, j;
 
-	update_state = atomic_dec_return(&axi_data->axi_cfg_update);
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	for (i = 0; i < MAX_NUM_STREAM; i++) {
+		struct msm_vfe_axi_stream *stream = &axi->stream_info[i];
+
+		if (stream->state != PAUSING && stream->state != RESUMING)
+			continue;
+		if (!(sources & BIT(SRC_TO_INTF(stream->stream_src)))) {
+			pending = true;
+			continue;
+		}
+		spin_lock(&stream->lock);
+		if (stream->state == PAUSING) {
+			stream->state = PAUSED;
+			memcpy(stream->plane_cfg, stream->pending_plane_cfg,
+			       stream->num_planes * sizeof(stream->plane_cfg[0]));
+			stream->output_format = stream->pending_format;
+			msm_isp_reload_ping_pong_offset(vfe_dev, stream);
+			for (j = 0; j < stream->num_planes; j++)
+				vfe_dev->hw_info->vfe_ops.axi_ops.cfg_wm_reg(
+					vfe_dev, stream, j);
+			stream->state = RESUME_PENDING;
+			msm_isp_axi_stream_enable_cfg(vfe_dev, stream);
+			stream->state = RESUMING;
+			pending = true;
+		} else {
+			stream->runtime_output_format = stream->output_format;
+			stream->state = ACTIVE;
+		}
+		spin_unlock(&stream->lock);
+	}
+	atomic_set(&axi->axi_cfg_update, pending);
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
 }
 
 static void msm_isp_cfg_pong_address(struct vfe_device *vfe_dev,
@@ -1143,7 +1148,7 @@ static void msm_isp_update_camif_output_count(
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-		> MAX_NUM_STREAM) {
+		>= MAX_NUM_STREAM) {
 			return;
 		}
 		stream_info =
@@ -1186,7 +1191,7 @@ static void msm_isp_update_rdi_output_count(
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-			> MAX_NUM_STREAM)
+			>= MAX_NUM_STREAM)
 			return;
 		stream_info =
 			&axi_data->stream_info[
@@ -1510,7 +1515,7 @@ static int msm_isp_axi_update_cgc_override(struct vfe_device *vfe_dev,
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-		> MAX_NUM_STREAM) {
+		>= MAX_NUM_STREAM) {
 			return -EINVAL;
 		}
 		stream_info = &axi_data->stream_info[
@@ -1542,7 +1547,7 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-		> MAX_NUM_STREAM) {
+		>= MAX_NUM_STREAM) {
 			return -EINVAL;
 		}
 		stream_info = &axi_data->stream_info[
@@ -1633,7 +1638,7 @@ static int msm_isp_stop_axi_stream(struct vfe_device *vfe_dev,
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-		> MAX_NUM_STREAM) {
+		>= MAX_NUM_STREAM) {
 			return -EINVAL;
 		}
 		stream_info = &axi_data->stream_info[
@@ -1845,29 +1850,89 @@ static int msm_isp_request_frame(struct vfe_device *vfe_dev,
 	return rc;
 }
 
+static int msm_isp_queue_axi_config(struct vfe_device *vfe_dev,
+				    struct msm_vfe_axi_stream_update_cmd *cmd)
+{
+	struct msm_vfe_axi_shared_data *axi = &vfe_dev->axi_data;
+	unsigned long flags;
+	uint32_t seen = 0, sources = 0;
+	int i, j, rc = 0;
+
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	if (atomic_read(&axi->axi_cfg_update)) {
+		rc = -EBUSY;
+		goto out;
+	}
+	for (i = 0; i < cmd->num_streams; i++) {
+		uint32_t handle = cmd->update_info[i].stream_handle;
+		uint32_t idx = HANDLE_TO_IDX(handle);
+		struct msm_vfe_axi_stream *stream;
+
+		if (idx >= MAX_NUM_STREAM || (seen & BIT(idx))) {
+			rc = -EINVAL;
+			goto out;
+		}
+		stream = &axi->stream_info[idx];
+		if (stream->stream_handle != handle ||
+		    (stream->state != ACTIVE && stream->state != INACTIVE) ||
+		    SRC_TO_INTF(stream->stream_src) >= VFE_SRC_MAX) {
+			rc = -EINVAL;
+			goto out;
+		}
+		seen |= BIT(idx);
+	}
+	for (i = 0; i < cmd->num_streams; i++) {
+		struct msm_vfe_axi_stream_cfg_update_info *cfg = &cmd->update_info[i];
+		struct msm_vfe_axi_stream *stream =
+			&axi->stream_info[HANDLE_TO_IDX(cfg->stream_handle)];
+		size_t bytes = stream->num_planes * sizeof(stream->plane_cfg[0]);
+
+		spin_lock(&stream->lock);
+		if (stream->state == ACTIVE) {
+			memcpy(stream->pending_plane_cfg, cfg->plane_cfg, bytes);
+			stream->pending_format = cfg->output_format;
+			stream->state = PAUSE_PENDING;
+			msm_isp_axi_stream_enable_cfg(vfe_dev, stream);
+			stream->state = PAUSING;
+			sources |= BIT(SRC_TO_INTF(stream->stream_src));
+		} else {
+			memcpy(stream->plane_cfg, cfg->plane_cfg, bytes);
+			stream->output_format = cfg->output_format;
+			for (j = 0; j < stream->num_planes; j++)
+				vfe_dev->hw_info->vfe_ops.axi_ops.cfg_wm_reg(
+					vfe_dev, stream, j);
+			stream->runtime_output_format = stream->output_format;
+		}
+		spin_unlock(&stream->lock);
+	}
+	if (sources) {
+		atomic_set(&axi->axi_cfg_update, 1);
+		vfe_dev->hw_info->vfe_ops.core_ops.reg_update(vfe_dev, sources);
+	}
+out:
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
+	return rc;
+}
+
 int msm_isp_update_axi_stream(struct vfe_device *vfe_dev, void *arg)
 {
-	int rc = 0, i, j;
+	int rc = 0, i;
 	struct msm_vfe_axi_stream *stream_info;
 	struct msm_vfe_axi_shared_data *axi_data = &vfe_dev->axi_data;
 	struct msm_vfe_axi_stream_update_cmd *update_cmd = arg;
 	struct msm_vfe_axi_stream_cfg_update_info *update_info;
 
-	if (update_cmd->update_type == UPDATE_STREAM_AXI_CONFIG &&
-		atomic_read(&axi_data->axi_cfg_update)) {
-		pr_err("%s: AXI stream config updating\n", __func__);
-		return -EBUSY;
-	}
-
 	/*num_stream is uint32 and update_info[] bound by MAX_NUM_STREAM*/
 	if (update_cmd->num_streams > MAX_NUM_STREAM)
 		return -EINVAL;
+	if (update_cmd->update_type == UPDATE_STREAM_AXI_CONFIG)
+		return msm_isp_queue_axi_config(vfe_dev, update_cmd);
 
 	for (i = 0; i < update_cmd->num_streams; i++) {
 		update_info = &update_cmd->update_info[i];
 		/*check array reference bounds*/
 		if (HANDLE_TO_IDX(update_info->stream_handle)
-		 > MAX_NUM_STREAM) {
+		 >= MAX_NUM_STREAM) {
 			return -EINVAL;
 		}
 		stream_info = &axi_data->stream_info[
@@ -1909,28 +1974,6 @@ int msm_isp_update_axi_stream(struct vfe_device *vfe_dev, void *arg)
 				stream_info->runtime_init_frame_drop = 0;
 				vfe_dev->hw_info->vfe_ops.axi_ops.
 					cfg_framedrop(vfe_dev, stream_info);
-			}
-			break;
-		}
-		case UPDATE_STREAM_AXI_CONFIG: {
-			for (j = 0; j < stream_info->num_planes; j++) {
-				stream_info->plane_cfg[j] =
-					update_info->plane_cfg[j];
-			}
-			stream_info->output_format = update_info->output_format;
-			if (stream_info->state == ACTIVE) {
-				stream_info->state = PAUSE_PENDING;
-				msm_isp_axi_stream_enable_cfg(
-					vfe_dev, stream_info);
-				stream_info->state = PAUSING;
-				atomic_set(&axi_data->axi_cfg_update,
-					UPDATE_REQUESTED);
-			} else {
-				for (j = 0; j < stream_info->num_planes; j++)
-					vfe_dev->hw_info->vfe_ops.axi_ops.
-					cfg_wm_reg(vfe_dev, stream_info, j);
-				stream_info->runtime_output_format =
-					stream_info->output_format;
 			}
 			break;
 		}

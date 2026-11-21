@@ -297,6 +297,8 @@ struct msm_vfe_axi_stream {
 	uint8_t wm[MAX_PLANES_PER_STREAM];
 	uint32_t output_format;/*Planar/RAW/Misc*/
 	struct msm_vfe_axi_plane_cfg plane_cfg[MAX_PLANES_PER_STREAM];
+	struct msm_vfe_axi_plane_cfg pending_plane_cfg[MAX_PLANES_PER_STREAM];
+	uint32_t pending_format;
 	uint8_t comp_mask_index;
 	struct msm_isp_buffer *buf[2];
 	uint32_t session_id;

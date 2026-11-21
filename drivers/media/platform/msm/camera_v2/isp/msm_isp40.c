@@ -692,7 +692,7 @@ static void msm_vfe40_process_reg_update(struct vfe_device *vfe_dev,
 	if (atomic_read(&vfe_dev->stats_data.stats_update))
 		msm_isp_stats_stream_update(vfe_dev);
 	if (atomic_read(&vfe_dev->axi_data.axi_cfg_update))
-		msm_isp_axi_cfg_update(vfe_dev);
+		msm_isp_axi_cfg_update(vfe_dev, input_src);
 	if (vfe_dev->axi_data.stream_update ||
 		atomic_read(&vfe_dev->stats_data.stats_update) ||
 		atomic_read(&vfe_dev->axi_data.axi_cfg_update)) {
