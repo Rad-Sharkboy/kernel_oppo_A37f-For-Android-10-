@@ -1521,6 +1521,7 @@ static int msm_cpp_cfg_frame(struct cpp_device *cpp_dev,
 	unsigned long tnr_scratch_buffer0, tnr_scratch_buffer1;
 	uint16_t num_stripes = 0;
 	struct msm_buf_mngr_info buff_mgr_info, dup_buff_mgr_info;
+	bool duplicate_acquired = false;
 	int32_t stripe_base = 0;
 	int32_t in_fd;
 	int32_t i = 0;
@@ -1535,12 +1536,14 @@ static int msm_cpp_cfg_frame(struct cpp_device *cpp_dev,
 		(new_frame->msg_len < MSM_CPP_MIN_FRAME_LENGTH)) {
 		pr_err("%s %d Length is not correct or frame message is missing\n",
 			__func__, __LINE__);
-		return -EINVAL;
+		rc = -EINVAL;
+		goto frame_msg_err;
 	}
 
 	if (cpp_frame_msg[new_frame->msg_len - 1] != MSM_CPP_MSG_ID_TRAILER) {
 		pr_err("%s %d Invalid frame message\n", __func__, __LINE__);
-		return -EINVAL;
+		rc = -EINVAL;
+		goto frame_msg_err;
 	}
 
 	in_phyaddr = msm_cpp_fetch_buffer_info(cpp_dev,
@@ -1601,6 +1604,7 @@ static int msm_cpp_cfg_frame(struct cpp_device *cpp_dev,
 				__func__, rc);
 			goto phyaddr_err;
 		}
+		duplicate_acquired = true;
 		new_frame->output_buffer_info[1].index =
 			dup_buff_mgr_info.index;
 		out_phyaddr1 = msm_cpp_fetch_buffer_info(cpp_dev,
@@ -1611,8 +1615,6 @@ static int msm_cpp_cfg_frame(struct cpp_device *cpp_dev,
 		if (!out_phyaddr1) {
 			pr_err("error gettting output physical address\n");
 			rc = -EINVAL;
-			msm_cpp_buffer_ops(cpp_dev, VIDIOC_MSM_BUF_MNGR_PUT_BUF,
-				&dup_buff_mgr_info);
 			goto phyaddr_err;
 		}
 		/* set duplicate enable bit */
@@ -1636,6 +1638,7 @@ static int msm_cpp_cfg_frame(struct cpp_device *cpp_dev,
 			stripe_base = STRIPE_BASE_FW_1_6_0;
 		} else {
 			pr_err("invalid fw version %08x", cpp_dev->fw_version);
+			rc = -EINVAL;
 			goto phyaddr_err;
 		}
 
@@ -1732,11 +1735,15 @@ static int msm_cpp_cfg_frame(struct cpp_device *cpp_dev,
 qcmd_err:
 	kfree(frame_qcmd);
 phyaddr_err:
+	if (duplicate_acquired)
+		msm_cpp_buffer_ops(cpp_dev, VIDIOC_MSM_BUF_MNGR_PUT_BUF,
+				   &dup_buff_mgr_info);
 	if (new_frame->output_buffer_info[0].native_buff == 0)
 		msm_cpp_buffer_ops(cpp_dev, VIDIOC_MSM_BUF_MNGR_PUT_BUF,
 			&buff_mgr_info);
 frame_msg_err:
 	kfree(cpp_frame_msg);
+	kfree(new_frame);
 	return rc;
 }
 
@@ -1744,19 +1751,20 @@ static int msm_cpp_cfg(struct cpp_device *cpp_dev,
 	struct msm_camera_v4l2_ioctl_t *ioctl_ptr)
 {
 	struct msm_cpp_frame_info_t *frame = NULL;
+	int32_t __user *status;
 	int32_t rc = 0;
 
 	frame = msm_cpp_get_frame(ioctl_ptr);
 	if (!frame) {
 		pr_err("%s: Error allocating frame\n", __func__);
 		return -ENOMEM;
-	} else {
-		rc = msm_cpp_cfg_frame(cpp_dev, frame);
 	}
+	status = frame->status;
+	rc = msm_cpp_cfg_frame(cpp_dev, frame);
 
 	ioctl_ptr->trans_code = rc;
 
-	if (copy_to_user((void __user *)frame->status, &rc,
+	if (copy_to_user(status, &rc,
 		sizeof(int32_t)))
 		pr_err("error cannot copy error\n");
 
@@ -2512,31 +2520,18 @@ static long msm_cpp_subdev_fops_compat_ioctl(struct file *file,
 	switch (cmd) {
 	case VIDIOC_MSM_CPP_CFG32:
 	{
-		struct msm_camera_v4l2_ioctl32_t *up32 =
-		  (struct msm_camera_v4l2_ioctl32_t *)up;
-		struct msm_cpp_frame_info32_t *u32_frame_info =
-		  (struct msm_cpp_frame_info32_t *)compat_ptr(up32->ioctl_ptr);
-		struct msm_cpp_frame_info_t *cpp_frame = NULL;
-		int32_t *status;
+		struct msm_cpp_frame_info_t *cpp_frame;
+		int32_t __user *status;
 
 		/* Get the cpp frame pointer */
 		cpp_frame = get_64bit_cpp_frame_from_compat(&kp_ioctl);
 
-		/* Configure the cpp frame */
-		if (cpp_frame)
-			rc = msm_cpp_cfg_frame(cpp_dev, cpp_frame);
-		else {
-			pr_err("%s: Error getting frame\n", __func__);
+		if (!cpp_frame)
 			return -ENOMEM;
-		}
-
+		status = cpp_frame->status;
+		rc = msm_cpp_cfg_frame(cpp_dev, cpp_frame);
 		kp_ioctl.trans_code = rc;
-
-		/* Convert the 32 bit pointer to 64 bit pointer */
-		status = compat_ptr(u32_frame_info->status);
-
-		if (copy_to_user((void __user *)cpp_frame->status, &rc,
-			sizeof(int32_t)))
+		if (copy_to_user(status, &rc, sizeof(rc)))
 			pr_err("error cannot copy error\n");
 
 		cmd = VIDIOC_MSM_CPP_CFG;
