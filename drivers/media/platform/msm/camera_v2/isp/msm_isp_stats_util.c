@@ -281,15 +281,20 @@ int msm_isp_release_stats_stream(struct vfe_device *vfe_dev, void *arg)
 	}
 
 	stream_info = &stats_data->stream_info[stats_idx];
+	if (stream_info->stream_handle != stream_release_cmd->stream_handle)
+		return -EINVAL;
 	if (stream_info->state == STATS_AVALIABLE) {
 		pr_err("%s: stream already release\n", __func__);
 		return rc;
-	} else if (stream_info->state != STATS_INACTIVE) {
+	} else if (stream_info->state != STATS_INACTIVE || stream_info->buf[0] ||
+		   stream_info->buf[1]) {
 		stream_cfg_cmd.enable = 0;
 		stream_cfg_cmd.num_streams = 1;
 		stream_cfg_cmd.stream_handle[0] =
 			stream_release_cmd->stream_handle;
 		rc = msm_isp_cfg_stats_stream(vfe_dev, &stream_cfg_cmd);
+		if (rc)
+			return rc;
 	}
 
 	if (!stream_info->composite_flag)
@@ -448,201 +453,102 @@ static int msm_isp_stats_wait_for_cfg_done(struct vfe_device *vfe_dev)
 	return rc;
 }
 
-static int msm_isp_stats_update_cgc_override(struct vfe_device *vfe_dev,
-	struct msm_vfe_stats_stream_cfg_cmd *stream_cfg_cmd)
-{
-	int i;
-	uint32_t stats_mask = 0, idx;
-
-	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
-		idx = STATS_IDX(stream_cfg_cmd->stream_handle[i]);
-
-		if (idx >= vfe_dev->hw_info->stats_hw_info->num_stats_type) {
-			pr_err("%s Invalid stats index %d", __func__, idx);
-			return -EINVAL;
-		}
-		stats_mask |= 1 << idx;
-	}
-
-	if (vfe_dev->hw_info->vfe_ops.stats_ops.update_cgc_override) {
-		vfe_dev->hw_info->vfe_ops.stats_ops.update_cgc_override(
-			vfe_dev, stats_mask, stream_cfg_cmd->enable);
-	}
-	return 0;
-}
-
-static int msm_isp_start_stats_stream(struct vfe_device *vfe_dev,
-	struct msm_vfe_stats_stream_cfg_cmd *stream_cfg_cmd)
-{
-	int i, rc = 0;
-	uint32_t stats_mask = 0, idx;
-	uint32_t comp_stats_mask[MAX_NUM_STATS_COMP_MASK] = {0};
-	uint32_t num_stats_comp_mask = 0;
-	struct msm_vfe_stats_stream *stream_info;
-	struct msm_vfe_stats_shared_data *stats_data = &vfe_dev->stats_data;
-
-	num_stats_comp_mask =
-		vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask;
-	rc = vfe_dev->hw_info->vfe_ops.stats_ops.check_streams(
-		stats_data->stream_info);
-	if (rc < 0)
-		return rc;
-	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
-		idx = STATS_IDX(stream_cfg_cmd->stream_handle[i]);
-
-		if (idx >= vfe_dev->hw_info->stats_hw_info->num_stats_type) {
-			pr_err("%s Invalid stats index %d", __func__, idx);
-			return -EINVAL;
-		}
-
-		stream_info = &stats_data->stream_info[idx];
-		if (stream_info->stream_handle !=
-				stream_cfg_cmd->stream_handle[i]) {
-			pr_err("%s: Invalid stream handle: 0x%x received\n",
-				__func__, stream_cfg_cmd->stream_handle[i]);
-			continue;
-		}
-
-		if (stream_info->composite_flag > num_stats_comp_mask) {
-			pr_err("%s: comp grp %d exceed max %d\n",
-				__func__, stream_info->composite_flag,
-				num_stats_comp_mask);
-			return -EINVAL;
-		}
-		rc = msm_isp_init_stats_ping_pong_reg(vfe_dev, stream_info);
-		if (rc < 0) {
-			pr_err("%s: No buffer for stream%d\n", __func__, idx);
-			return rc;
-		}
-
-		if (vfe_dev->axi_data.src_info[VFE_PIX_0].active)
-			stream_info->state = STATS_START_PENDING;
-		else
-			stream_info->state = STATS_ACTIVE;
-
-		stats_data->num_active_stream++;
-		stats_mask |= 1 << idx;
-
-		if (stream_info->composite_flag > 0)
-			comp_stats_mask[stream_info->composite_flag-1] |=
-				1 << idx;
-
-		ISP_DBG("%s: stats_mask %x %x active streams %d\n",
-			__func__, comp_stats_mask[0],
-			comp_stats_mask[1],
-			stats_data->num_active_stream);
-
-	}
-
-	if (vfe_dev->axi_data.src_info[VFE_PIX_0].active) {
-		rc = msm_isp_stats_wait_for_cfg_done(vfe_dev);
-	} else {
-		vfe_dev->hw_info->vfe_ops.stats_ops.enable_module(
-			vfe_dev, stats_mask, stream_cfg_cmd->enable);
-		for (i = 0; i < num_stats_comp_mask; i++) {
-			vfe_dev->hw_info->vfe_ops.stats_ops.cfg_comp_mask(
-			 vfe_dev, comp_stats_mask[i], i, 1);
-		}
-	}
-	return rc;
-}
-
-static int msm_isp_stop_stats_stream(struct vfe_device *vfe_dev,
-	struct msm_vfe_stats_stream_cfg_cmd *stream_cfg_cmd)
-{
-	int i, rc = 0;
-	uint32_t stats_mask = 0, idx;
-	uint32_t comp_stats_mask[MAX_NUM_STATS_COMP_MASK] = {0};
-	uint32_t num_stats_comp_mask = 0;
-	struct msm_vfe_stats_stream *stream_info;
-	struct msm_vfe_stats_shared_data *stats_data = &vfe_dev->stats_data;
-	num_stats_comp_mask =
-		vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask;
-
-	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
-
-		idx = STATS_IDX(stream_cfg_cmd->stream_handle[i]);
-
-		if (idx >= vfe_dev->hw_info->stats_hw_info->num_stats_type) {
-			pr_err("%s Invalid stats index %d", __func__, idx);
-			return -EINVAL;
-		}
-
-		stream_info = &stats_data->stream_info[idx];
-		if (stream_info->stream_handle !=
-				stream_cfg_cmd->stream_handle[i]) {
-			pr_err("%s: Invalid stream handle: 0x%x received\n",
-				__func__, stream_cfg_cmd->stream_handle[i]);
-			continue;
-		}
-
-		if (stream_info->composite_flag > num_stats_comp_mask) {
-			pr_err("%s: comp grp %d exceed max %d\n",
-				__func__, stream_info->composite_flag,
-				num_stats_comp_mask);
-			return -EINVAL;
-		}
-
-		if (vfe_dev->axi_data.src_info[VFE_PIX_0].active)
-			stream_info->state = STATS_STOP_PENDING;
-		else
-			stream_info->state = STATS_INACTIVE;
-
-		stats_data->num_active_stream--;
-		stats_mask |= 1 << idx;
-
-		if (stream_info->composite_flag > 0)
-			comp_stats_mask[stream_info->composite_flag-1] |=
-				1 << idx;
-
-		ISP_DBG("%s: stats_mask %x %x active streams %d\n",
-			__func__, comp_stats_mask[0],
-			comp_stats_mask[1],
-			stats_data->num_active_stream);
-	}
-
-	if (vfe_dev->axi_data.src_info[VFE_PIX_0].active) {
-		rc = msm_isp_stats_wait_for_cfg_done(vfe_dev);
-	} else {
-		vfe_dev->hw_info->vfe_ops.stats_ops.enable_module(
-			vfe_dev, stats_mask, stream_cfg_cmd->enable);
-		for (i = 0; i < num_stats_comp_mask; i++) {
-			vfe_dev->hw_info->vfe_ops.stats_ops.cfg_comp_mask(
-			   vfe_dev, comp_stats_mask[i], i, 0);
-		}
-	}
-
-	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
-		idx = STATS_IDX(stream_cfg_cmd->stream_handle[i]);
-
-		if (idx >= vfe_dev->hw_info->stats_hw_info->num_stats_type) {
-			pr_err("%s Invalid stats index %d", __func__, idx);
-			return -EINVAL;
-		}
-
-		stream_info = &stats_data->stream_info[idx];
-		msm_isp_put_ping_pong_buffers(vfe_dev, stream_info->buf);
-	}
-	return rc;
-}
-
 int msm_isp_cfg_stats_stream(struct vfe_device *vfe_dev, void *arg)
 {
-	int rc = 0;
-	struct msm_vfe_stats_stream_cfg_cmd *stream_cfg_cmd = arg;
-	if (vfe_dev->stats_data.num_active_stream == 0)
-		vfe_dev->hw_info->vfe_ops.stats_ops.cfg_ub(vfe_dev);
+	struct msm_vfe_stats_stream_cfg_cmd *cmd = arg;
+	struct msm_vfe_stats_shared_data *stats = &vfe_dev->stats_data;
+	struct msm_vfe_stats_ops *ops = &vfe_dev->hw_info->vfe_ops.stats_ops;
+	const unsigned int count = vfe_dev->hw_info->stats_hw_info->num_stats_type;
+	const unsigned int groups = vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask;
+	struct msm_vfe_stats_stream *stream;
+	uint32_t comp[MAX_NUM_STATS_COMP_MASK] = { 0 };
+	uint32_t seen = 0, mask = 0, prepared = 0;
+	bool enable = !!cmd->enable;
+	bool running = vfe_dev->axi_data.src_info[VFE_PIX_0].active;
+	unsigned int i, idx;
+	int rc;
 
-	if (stream_cfg_cmd->enable) {
-		msm_isp_stats_update_cgc_override(vfe_dev, stream_cfg_cmd);
-
-		rc = msm_isp_start_stats_stream(vfe_dev, stream_cfg_cmd);
-	} else {
-		rc = msm_isp_stop_stats_stream(vfe_dev, stream_cfg_cmd);
-
-		msm_isp_stats_update_cgc_override(vfe_dev, stream_cfg_cmd);
+	if (cmd->num_streams > ARRAY_SIZE(cmd->stream_handle) ||
+	    groups > ARRAY_SIZE(comp) || count > ARRAY_SIZE(stats->stream_info))
+		return -EINVAL;
+	for (i = 0; i < cmd->num_streams; i++) {
+		idx = STATS_IDX(cmd->stream_handle[i]);
+		if (idx >= count || (seen & BIT(idx)))
+			return -EINVAL;
+		seen |= BIT(idx);
+		stream = &stats->stream_info[idx];
+		if (stream->stream_handle != cmd->stream_handle[i] ||
+		    stream->state == STATS_AVALIABLE || stream->composite_flag > groups)
+			return -EINVAL;
+		if (enable && stream->state != STATS_INACTIVE)
+			return -EBUSY;
+		if (!enable && stream->state == STATS_INACTIVE &&
+		    !stream->buf[0] && !stream->buf[1])
+			continue;
+		mask |= BIT(idx);
+		if (stream->composite_flag)
+			comp[stream->composite_flag - 1] |= BIT(idx);
 	}
+	if (!mask)
+		return 0;
 
+	if (enable) {
+		rc = ops->check_streams(stats->stream_info);
+		if (rc)
+			return rc;
+		for (i = 0; i < count; i++) {
+			stream = &stats->stream_info[i];
+			/* A previously timed-out stop may have since latched. */
+			if ((mask & BIT(i)) && (stream->buf[0] || stream->buf[1])) {
+				msm_isp_put_ping_pong_buffers(vfe_dev, stream->buf);
+				stats->num_active_stream--;
+			}
+		}
+		if (!stats->num_active_stream)
+			ops->cfg_ub(vfe_dev);
+		if (ops->update_cgc_override)
+			ops->update_cgc_override(vfe_dev, mask, 1);
+		for (i = 0; i < count; i++) {
+			if (!(mask & BIT(i)))
+				continue;
+			rc = msm_isp_init_stats_ping_pong_reg(vfe_dev, &stats->stream_info[i]);
+			if (rc)
+				goto put_prepared;
+			prepared |= BIT(i);
+		}
+		stats->num_active_stream += hweight32(mask);
+	}
+	for (i = 0; i < count; i++) {
+		if (!(mask & BIT(i)))
+			continue;
+		stream = &stats->stream_info[i];
+		if (enable)
+			stream->state = running ? STATS_START_PENDING : STATS_ACTIVE;
+		else
+			stream->state = running ? STATS_STOP_PENDING : STATS_INACTIVE;
+	}
+	if (running) {
+		rc = msm_isp_stats_wait_for_cfg_done(vfe_dev);
+		if (rc)
+			return rc;
+	} else {
+		ops->enable_module(vfe_dev, mask, enable);
+		for (i = 0; i < groups; i++)
+			if (comp[i])
+				ops->cfg_comp_mask(vfe_dev, comp[i], i, enable);
+	}
+	if (enable)
+		return 0;
+	stats->num_active_stream -= hweight32(mask);
+	prepared = mask;
+	rc = 0;
+
+put_prepared:
+	for (i = 0; i < count; i++)
+		if (prepared & BIT(i))
+			msm_isp_put_ping_pong_buffers(vfe_dev, stats->stream_info[i].buf);
+	if (ops->update_cgc_override)
+		ops->update_cgc_override(vfe_dev, mask, 0);
 	return rc;
 }
 
@@ -654,12 +560,16 @@ int msm_isp_update_stats_stream(struct vfe_device *vfe_dev, void *arg)
 	struct msm_vfe_axi_stream_update_cmd *update_cmd = arg;
 	struct msm_vfe_axi_stream_cfg_update_info *update_info = NULL;
 
+	if (update_cmd->num_streams > ARRAY_SIZE(update_cmd->update_info))
+		return -EINVAL;
 	/*validate request*/
 	for (i = 0; i < update_cmd->num_streams; i++) {
 		update_info = &update_cmd->update_info[i];
 		/*check array reference bounds*/
 		if (STATS_IDX(update_info->stream_handle)
-			> vfe_dev->hw_info->stats_hw_info->num_stats_type) {
+			>= vfe_dev->hw_info->stats_hw_info->num_stats_type ||
+		    (update_cmd->update_type == UPDATE_STREAM_STATS_FRAMEDROP_PATTERN &&
+		     update_info->skip_pattern >= MAX_SKIP)) {
 			pr_err("%s: stats idx %d out of bound!", __func__,
 				STATS_IDX(update_info->stream_handle));
 			return -EINVAL;
