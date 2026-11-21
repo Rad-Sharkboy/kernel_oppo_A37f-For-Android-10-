@@ -28,3 +28,22 @@
 &clock_gcc {
 	qcom,a37-gpu-svs-310;
 };
+
+&soc {
+	qcom,lpm-levels {
+		qcom,pm-cluster@0 {
+			qcom,pm-cluster-level@2 {
+				reg = <2>;
+				label = "l2-pc";
+				qcom,spm-l2-mode = "pc";
+				qcom,latency-us = <11030>;
+				qcom,ss-power = <490>;
+				qcom,energy-overhead = <972390>;
+				qcom,time-overhead = <1580>;
+				qcom,min-child-idx = <2>;
+				qcom,notify-rpm;
+				qcom,suspend-only;
+			};
+		};
+	};
+};
