@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/gpio.h>
 #include <linux/delay.h>
 #include <linux/regulator/consumer.h>
@@ -253,20 +254,22 @@ int validate_iris_chip_id(u32 reg)
 	}
 }
 
-void  wcnss_iris_reset(u32 reg, void __iomem *pmu_conf_reg)
+/* All IRIS setup runs in sleepable proxy-notifier context. */
+static int iris_wait_clear(void __iomem *pmu, u32 mask)
 {
-	/* Reset IRIS */
-	reg |= WCNSS_PMU_CFG_IRIS_RESET;
-	writel_relaxed(reg, pmu_conf_reg);
+	u32 status;
 
-	/* Wait for PMU_CFG.iris_reg_reset_sts */
-	while (readl_relaxed(pmu_conf_reg) &
-			WCNSS_PMU_CFG_IRIS_RESET_STS)
-		cpu_relax();
+	return readl_poll_timeout(pmu, status, !(status & mask), 50, 100000);
+}
 
-	/* Reset iris reset bit */
-	reg &= ~WCNSS_PMU_CFG_IRIS_RESET;
-	writel_relaxed(reg, pmu_conf_reg);
+static int wcnss_iris_reset(u32 reg, void __iomem *pmu)
+{
+	int rc;
+
+	writel_relaxed(reg | WCNSS_PMU_CFG_IRIS_RESET, pmu);
+	rc = iris_wait_clear(pmu, WCNSS_PMU_CFG_IRIS_RESET_STS);
+	writel_relaxed(reg & ~WCNSS_PMU_CFG_IRIS_RESET, pmu);
+	return rc;
 }
 
 static int configure_iris_xo(struct device *dev, struct wcnss_wlan_config *cfg,
@@ -315,7 +318,9 @@ static int configure_iris_xo(struct device *dev, struct wcnss_wlan_config *cfg,
 		iris_reg = readl_relaxed(iris_read_reg);
 	}
 
-	wcnss_iris_reset(reg, pmu_conf_reg);
+	rc = wcnss_iris_reset(reg, pmu_conf_reg);
+	if (rc)
+		goto abort_pmu;
 
 	if (iris_reg != WCNSS_INVALID_IRIS_REG) {
 		iris_reg &= 0xffff;
@@ -328,14 +333,16 @@ static int configure_iris_xo(struct device *dev, struct wcnss_wlan_config *cfg,
 			writel_relaxed(reg, pmu_conf_reg);
 
 			/* Wait for PMU_CFG.iris_reg_read_sts */
-			while (readl_relaxed(pmu_conf_reg) &
-					WCNSS_PMU_CFG_IRIS_XO_READ_STS)
-				cpu_relax();
+			rc = iris_wait_clear(pmu_conf_reg, WCNSS_PMU_CFG_IRIS_XO_READ_STS);
+			if (rc)
+				goto abort_pmu;
 
 			iris_reg = readl_relaxed(iris_read_reg);
 			pr_info("wcnss: IRIS Reg: %08x\n", iris_reg);
 
-			if (validate_iris_chip_id(iris_reg) && i >= 4) {
+			if (!validate_iris_chip_id(iris_reg))
+				break;
+			if (i >= 4) {
 				pr_info("wcnss: IRIS Card absent/invalid\n");
 				detected = WCNSS_XO_INVALID;
 				/* Reset iris read bit */
@@ -345,13 +352,12 @@ static int configure_iris_xo(struct device *dev, struct wcnss_wlan_config *cfg,
 				 */
 				reg &= ~(WCNSS_PMU_CFG_IRIS_XO_MODE);
 				goto xo_configure;
-			} else if (!validate_iris_chip_id(iris_reg)) {
-				pr_debug("wcnss: IRIS Card is present\n");
-				break;
 			}
 			reg &= ~WCNSS_PMU_CFG_IRIS_XO_READ;
 			writel_relaxed(reg, pmu_conf_reg);
-			wcnss_iris_reset(reg, pmu_conf_reg);
+			rc = wcnss_iris_reset(reg, pmu_conf_reg);
+			if (rc)
+				goto abort_pmu;
 		} while (i++ < 5);
 		detected = xo_auto_detect(iris_reg);
 
@@ -369,27 +375,27 @@ static int configure_iris_xo(struct device *dev, struct wcnss_wlan_config *cfg,
 	/* Clear XO_MODE[b2:b1] bits. Clear implies 19.2 MHz TCXO */
 	reg &= ~(WCNSS_PMU_CFG_IRIS_XO_MODE);
 
-	if ((cfg->use_48mhz_xo && detected == WCNSS_XO_INVALID)
-			|| detected ==  WCNSS_XO_48MHZ) {
+	if ((cfg->use_48mhz_xo && detected == WCNSS_XO_INVALID) ||
+	    detected == WCNSS_XO_48MHZ)
 		reg |= WCNSS_PMU_CFG_IRIS_XO_MODE_48;
-
-	}
 
 xo_configure:
 	mode = (reg & WCNSS_PMU_CFG_IRIS_XO_MODE) == WCNSS_PMU_CFG_IRIS_XO_MODE_48 ?
 		WCNSS_XO_48MHZ : WCNSS_XO_19MHZ;
 	writel_relaxed(reg, pmu_conf_reg);
 
-	wcnss_iris_reset(reg, pmu_conf_reg);
+	rc = wcnss_iris_reset(reg, pmu_conf_reg);
+	if (rc)
+		goto abort_pmu;
 
 	/* Start IRIS XO configuration */
 	reg |= WCNSS_PMU_CFG_IRIS_XO_CFG;
 	writel_relaxed(reg, pmu_conf_reg);
 
 	/* Wait for XO configuration to finish */
-	while (readl_relaxed(pmu_conf_reg) &
-					WCNSS_PMU_CFG_IRIS_XO_CFG_STS)
-		cpu_relax();
+	rc = iris_wait_clear(pmu_conf_reg, WCNSS_PMU_CFG_IRIS_XO_CFG_STS);
+	if (rc)
+		goto abort_pmu;
 
 	/* Stop IRIS XO configuration */
 	reg &= ~(WCNSS_PMU_CFG_GC_BUS_MUX_SEL_TOP |
@@ -412,6 +418,15 @@ xo_configure:
 	}
 	*iris_xo_set = mode;
 	msleep(20);
+	goto put_clk;
+
+abort_pmu:
+	pr_err_ratelimited("wcnss: IRIS handshake timed out\n");
+	reg &= ~(WCNSS_PMU_CFG_GC_BUS_MUX_SEL_TOP | WCNSS_PMU_CFG_IRIS_RESET |
+		 WCNSS_PMU_CFG_IRIS_XO_READ | WCNSS_PMU_CFG_IRIS_XO_CFG |
+		 WCNSS_PMU_CFG_IRIS_XO_EN);
+	writel_relaxed(reg, pmu_conf_reg);
+	clk_disable_unprepare(clk);
 put_clk:
 	clk_put(clk);
 	return rc;
