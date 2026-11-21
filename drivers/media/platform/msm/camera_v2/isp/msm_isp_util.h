@@ -34,6 +34,8 @@ struct msm_isp_bandwidth_mgr {
 
 uint32_t msm_isp_get_framedrop_period(
 	enum msm_vfe_frame_skip_pattern frame_skip_pattern);
+void msm_isp_put_ping_pong_buffers(struct vfe_device *vfe_dev,
+				   struct msm_isp_buffer **slots);
 void msm_isp_reset_burst_count_and_frame_drop(
 	struct vfe_device *vfe_dev, struct msm_vfe_axi_stream *stream_info);
 

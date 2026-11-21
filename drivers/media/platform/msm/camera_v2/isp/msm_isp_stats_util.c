@@ -325,25 +325,13 @@ static int msm_isp_init_stats_ping_pong_reg(
 	rc = msm_isp_stats_cfg_ping_pong_address(vfe_dev,
 		stream_info, VFE_PONG_FLAG, NULL);
 	if (rc < 0) {
+		msm_isp_put_ping_pong_buffers(vfe_dev, stream_info->buf);
 		pr_err("%s: No free buffer for pong\n", __func__);
 		return rc;
 	}
 	return rc;
 }
 
-static void msm_isp_deinit_stats_ping_pong_reg(
-	struct vfe_device *vfe_dev,
-	struct msm_vfe_stats_stream *stream_info)
-{
-	int i;
-	struct msm_isp_buffer *buf;
-	for (i = 0; i < 2; i++) {
-		buf = stream_info->buf[i];
-		if (buf)
-			vfe_dev->buf_mgr->ops->put_buf(vfe_dev->buf_mgr,
-				buf->bufq_handle, buf->buf_idx);
-	}
-}
 
 void msm_isp_update_stats_framedrop_reg(struct vfe_device *vfe_dev)
 {
@@ -633,7 +621,7 @@ static int msm_isp_stop_stats_stream(struct vfe_device *vfe_dev,
 		}
 
 		stream_info = &stats_data->stream_info[idx];
-		msm_isp_deinit_stats_ping_pong_reg(vfe_dev, stream_info);
+		msm_isp_put_ping_pong_buffers(vfe_dev, stream_info->buf);
 	}
 	return rc;
 }

@@ -108,6 +108,22 @@ void msm_camera_io_dump_2(void __iomem *addr, int size)
 		pr_err("%s\n", line_str);
 }
 
+void msm_isp_put_ping_pong_buffers(struct vfe_device *vfe_dev,
+				   struct msm_isp_buffer **slots)
+{
+	struct msm_isp_buffer *ping = slots[0];
+	struct msm_isp_buffer *pong = slots[1];
+
+	slots[0] = NULL;
+	slots[1] = NULL;
+	if (ping)
+		vfe_dev->buf_mgr->ops->put_buf(vfe_dev->buf_mgr,
+					       ping->bufq_handle, ping->buf_idx);
+	if (pong && pong != ping)
+		vfe_dev->buf_mgr->ops->put_buf(vfe_dev->buf_mgr,
+					       pong->bufq_handle, pong->buf_idx);
+}
+
 void msm_isp_print_fourcc_error(const char *origin, uint32_t fourcc_format)
 {
 	int i;

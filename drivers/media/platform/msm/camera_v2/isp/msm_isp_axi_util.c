@@ -397,6 +397,7 @@ int msm_isp_axi_check_stream_state(
 {
 	int rc = 0, i;
 	unsigned long flags;
+	uint32_t seen = 0, idx;
 	struct msm_vfe_axi_shared_data *axi_data = &vfe_dev->axi_data;
 	struct msm_vfe_axi_stream *stream_info;
 	enum msm_vfe_axi_state valid_state =
@@ -406,12 +407,14 @@ int msm_isp_axi_check_stream_state(
 		return -EINVAL;
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
-		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-		>= MAX_NUM_STREAM) {
+		idx = HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i]);
+		if (idx >= MAX_NUM_STREAM || (seen & BIT(idx)))
 			return -EINVAL;
-		}
-		stream_info = &axi_data->stream_info[
-			HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])];
+		seen |= BIT(idx);
+		stream_info = &axi_data->stream_info[idx];
+		if (stream_info->stream_handle != stream_cfg_cmd->stream_handle[i] ||
+		    SRC_TO_INTF(stream_info->stream_src) >= VFE_SRC_MAX)
+			return -EINVAL;
 		spin_lock_irqsave(&stream_info->lock, flags);
 		if (stream_info->state != valid_state) {
 			if ((stream_info->state == PAUSING ||
@@ -919,7 +922,7 @@ void msm_isp_axi_cfg_update(struct vfe_device *vfe_dev, uint32_t sources)
 			msm_isp_axi_stream_enable_cfg(vfe_dev, stream);
 			stream->state = RESUMING;
 			pending = true;
-		} else {
+		} else if (stream->state == RESUMING) {
 			stream->runtime_output_format = stream->output_format;
 			stream->state = ACTIVE;
 		}
@@ -1353,11 +1356,13 @@ static int msm_isp_init_stream_ping_pong_reg(
 	 */
 	if (stream_info->stream_type == BURST_STREAM &&
 		stream_info->runtime_num_burst_capture <= 1) {
-		msm_isp_cfg_pong_address(vfe_dev, stream_info);
+		if (stream_info->buf[0])
+			msm_isp_cfg_pong_address(vfe_dev, stream_info);
 	} else {
 		rc = msm_isp_cfg_ping_pong_address(vfe_dev,
 			stream_info, VFE_PONG_FLAG, 1);
 		if (rc < 0) {
+			msm_isp_put_ping_pong_buffers(vfe_dev, stream_info->buf);
 			pr_err("%s: No free buffer for pong\n",
 				   __func__);
 			return rc;
@@ -1366,20 +1371,6 @@ static int msm_isp_init_stream_ping_pong_reg(
 	return rc;
 }
 
-static void msm_isp_deinit_stream_ping_pong_reg(
-	struct vfe_device *vfe_dev,
-	struct msm_vfe_axi_stream *stream_info)
-{
-	int i;
-	for (i = 0; i < 2; i++) {
-		struct msm_isp_buffer *buf;
-		buf = stream_info->buf[i];
-		if (buf) {
-			vfe_dev->buf_mgr->ops->put_buf(vfe_dev->buf_mgr,
-				buf->bufq_handle, buf->buf_idx);
-		}
-	}
-}
 
 static void msm_isp_get_stream_wm_mask(
 	struct msm_vfe_axi_stream *stream_info,
@@ -1456,12 +1447,13 @@ int msm_isp_axi_reset(struct vfe_device *vfe_dev,
 		}
 
 		if (bufq->buf_type != ISP_SHARE_BUF) {
-			msm_isp_deinit_stream_ping_pong_reg(vfe_dev,
-				stream_info);
+			msm_isp_put_ping_pong_buffers(vfe_dev, stream_info->buf);
 		} else {
 			vfe_dev->buf_mgr->ops->flush_buf(vfe_dev->buf_mgr,
 				stream_info->bufq_handle,
 				MSM_ISP_BUFFER_FLUSH_ALL);
+			stream_info->buf[0] = NULL;
+			stream_info->buf[1] = NULL;
 		}
 		axi_data->src_info[SRC_TO_INTF(stream_info->stream_src)].
 			frame_id = reset_cmd->frame_id;
@@ -1536,7 +1528,7 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 			enum msm_isp_camif_update_state camif_update)
 {
 	int i, rc = 0;
-	uint8_t src_state;
+	enum msm_vfe_input_src src;
 	uint32_t pending = 0;
 	uint32_t wm_reload_mask = 0x0;
 	struct msm_vfe_axi_stream *stream_info;
@@ -1546,34 +1538,22 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 		return -EINVAL;
 
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
-		if (HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])
-		>= MAX_NUM_STREAM) {
-			return -EINVAL;
-		}
 		stream_info = &axi_data->stream_info[
 			HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])];
-		if (SRC_TO_INTF(stream_info->stream_src) < VFE_SRC_MAX)
-			src_state = axi_data->src_info[
-				SRC_TO_INTF(stream_info->stream_src)].active;
-		else {
-			pr_err("%s: invalid src info index\n", __func__);
-			return -EINVAL;
-		}
-
 		msm_isp_calculate_bandwidth(axi_data, stream_info);
 		msm_isp_reset_framedrop(vfe_dev, stream_info);
 		msm_isp_get_stream_wm_mask(stream_info, &wm_reload_mask);
 		rc = msm_isp_init_stream_ping_pong_reg(vfe_dev, stream_info);
-		if (rc < 0) {
-			pr_err("%s: No buffer for stream %d\n",
-					__func__,
-				HANDLE_TO_IDX(
-				stream_cfg_cmd->stream_handle[i]));
-			return rc;
-		}
+		if (rc < 0)
+			goto put_prepared;
+	}
 
+	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
+		stream_info = &axi_data->stream_info[
+			HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])];
+		src = SRC_TO_INTF(stream_info->stream_src);
 		stream_info->state = START_PENDING;
-		if (src_state) {
+		if (axi_data->src_info[src].active) {
 			pending |= BIT(HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i]));
 		} else {
 			if (vfe_dev->dump_reg)
@@ -1583,11 +1563,8 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 			msm_isp_axi_stream_enable_cfg(vfe_dev, stream_info);
 			stream_info->state = ACTIVE;
 		}
-		if (SRC_TO_INTF(stream_info->stream_src) != VFE_PIX_0 &&
-			stream_info->stream_src < VFE_AXI_SRC_MAX) {
-			vfe_dev->axi_data.src_info[SRC_TO_INTF(
-				stream_info->stream_src)].frame_id = 0;
-		}
+		if (src != VFE_PIX_0)
+			axi_data->src_info[src].frame_id = 0;
 	}
 	msm_isp_update_stream_bandwidth(vfe_dev);
 	vfe_dev->hw_info->vfe_ops.axi_ops.reload_wm(vfe_dev, wm_reload_mask);
@@ -1613,6 +1590,15 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 	if (pending)
 		rc = msm_isp_axi_wait_for_cfg_done(vfe_dev);
 
+	return rc;
+
+put_prepared:
+	while (i-- > 0) {
+		stream_info = &axi_data->stream_info[
+			HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])];
+		msm_isp_put_ping_pong_buffers(vfe_dev, stream_info->buf);
+	}
+	msm_isp_axi_update_cgc_override(vfe_dev, stream_cfg_cmd, 0);
 	return rc;
 }
 
@@ -1729,7 +1715,7 @@ static int msm_isp_stop_axi_stream(struct vfe_device *vfe_dev,
 	for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 		stream_info = &axi_data->stream_info[
 			HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i])];
-		msm_isp_deinit_stream_ping_pong_reg(vfe_dev, stream_info);
+		msm_isp_put_ping_pong_buffers(vfe_dev, stream_info->buf);
 	}
 
 	return rc;
