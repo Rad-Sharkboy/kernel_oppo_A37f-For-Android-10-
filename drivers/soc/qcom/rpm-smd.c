@@ -388,39 +388,27 @@ LIST_HEAD(msm_rpm_ack_list);
 
 static DECLARE_COMPLETION(data_ready);
 
-static inline uint32_t msm_rpm_get_msg_id_from_ack(uint8_t *buf)
+static int msm_rpm_ack_status(const struct msm_rpm_ack_msg *ack, int size)
 {
-	return ((struct msm_rpm_ack_msg *)buf)->id_ack;
-}
+	const struct kvp *error = (const void *)(ack + 1);
+	u32 payload;
 
-static inline int msm_rpm_get_error_from_ack(uint8_t *buf)
-{
-	uint8_t *tmp;
-	uint32_t req_len = ((struct msm_rpm_ack_msg *)buf)->req_len;
-
-	int rc = -ENODEV;
-
-	req_len -= sizeof(struct msm_rpm_ack_msg);
-	req_len += 2 * sizeof(uint32_t);
-	if (!req_len)
+	if (ack->req_len < sizeof(*ack) - 2 * sizeof(u32) ||
+	    ack->req_len > size - 2 * sizeof(u32))
+		return -EPROTO;
+	payload = ack->req_len - (sizeof(*ack) - 2 * sizeof(u32));
+	if (!payload)
 		return 0;
-
-	tmp = buf + sizeof(struct msm_rpm_ack_msg);
-
-	BUG_ON(memcmp(tmp, ERR, sizeof(uint32_t)));
-
-	tmp += 2 * sizeof(uint32_t);
-
-	if (!(memcmp(tmp, INV_RSC, min_t(uint32_t, req_len,
-						sizeof(INV_RSC))-1))) {
-		pr_err("%s(): RPM NACK Unsupported resource\n", __func__);
-		rc = -EINVAL;
-	} else {
-		pr_err("%s(): RPM NACK Invalid header\n", __func__);
-	}
-
-	return rc;
+	if (payload < sizeof(*error) || memcmp(error, ERR, sizeof(u32)) ||
+	    error->s > payload - sizeof(*error))
+		return -EPROTO;
+	if (error->s >= sizeof(INV_RSC) - 1 &&
+	    !memcmp(error + 1, INV_RSC, sizeof(INV_RSC) - 1))
+		return -EINVAL;
+	return -ENODEV;
 }
+
+static int msm_rpm_receive_ack(bool noirq);
 
 static int msm_rpm_smd_buffer_request(struct msm_rpm_request *cdata, u32 size)
 {
@@ -515,7 +503,7 @@ static int msm_rpm_try_sleep_write(char *data, int size)
 
 static int msm_rpm_flush_requests(bool print)
 {
-	char local[MAX_SLEEP_BUFFER] __aligned(4), ack[MAX_ERR_BUFFER_SIZE];
+	char local[MAX_SLEEP_BUFFER] __aligned(4);
 	struct rb_node *node;
 	unsigned long flags;
 	int count = 0, rc = 0;
@@ -565,14 +553,15 @@ static int msm_rpm_flush_requests(bool print)
 		}
 
 		if (++count >= MAX_WAIT_ON_ACK) {
-			int retries = 10, len;
+			int retries = 10;
 			while (smd_is_pkt_avail(msm_rpm_data.ch_info) <= 0 && retries--)
 				udelay(50);
-			len = smd_cur_packet_size(msm_rpm_data.ch_info);
-			if (len <= 0 || len > sizeof(ack) ||
-			    smd_read_avail(msm_rpm_data.ch_info) != len ||
-			    smd_read(msm_rpm_data.ch_info, ack, len) != len)
+			if (spin_trylock_irqsave(&msm_rpm_data.smd_lock_read, flags)) {
+				rc = msm_rpm_receive_ack(true);
+				spin_unlock_irqrestore(&msm_rpm_data.smd_lock_read, flags);
+			} else {
 				rc = -EAGAIN;
+			}
 			count--;
 		}
 		spin_lock_irqsave(&slp_buffer_lock, flags);
@@ -895,53 +884,50 @@ struct msm_rpm_kvp_packet {
 };
 
 
-static int msm_rpm_read_smd_data(char *buf)
+/* All three consumers serialize packet framing and dispatch the actual ID. */
+static int msm_rpm_receive_ack(bool noirq)
 {
-	int pkt_sz;
-	int bytes_read = 0;
+	u8 buf[MAX_ERR_BUFFER_SIZE] __aligned(4);
+	struct msm_rpm_ack_msg *ack = (void *)buf;
+	smd_channel_t *ch = msm_rpm_data.ch_info;
+	int size, avail, keep, rc;
 
-	pkt_sz = smd_cur_packet_size(msm_rpm_data.ch_info);
-
-	if (!pkt_sz)
+	size = smd_cur_packet_size(ch);
+	if (size <= 0)
+		return size ? size : -EAGAIN;
+	avail = smd_read_avail(ch);
+	if (avail < 0)
+		return avail;
+	if (avail != size)
 		return -EAGAIN;
 
-	BUG_ON(pkt_sz > MAX_ERR_BUFFER_SIZE);
-
-	if (pkt_sz != smd_read_avail(msm_rpm_data.ch_info))
-		return -EAGAIN;
-
-	do {
-		int len;
-
-		len = smd_read(msm_rpm_data.ch_info, buf + bytes_read, pkt_sz);
-		pkt_sz -= len;
-		bytes_read += len;
-
-	} while (pkt_sz > 0);
-
-	BUG_ON(pkt_sz < 0);
-
+	keep = min_t(int, size, sizeof(buf));
+	rc = smd_read(ch, buf, keep);
+	if (rc != keep)
+		return rc < 0 ? rc : -EIO;
+	if (size > keep) {
+		rc = smd_read(ch, NULL, size - keep);
+		if (rc != size - keep)
+			return rc < 0 ? rc : -EIO;
+	}
+	if (keep < sizeof(*ack)) {
+		pr_err_ratelimited("Short RPM acknowledgement (%d bytes)\n", size);
+		return 0;
+	}
+	rc = size == keep ? msm_rpm_ack_status(ack, size) : -EPROTO;
+	trace_rpm_smd_ack_recvd(noirq, ack->id_ack, rc);
+	msm_rpm_process_ack(ack->id_ack, rc);
 	return 0;
 }
 
 static void msm_rpm_smd_work(struct work_struct *work)
 {
-	uint32_t msg_id;
-	int errno;
-	char buf[MAX_ERR_BUFFER_SIZE] = {0};
-
 	while (1) {
 		wait_for_completion(&data_ready);
-
 		spin_lock(&msm_rpm_data.smd_lock_read);
-		while (smd_is_pkt_avail(msm_rpm_data.ch_info)) {
-			if (msm_rpm_read_smd_data(buf))
+		while (smd_is_pkt_avail(msm_rpm_data.ch_info) > 0)
+			if (msm_rpm_receive_ack(false))
 				break;
-			msg_id = msm_rpm_get_msg_id_from_ack(buf);
-			errno = msm_rpm_get_error_from_ack((uint8_t *)buf);
-			trace_rpm_smd_ack_recvd(0, msg_id, errno);
-			msm_rpm_process_ack(msg_id, errno);
-		}
 		spin_unlock(&msm_rpm_data.smd_lock_read);
 	}
 }
@@ -1273,7 +1259,6 @@ int msm_rpm_wait_for_ack_noirq(uint32_t msg_id)
 	struct msm_rpm_wait_data *elem;
 	unsigned long flags;
 	int rc = 0;
-	uint32_t id = 0;
 
 	if (!msg_id)  {
 		pr_err("%s(): Invalid msg id\n", __func__);
@@ -1296,32 +1281,24 @@ int msm_rpm_wait_for_ack_noirq(uint32_t msg_id)
 		 */
 		goto wait_ack_cleanup;
 
-	if (elem->errno != INIT_ERROR) {
-		rc = elem->errno;
-		msm_rpm_free_list_entry(elem);
-		goto wait_ack_cleanup;
-	}
-
-	while (id != msg_id) {
-		if (smd_is_pkt_avail(msm_rpm_data.ch_info)) {
-			int errno;
-			char buf[MAX_ERR_BUFFER_SIZE] = {};
-
-			msm_rpm_read_smd_data(buf);
-			id = msm_rpm_get_msg_id_from_ack(buf);
-			errno = msm_rpm_get_error_from_ack(buf);
-			trace_rpm_smd_ack_recvd(1, msg_id, errno);
-			msm_rpm_process_ack(id, errno);
+	while (!elem->ack_recd) {
+		rc = smd_is_pkt_avail(msm_rpm_data.ch_info);
+		if (rc < 0)
+			break;
+		if (rc > 0) {
+			rc = msm_rpm_receive_ack(true);
+			if (rc && rc != -EAGAIN)
+				break;
 		}
+		cpu_relax();
 	}
-
-	rc = elem->errno;
-
+	if (elem->ack_recd)
+		rc = elem->errno;
 	msm_rpm_free_list_entry(elem);
 wait_ack_cleanup:
 	spin_unlock_irqrestore(&msm_rpm_data.smd_lock_read, flags);
 
-	if (smd_is_pkt_avail(msm_rpm_data.ch_info))
+	if (smd_is_pkt_avail(msm_rpm_data.ch_info) > 0)
 		complete(&data_ready);
 	return rc;
 }
