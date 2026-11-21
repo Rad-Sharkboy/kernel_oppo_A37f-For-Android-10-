@@ -535,7 +535,9 @@ bool msm_mpm_suspend_wakes_mapped(void)
 	bool ready;
 
 	spin_lock_irqsave(&msm_mpm_lock, flags);
-	ready = msm_mpm_in_suspend && msm_mpm_irqs_detectable(false) &&
+	ready = (msm_mpm_initialized & MSM_MPM_IRQ_MAPPING_DONE) &&
+		(msm_mpm_initialized & MSM_MPM_DEVICE_PROBED) &&
+		msm_mpm_in_suspend && msm_mpm_irqs_detectable(false) &&
 		msm_mpm_gpio_irqs_detectable(false);
 	spin_unlock_irqrestore(&msm_mpm_lock, flags);
 	return ready;
@@ -663,12 +665,12 @@ void msm_mpm_suspend_wake(void)
 
 	spin_lock_irqsave(&msm_mpm_lock, flags);
 
+	msm_mpm_in_suspend = false;
 	allow = msm_mpm_irqs_detectable(true) &&
 		msm_mpm_gpio_irqs_detectable(true);
 
 	spin_unlock_irqrestore(&msm_mpm_lock, flags);
 	msm_mpm_sys_low_power_modes(allow);
-	msm_mpm_in_suspend = false;
 }
 EXPORT_SYMBOL(msm_mpm_suspend_wake);
 
