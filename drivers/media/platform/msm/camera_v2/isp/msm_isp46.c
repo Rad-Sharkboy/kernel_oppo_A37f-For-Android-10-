@@ -499,7 +499,8 @@ static void msm_vfe46_process_reg_update(struct vfe_device *vfe_dev,
 		}
 	}
 	msm_isp_update_framedrop_reg(vfe_dev, input_src);
-	msm_isp_update_stats_framedrop_reg(vfe_dev);
+	if (input_src & BIT(VFE_PIX_0))
+		msm_isp_update_stats_framedrop_reg(vfe_dev);
 	msm_isp_update_error_frame_count(vfe_dev);
 	if ((input_src & (1 << VFE_RAW_0)) ||
 		(input_src & (1 << VFE_RAW_1)) ||
