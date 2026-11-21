@@ -270,7 +270,9 @@ new_packet:
 	}
 
 	dest_buff = skb_tail_pointer(config->agg_skb);
-	if (skb_copy_bits(skb, 0, dest_buff, skb->len)) {
+	if (likely(!skb_is_nonlinear(skb))) {
+		memcpy(dest_buff, skb->data, skb->len);
+	} else if (skb_copy_bits(skb, 0, dest_buff, skb->len)) {
 		spin_unlock_irqrestore(&config->agg_lock, flags);
 		rmnet_kfree_skb(skb, RMNET_STATS_SKBFREE_EGR_MAPFAIL);
 		return;
