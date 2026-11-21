@@ -32,7 +32,8 @@ static LIST_HEAD(power_on_lock_list);
 static DEFINE_MUTEX(list_lock);
 static DEFINE_SEMAPHORE(wcnss_power_on_lock);
 static int auto_detect;
-static int is_power_on;
+static bool is_power_on;
+static int proxy_xo_mode = WCNSS_XO_INVALID;
 DEFINE_LED_TRIGGER(wlan_indication_led);
 
 #define RIVA_PMU_OFFSET         0x28
@@ -717,6 +718,8 @@ int wcnss_wlan_power(struct device *dev,
 	enum wcnss_hw_type hw_type = wcnss_hardware_type();
 
 	down(&wcnss_power_on_lock);
+	if (on && is_power_on)
+		goto report_mode;
 	if (on) {
 		/* RIVA regulator settings */
 		rc = wcnss_core_vregs_on(dev, hw_type,
@@ -732,14 +735,18 @@ int wcnss_wlan_power(struct device *dev,
 
 		/* Configure IRIS XO */
 		rc = configure_iris_xo(dev, cfg,
-				WCNSS_WLAN_SWITCH_ON, iris_xo_set);
+				WCNSS_WLAN_SWITCH_ON, &proxy_xo_mode);
 		if (rc)
 			goto fail_iris_xo;
 
 		is_power_on = true;
+report_mode:
+		if (iris_xo_set)
+			*iris_xo_set = proxy_xo_mode;
 
 	}  else if (is_power_on) {
 		is_power_on = false;
+		proxy_xo_mode = WCNSS_XO_INVALID;
 		configure_iris_xo(dev, cfg,
 				WCNSS_WLAN_SWITCH_OFF, NULL);
 		wcnss_iris_vregs_off(hw_type, cfg);
