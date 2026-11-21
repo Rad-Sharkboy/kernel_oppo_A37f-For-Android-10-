@@ -107,14 +107,8 @@ done:
  * @skb:        Source socket buffer containing multiple MAP frames
  * @config:     Physical endpoint configuration of the ingress device
  *
- * Source skb is cloned with skb_clone(). The new skb data and tail pointers are
- * modified to contain a single MAP frame. Clone happens with GFP_ATOMIC flags
- * set. User should keep calling deaggregate() on the source skb until 0 is
- * returned, indicating that there are no more packets to deaggregate.
- *
- * Return:
- *     - Pointer to new skb
- *     - 0 (null) if no more aggregated packets
+ * Earlier frames share the data allocation. The last frame transfers ownership
+ * of the source skb to the caller. NULL leaves the source with the caller.
  */
 struct sk_buff *rmnet_map_deaggregate(struct sk_buff *skb,
 				      struct rmnet_phys_ep_conf_s *config)
@@ -124,47 +118,38 @@ struct sk_buff *rmnet_map_deaggregate(struct sk_buff *skb,
 	uint32_t packet_len;
 	uint8_t ip_byte;
 
-	if (skb->len == 0)
-		return 0;
+	while (skb->len >= sizeof(*maph)) {
+		unsigned int data_len, suffix;
 
-	maph = (struct rmnet_map_header_s *) skb->data;
-	packet_len = ntohs(maph->pkt_len) + sizeof(struct rmnet_map_header_s);
+		maph = (struct rmnet_map_header_s *)skb->data;
+		data_len = ntohs(maph->pkt_len);
+		packet_len = sizeof(*maph) + data_len;
+		if (config->ingress_data_format & (RMNET_INGRESS_FORMAT_MAP_CKSUMV3 |
+						   RMNET_INGRESS_FORMAT_MAP_CKSUMV4))
+			packet_len += sizeof(struct rmnet_map_dl_checksum_trailer_s);
+		if (packet_len > skb->len)
+			break;
 
-	if ((config->ingress_data_format & RMNET_INGRESS_FORMAT_MAP_CKSUMV3) ||
-	    (config->ingress_data_format & RMNET_INGRESS_FORMAT_MAP_CKSUMV4))
-		packet_len += sizeof(struct rmnet_map_dl_checksum_trailer_s);
-
-	if ((((int)skb->len) - ((int)packet_len)) < 0) {
-		LOGM("%s", "Got malformed packet. Dropping");
-		return 0;
+		suffix = maph->pad_len + config->tail_spacing;
+		if (data_len > suffix) {
+			ip_byte = skb->data[sizeof(*maph)] >> 4;
+			if (ip_byte == 4 || ip_byte == 6) {
+				if (packet_len == skb->len)
+					return skb;
+				skbn = skb_clone(skb, GFP_ATOMIC);
+				if (!skbn)
+					return NULL;
+				skb_trim(skbn, packet_len);
+				skb_pull(skb, packet_len);
+				return skbn;
+			}
+			rmnet_kfree_skb(NULL, RMNET_STATS_SKBFREE_DEAGG_UNKOWN_IP_TYP);
+		} else {
+			rmnet_kfree_skb(NULL, RMNET_STATS_SKBFREE_DEAGG_DATA_LEN_0);
+		}
+		skb_pull(skb, packet_len);
 	}
-
-	skbn = skb_clone(skb, GFP_ATOMIC);
-	if (!skbn)
-		return 0;
-
-	LOGD("Trimming to %d bytes", packet_len);
-	LOGD("before skbn->len = %d", skbn->len);
-	skb_trim(skbn, packet_len);
-	skb_pull(skb, packet_len);
-	LOGD("after skbn->len = %d", skbn->len);
-
-	/* Some hardware can send us empty frames. Catch them */
-	if (ntohs(maph->pkt_len) == 0) {
-		LOGD("Dropping empty MAP frame");
-		rmnet_kfree_skb(skbn, RMNET_STATS_SKBFREE_DEAGG_DATA_LEN_0);
-		return 0;
-	}
-
-	/* Sanity check */
-	ip_byte = (skbn->data[4]) & 0xF0;
-	if (ip_byte != 0x40 && ip_byte != 0x60) {
-		LOGM("Unknown IP type: 0x%02X", ip_byte);
-		rmnet_kfree_skb(skbn, RMNET_STATS_SKBFREE_DEAGG_UNKOWN_IP_TYP);
-		return 0;
-	}
-
-	return skbn;
+	return NULL;
 }
 
 /**

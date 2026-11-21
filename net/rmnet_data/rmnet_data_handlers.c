@@ -332,9 +332,19 @@ static rx_handler_result_t rmnet_map_ingress_handler(struct sk_buff *skb,
 
 	if (config->ingress_data_format & RMNET_INGRESS_FORMAT_DEAGGREGATION) {
 		trace_rmnet_start_deaggregation(skb);
-		while ((skbn = rmnet_map_deaggregate(skb, config)) != 0) {
-			_rmnet_map_ingress_handler(skbn, config);
+		if (unlikely(skb_linearize(skb))) {
+			rmnet_kfree_skb(skb, RMNET_STATS_SKBFREE_DEAGG_CLONE_FAIL);
+			return RX_HANDLER_CONSUMED;
+		}
+		while ((skbn = rmnet_map_deaggregate(skb, config))) {
 			co++;
+			if (skbn == skb) {
+				trace_rmnet_end_deaggregation(skb, co);
+				rmnet_stats_deagg_pkts(co);
+				return _rmnet_map_ingress_handler(skb, config);
+			}
+			if (_rmnet_map_ingress_handler(skbn, config) == RX_HANDLER_PASS)
+				rmnet_kfree_skb(skbn, RMNET_STATS_SKBFREE_DELIVER_NO_EP);
 		}
 		trace_rmnet_end_deaggregation(skb, co);
 		LOGD("De-aggregated %d packets", co);
@@ -469,6 +479,10 @@ rx_handler_result_t rmnet_ingress_handler(struct sk_buff *skb)
 	}
 
 	if (config->ingress_data_format & RMNET_INGRESS_FORMAT_MAP) {
+		if (unlikely(!pskb_may_pull(skb, sizeof(struct rmnet_map_header_s)))) {
+			rmnet_kfree_skb(skb, RMNET_STATS_SKBFREE_DEAGG_MALFORMED);
+			return RX_HANDLER_CONSUMED;
+		}
 		if (RMNET_MAP_GET_CD_BIT(skb)) {
 			if (config->ingress_data_format
 			    & RMNET_INGRESS_FORMAT_MAP_COMMANDS) {

@@ -71,7 +71,7 @@ struct rmnet_phys_ep_conf_s {
 	spinlock_t agg_lock;
 	struct sk_buff *agg_skb;
 	uint8_t agg_state;
-	uint8_t agg_count;
+	uint16_t agg_count;
 	uint8_t tail_spacing;
 };
 
