@@ -2737,6 +2737,7 @@ VOS_STATUS hdd_rx_packet_cbk( v_VOID_t *vosContext,
    vos_pkt_t* pNextVosPacket;
    v_U8_t proto_type = 0;
    v_BOOL_t arp_pkt;
+   __be16 ether_type;
 
    //Sanity check on inputs
    if ( ( NULL == vosContext ) || 
@@ -2810,10 +2811,16 @@ VOS_STATUS hdd_rx_packet_cbk( v_VOID_t *vosContext,
          return VOS_STATUS_E_FAILURE;
       }
 
-      if (TRUE == hdd_IsEAPOLPacket( pVosPacket ))
-          wlan_hdd_log_eapol(skb, WIFI_EVENT_DRIVER_EAPOL_FRAME_RECEIVED);
-
       pVosPacket->pSkb = NULL;
+      if (unlikely(!pskb_may_pull(skb, ETH_HLEN))) {
+          ++pAdapter->hdd_stats.hddTxRxStats.rxDropped;
+          dev_kfree_skb_any(skb);
+          goto next_packet;
+      }
+      ether_type = ((struct ethhdr *)skb->data)->h_proto;
+      arp_pkt = ether_type == htons(ETH_P_ARP);
+      if (ether_type == htons(ETH_P_PAE))
+          wlan_hdd_log_eapol(skb, WIFI_EVENT_DRIVER_EAPOL_FRAME_RECEIVED);
 
       if (WLAN_HDD_ADAPTER_MAGIC != pAdapter->magic)
       {
@@ -2865,8 +2872,6 @@ VOS_STATUS hdd_rx_packet_cbk( v_VOID_t *vosContext,
          }
       }
 
-      arp_pkt = vos_is_arp_pkt(skb, false);
-
       if (arp_pkt)
       {
          ++pAdapter->hdd_stats.hddArpStats.rxCount;
@@ -2875,8 +2880,7 @@ VOS_STATUS hdd_rx_packet_cbk( v_VOID_t *vosContext,
       }
 
       if (pHddCtx->rx_wow_dump) {
-          if (!(VOS_PKT_PROTO_TYPE_ARP & proto_type) &&
-              !(VOS_PKT_PROTO_TYPE_EAPOL & proto_type))
+          if (!arp_pkt && ether_type != htons(ETH_P_PAE))
              hdd_log_ip_addr(skb);
           pHddCtx->rx_wow_dump = false;
       }
@@ -2945,6 +2949,7 @@ VOS_STATUS hdd_rx_packet_cbk( v_VOID_t *vosContext,
 
          ++pAdapter->hdd_stats.hddTxRxStats.rxRefused;
       }
+next_packet:
       // now process the next packet in the chain
       pVosPacket = pNextVosPacket;
 
