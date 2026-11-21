@@ -27,11 +27,10 @@
 #include <linux/leds.h>
 
 
-static void __iomem *msm_wcnss_base;
 static LIST_HEAD(power_on_lock_list);
 static DEFINE_MUTEX(list_lock);
 static DEFINE_SEMAPHORE(wcnss_power_on_lock);
-static int auto_detect;
+static struct clk *proxy_rf_clk;
 static bool is_power_on;
 static int proxy_xo_mode = WCNSS_XO_INVALID;
 DEFINE_LED_TRIGGER(wlan_indication_led);
@@ -270,202 +269,162 @@ void  wcnss_iris_reset(u32 reg, void __iomem *pmu_conf_reg)
 	writel_relaxed(reg, pmu_conf_reg);
 }
 
-static int
-configure_iris_xo(struct device *dev,
-			struct wcnss_wlan_config *cfg,
-			int on, int *iris_xo_set)
+static int configure_iris_xo(struct device *dev, struct wcnss_wlan_config *cfg,
+			     int *iris_xo_set)
 {
-	u32 reg = 0, i = 0;
-	u32 iris_reg = WCNSS_INVALID_IRIS_REG;
-	int rc = 0;
-	int pmu_offset = 0;
-	int spare_offset = 0;
-	void __iomem *pmu_conf_reg;
-	void __iomem *spare_reg;
-	void __iomem *iris_read_reg;
-	struct clk *clk;
-	struct clk *clk_rf = NULL;
-	bool use_48mhz_xo;
+	void __iomem *base = cfg->msm_wcnss_base;
+	void __iomem *pmu_conf_reg, *spare_reg, *iris_read_reg;
+	u32 reg, i = 0, iris_reg = WCNSS_INVALID_IRIS_REG;
+	bool pronto = wcnss_hardware_type() == WCNSS_PRONTO_HW;
+	bool detect = wcnss_xo_auto_detect_enabled();
+	int detected = WCNSS_XO_INVALID;
+	int mode, rc;
+	struct clk *clk, *rf;
 
-	use_48mhz_xo = cfg->use_48mhz_xo;
-
-	if (wcnss_hardware_type() == WCNSS_PRONTO_HW) {
-		pmu_offset = PRONTO_PMU_OFFSET;
-		spare_offset = PRONTO_SPARE_OFFSET;
-
-		clk = clk_get(dev, "xo");
-		if (IS_ERR(clk)) {
-			pr_err("Couldn't get xo clock\n");
-			return PTR_ERR(clk);
-		}
-
-	} else {
-		pmu_offset = RIVA_PMU_OFFSET;
-		spare_offset = RIVA_SPARE_OFFSET;
-
-		clk = clk_get(dev, "cxo");
-		if (IS_ERR(clk)) {
-			pr_err("Couldn't get cxo clock\n");
-			return PTR_ERR(clk);
-		}
+	if (!base)
+		return -ENODEV;
+	clk = clk_get(dev, pronto ? "xo" : "cxo");
+	if (IS_ERR(clk))
+		return PTR_ERR(clk);
+	/* Enable IRIS XO */
+	rc = clk_prepare_enable(clk);
+	if (rc) {
+		pr_err("clk enable failed\n");
+		goto put_clk;
 	}
 
-	if (on) {
-		msm_wcnss_base = cfg->msm_wcnss_base;
-		if (!msm_wcnss_base) {
-			pr_err("ioremap wcnss physical failed\n");
-			goto fail;
-		}
+	/* NV bit is set to indicate that platform driver is capable
+	 * of doing NV download.
+	 */
+	pr_debug("wcnss: Indicate NV bin download\n");
+	spare_reg = base + (pronto ? PRONTO_SPARE_OFFSET : RIVA_SPARE_OFFSET);
+	reg = readl_relaxed(spare_reg);
+	reg |= NVBIN_DLND_BIT;
+	writel_relaxed(reg, spare_reg);
 
-		/* Enable IRIS XO */
-		rc = clk_prepare_enable(clk);
-		if (rc) {
-			pr_err("clk enable failed\n");
-			goto fail;
-		}
+	pmu_conf_reg = base + (pronto ? PRONTO_PMU_OFFSET : RIVA_PMU_OFFSET);
+	writel_relaxed(0, pmu_conf_reg);
+	reg = readl_relaxed(pmu_conf_reg);
+	reg |= WCNSS_PMU_CFG_GC_BUS_MUX_SEL_TOP |
+			WCNSS_PMU_CFG_IRIS_XO_EN;
+	writel_relaxed(reg, pmu_conf_reg);
 
-		/* NV bit is set to indicate that platform driver is capable
-		 * of doing NV download.
-		 */
-		pr_debug("wcnss: Indicate NV bin download\n");
-		spare_reg = msm_wcnss_base + spare_offset;
-		reg = readl_relaxed(spare_reg);
-		reg |= NVBIN_DLND_BIT;
-		writel_relaxed(reg, spare_reg);
+	if (detect) {
+		iris_read_reg = base +
+			PRONTO_IRIS_REG_READ_OFFSET;
+		iris_reg = readl_relaxed(iris_read_reg);
+	}
 
-		pmu_conf_reg = msm_wcnss_base + pmu_offset;
-		writel_relaxed(0, pmu_conf_reg);
-		reg = readl_relaxed(pmu_conf_reg);
-		reg |= WCNSS_PMU_CFG_GC_BUS_MUX_SEL_TOP |
-				WCNSS_PMU_CFG_IRIS_XO_EN;
-		writel_relaxed(reg, pmu_conf_reg);
+	wcnss_iris_reset(reg, pmu_conf_reg);
 
-		if (wcnss_xo_auto_detect_enabled()) {
-			iris_read_reg = msm_wcnss_base +
-				PRONTO_IRIS_REG_READ_OFFSET;
+	if (iris_reg != WCNSS_INVALID_IRIS_REG) {
+		iris_reg &= 0xffff;
+		iris_reg |= PRONTO_IRIS_REG_CHIP_ID;
+		writel_relaxed(iris_reg, iris_read_reg);
+		do {
+			/* Iris read */
+			reg = readl_relaxed(pmu_conf_reg);
+			reg |= WCNSS_PMU_CFG_IRIS_XO_READ;
+			writel_relaxed(reg, pmu_conf_reg);
+
+			/* Wait for PMU_CFG.iris_reg_read_sts */
+			while (readl_relaxed(pmu_conf_reg) &
+					WCNSS_PMU_CFG_IRIS_XO_READ_STS)
+				cpu_relax();
+
 			iris_reg = readl_relaxed(iris_read_reg);
-		}
+			pr_info("wcnss: IRIS Reg: %08x\n", iris_reg);
 
-		wcnss_iris_reset(reg, pmu_conf_reg);
-
-		if (iris_reg != WCNSS_INVALID_IRIS_REG) {
-			iris_reg &= 0xffff;
-			iris_reg |= PRONTO_IRIS_REG_CHIP_ID;
-			writel_relaxed(iris_reg, iris_read_reg);
-			do {
-				/* Iris read */
-				reg = readl_relaxed(pmu_conf_reg);
-				reg |= WCNSS_PMU_CFG_IRIS_XO_READ;
-				writel_relaxed(reg, pmu_conf_reg);
-
-				/* Wait for PMU_CFG.iris_reg_read_sts */
-				while (readl_relaxed(pmu_conf_reg) &
-						WCNSS_PMU_CFG_IRIS_XO_READ_STS)
-					cpu_relax();
-
-				iris_reg = readl_relaxed(iris_read_reg);
-				pr_info("wcnss: IRIS Reg: %08x\n", iris_reg);
-
-				if (validate_iris_chip_id(iris_reg) && i >= 4) {
-					pr_info("wcnss: IRIS Card absent/invalid\n");
-					auto_detect = WCNSS_XO_INVALID;
-					/* Reset iris read bit */
-					reg &= ~WCNSS_PMU_CFG_IRIS_XO_READ;
-					/* Clear XO_MODE[b2:b1] bits.
-					 * Clear implies 19.2 MHz TCXO
-					 */
-					reg &= ~(WCNSS_PMU_CFG_IRIS_XO_MODE);
-					goto xo_configure;
-				} else if (!validate_iris_chip_id(iris_reg)) {
-					pr_debug("wcnss: IRIS Card is present\n");
-					break;
-				}
+			if (validate_iris_chip_id(iris_reg) && i >= 4) {
+				pr_info("wcnss: IRIS Card absent/invalid\n");
+				detected = WCNSS_XO_INVALID;
+				/* Reset iris read bit */
 				reg &= ~WCNSS_PMU_CFG_IRIS_XO_READ;
-				writel_relaxed(reg, pmu_conf_reg);
-				wcnss_iris_reset(reg, pmu_conf_reg);
-			} while (i++ < 5);
-			auto_detect = xo_auto_detect(iris_reg);
-
-			/* Reset iris read bit */
+				/* Clear XO_MODE[b2:b1] bits.
+				 * Clear implies 19.2 MHz TCXO
+				 */
+				reg &= ~(WCNSS_PMU_CFG_IRIS_XO_MODE);
+				goto xo_configure;
+			} else if (!validate_iris_chip_id(iris_reg)) {
+				pr_debug("wcnss: IRIS Card is present\n");
+				break;
+			}
 			reg &= ~WCNSS_PMU_CFG_IRIS_XO_READ;
+			writel_relaxed(reg, pmu_conf_reg);
+			wcnss_iris_reset(reg, pmu_conf_reg);
+		} while (i++ < 5);
+		detected = xo_auto_detect(iris_reg);
 
-		} else if (wcnss_xo_auto_detect_enabled())
-			/* Default to 48 MHZ */
-			auto_detect = WCNSS_XO_48MHZ;
-		else
-			auto_detect = WCNSS_XO_INVALID;
+		/* Reset iris read bit */
+		reg &= ~WCNSS_PMU_CFG_IRIS_XO_READ;
 
-		cfg->iris_id = iris_reg;
+	} else if (detect)
+		/* Default to 48 MHZ */
+		detected = WCNSS_XO_48MHZ;
+	else
+		detected = WCNSS_XO_INVALID;
 
-		/* Clear XO_MODE[b2:b1] bits. Clear implies 19.2 MHz TCXO */
-		reg &= ~(WCNSS_PMU_CFG_IRIS_XO_MODE);
+	cfg->iris_id = iris_reg;
 
-		if ((use_48mhz_xo && auto_detect == WCNSS_XO_INVALID)
-				|| auto_detect ==  WCNSS_XO_48MHZ) {
-			reg |= WCNSS_PMU_CFG_IRIS_XO_MODE_48;
+	/* Clear XO_MODE[b2:b1] bits. Clear implies 19.2 MHz TCXO */
+	reg &= ~(WCNSS_PMU_CFG_IRIS_XO_MODE);
 
-			if (iris_xo_set)
-				*iris_xo_set = WCNSS_XO_48MHZ;
-		}
+	if ((cfg->use_48mhz_xo && detected == WCNSS_XO_INVALID)
+			|| detected ==  WCNSS_XO_48MHZ) {
+		reg |= WCNSS_PMU_CFG_IRIS_XO_MODE_48;
+
+	}
 
 xo_configure:
-		writel_relaxed(reg, pmu_conf_reg);
+	mode = (reg & WCNSS_PMU_CFG_IRIS_XO_MODE) == WCNSS_PMU_CFG_IRIS_XO_MODE_48 ?
+		WCNSS_XO_48MHZ : WCNSS_XO_19MHZ;
+	writel_relaxed(reg, pmu_conf_reg);
 
-		wcnss_iris_reset(reg, pmu_conf_reg);
+	wcnss_iris_reset(reg, pmu_conf_reg);
 
-		/* Start IRIS XO configuration */
-		reg |= WCNSS_PMU_CFG_IRIS_XO_CFG;
-		writel_relaxed(reg, pmu_conf_reg);
+	/* Start IRIS XO configuration */
+	reg |= WCNSS_PMU_CFG_IRIS_XO_CFG;
+	writel_relaxed(reg, pmu_conf_reg);
 
-		/* Wait for XO configuration to finish */
-		while (readl_relaxed(pmu_conf_reg) &
-						WCNSS_PMU_CFG_IRIS_XO_CFG_STS)
-			cpu_relax();
+	/* Wait for XO configuration to finish */
+	while (readl_relaxed(pmu_conf_reg) &
+					WCNSS_PMU_CFG_IRIS_XO_CFG_STS)
+		cpu_relax();
 
-		/* Stop IRIS XO configuration */
-		reg &= ~(WCNSS_PMU_CFG_GC_BUS_MUX_SEL_TOP |
-				WCNSS_PMU_CFG_IRIS_XO_CFG);
-		writel_relaxed(reg, pmu_conf_reg);
-		clk_disable_unprepare(clk);
+	/* Stop IRIS XO configuration */
+	reg &= ~(WCNSS_PMU_CFG_GC_BUS_MUX_SEL_TOP |
+			WCNSS_PMU_CFG_IRIS_XO_CFG);
+	writel_relaxed(reg, pmu_conf_reg);
+	clk_disable_unprepare(clk);
 
-		if ((!use_48mhz_xo && auto_detect == WCNSS_XO_INVALID)
-				|| auto_detect ==  WCNSS_XO_19MHZ) {
-
-			clk_rf = clk_get(dev, "rf_clk");
-			if (IS_ERR(clk_rf)) {
-				pr_err("Couldn't get rf_clk\n");
-				goto fail;
-			}
-
-			rc = clk_prepare_enable(clk_rf);
-			if (rc) {
-				pr_err("clk_rf enable failed\n");
-				goto fail;
-			}
-			if (iris_xo_set)
-				*iris_xo_set = WCNSS_XO_19MHZ;
+	if (mode == WCNSS_XO_19MHZ) {
+		rf = clk_get(dev, "rf_clk");
+		if (IS_ERR(rf)) {
+			rc = PTR_ERR(rf);
+			goto put_clk;
 		}
-
-	}  else if ((!use_48mhz_xo && auto_detect == WCNSS_XO_INVALID)
-			|| auto_detect ==  WCNSS_XO_19MHZ) {
-		clk_rf = clk_get(dev, "rf_clk");
-		if (IS_ERR(clk_rf)) {
-			pr_err("Couldn't get rf_clk\n");
-			goto fail;
+		rc = clk_prepare_enable(rf);
+		if (rc) {
+			clk_put(rf);
+			goto put_clk;
 		}
-		clk_disable_unprepare(clk_rf);
+		proxy_rf_clk = rf;
 	}
-
-	/* Add some delay for XO to settle */
+	*iris_xo_set = mode;
 	msleep(20);
-
-fail:
+put_clk:
 	clk_put(clk);
-
-	if (clk_rf != NULL)
-		clk_put(clk_rf);
-
 	return rc;
+}
+
+static void release_iris_xo(void)
+{
+	if (proxy_rf_clk) {
+		clk_disable_unprepare(proxy_rf_clk);
+		clk_put(proxy_rf_clk);
+		proxy_rf_clk = NULL;
+	}
+	msleep(20);
 }
 
 /* Helper routine to turn off all WCNSS & IRIS vregs */
@@ -734,8 +693,7 @@ int wcnss_wlan_power(struct device *dev,
 			goto fail_iris_on;
 
 		/* Configure IRIS XO */
-		rc = configure_iris_xo(dev, cfg,
-				WCNSS_WLAN_SWITCH_ON, &proxy_xo_mode);
+		rc = configure_iris_xo(dev, cfg, &proxy_xo_mode);
 		if (rc)
 			goto fail_iris_xo;
 
@@ -747,8 +705,7 @@ report_mode:
 	}  else if (is_power_on) {
 		is_power_on = false;
 		proxy_xo_mode = WCNSS_XO_INVALID;
-		configure_iris_xo(dev, cfg,
-				WCNSS_WLAN_SWITCH_OFF, NULL);
+		release_iris_xo();
 		wcnss_iris_vregs_off(hw_type, cfg);
 		wcnss_core_vregs_off(hw_type, cfg);
 	}
