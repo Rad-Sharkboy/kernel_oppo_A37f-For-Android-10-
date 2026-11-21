@@ -53,7 +53,6 @@
 #define WCNSS_PINCTRL_GPIO_STATE_DEFAULT "wcnss_gpio_default"
 
 #define WCNSS_DISABLE_PC_LATENCY	100
-#define WCNSS_ENABLE_PC_LATENCY	PM_QOS_DEFAULT_VALUE
 #define WCNSS_PM_QOS_TIMEOUT	15000
 #define IS_CAL_DATA_PRESENT     0
 #define WAIT_FOR_CBC_IND	2
@@ -1205,32 +1204,12 @@ static void wcnss_remove_sysfs(struct device *dev)
 	}
 }
 
-static void wcnss_pm_qos_add_request(void)
-{
-	pr_info("%s: add request\n", __func__);
-	pm_qos_add_request(&penv->wcnss_pm_qos_request, PM_QOS_CPU_DMA_LATENCY,
-			PM_QOS_DEFAULT_VALUE);
-}
-
-static void wcnss_pm_qos_remove_request(void)
-{
-	pr_info("%s: remove request\n", __func__);
-	pm_qos_remove_request(&penv->wcnss_pm_qos_request);
-}
-
-void wcnss_pm_qos_update_request(int val)
-{
-	pr_info("%s: update request %d\n", __func__, val);
-	pm_qos_update_request(&penv->wcnss_pm_qos_request, val);
-}
-
 void wcnss_disable_pc_remove_req(void)
 {
 	mutex_lock(&penv->pm_qos_mutex);
 	if (penv->pc_disabled) {
 		penv->pc_disabled = 0;
-		wcnss_pm_qos_update_request(WCNSS_ENABLE_PC_LATENCY);
-		wcnss_pm_qos_remove_request();
+		pm_qos_remove_request(&penv->wcnss_pm_qos_request);
 		wcnss_allow_suspend();
 	}
 	mutex_unlock(&penv->pm_qos_mutex);
@@ -1240,9 +1219,9 @@ void wcnss_disable_pc_add_req(void)
 {
 	mutex_lock(&penv->pm_qos_mutex);
 	if (!penv->pc_disabled) {
-		wcnss_pm_qos_add_request();
 		wcnss_prevent_suspend();
-		wcnss_pm_qos_update_request(WCNSS_DISABLE_PC_LATENCY);
+		pm_qos_add_request(&penv->wcnss_pm_qos_request,
+				PM_QOS_CPU_DMA_LATENCY, WCNSS_DISABLE_PC_LATENCY);
 		penv->pc_disabled = 1;
 	}
 	mutex_unlock(&penv->pm_qos_mutex);
