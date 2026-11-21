@@ -521,6 +521,7 @@ static int vfe_probe(struct platform_device *pdev)
 	mutex_init(&vfe_dev->core_mutex);
 	spin_lock_init(&vfe_dev->tasklet_lock);
 	spin_lock_init(&vfe_dev->shared_data_lock);
+	init_completion(&vfe_dev->stream_config_complete);
 	spin_lock_init(&req_history_lock);
 	media_entity_init(&vfe_dev->subdev.sd.entity, 0, NULL, 0);
 	vfe_dev->subdev.sd.entity.type = MEDIA_ENT_T_V4L2_SUBDEV;

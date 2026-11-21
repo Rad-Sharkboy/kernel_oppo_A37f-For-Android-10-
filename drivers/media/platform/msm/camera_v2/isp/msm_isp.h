@@ -380,7 +380,8 @@ struct msm_vfe_axi_shared_data {
 	struct msm_vfe_axi_composite_info
 	composite_info[MAX_NUM_COMPOSITE_MASK];
 	uint8_t num_used_composite_mask;
-	uint32_t stream_update;
+	uint32_t stream_update; /* streams awaiting a frame-boundary change */
+	bool stream_update_aborted;
 	atomic_t axi_cfg_update;
 	enum msm_isp_camif_update_state pipeline_update;
 	struct msm_vfe_src_info src_info[VFE_SRC_MAX];

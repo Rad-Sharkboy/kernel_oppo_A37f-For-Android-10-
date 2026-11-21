@@ -818,9 +818,15 @@ static void msm_isp_axi_stream_enable_cfg(
 void msm_isp_axi_stream_update(struct vfe_device *vfe_dev, uint8_t input_src)
 {
 	int i;
+	unsigned long flags;
 	struct msm_vfe_axi_shared_data *axi_data = &vfe_dev->axi_data;
 
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	if (!axi_data->stream_update)
+		goto out;
 	for (i = 0; i < MAX_NUM_STREAM; i++) {
+		if (!(axi_data->stream_update & BIT(i)))
+			continue;
 		if (axi_data->stream_info[i].state == START_PENDING ||
 				axi_data->stream_info[i].state ==
 					STOP_PENDING) {
@@ -843,7 +849,7 @@ void msm_isp_axi_stream_update(struct vfe_device *vfe_dev, uint8_t input_src)
 				axi_data->stream_info[i].state =
 				axi_data->stream_info[i].state == STARTING ?
 					ACTIVE : INACTIVE;
-				vfe_dev->axi_data.stream_update--;
+				axi_data->stream_update &= ~BIT(i);
 			}
 		}
 	}
@@ -858,6 +864,8 @@ void msm_isp_axi_stream_update(struct vfe_device *vfe_dev, uint8_t input_src)
 
 	if (vfe_dev->axi_data.stream_update == 0)
 		complete(&vfe_dev->stream_config_complete);
+out:
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
 }
 
 static void msm_isp_reload_ping_pong_offset(struct vfe_device *vfe_dev,
@@ -1272,24 +1280,51 @@ static int msm_isp_update_stream_bandwidth(struct vfe_device *vfe_dev)
 	return rc;
 }
 
-static int msm_isp_axi_wait_for_cfg_done(struct vfe_device *vfe_dev,
+static void msm_isp_axi_arm_cfg(struct vfe_device *vfe_dev, uint32_t pending,
 	enum msm_isp_camif_update_state camif_update)
 {
-	int rc;
 	unsigned long flags;
+
 	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
-	init_completion(&vfe_dev->stream_config_complete);
+	INIT_COMPLETION(vfe_dev->stream_config_complete);
+	vfe_dev->axi_data.stream_update_aborted = false;
 	vfe_dev->axi_data.pipeline_update = camif_update;
+	vfe_dev->axi_data.stream_update = pending;
 	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
-	rc = wait_for_completion_timeout(
-		&vfe_dev->stream_config_complete,
-		msecs_to_jiffies(VFE_MAX_CFG_TIMEOUT));
-	if (rc == 0) {
-		pr_err("%s: wait timeout\n", __func__);
-		rc = -1;
-	} else {
-		rc = 0;
+}
+
+void msm_isp_axi_abort_cfg(struct vfe_device *vfe_dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	if (vfe_dev->axi_data.stream_update) {
+		vfe_dev->axi_data.stream_update = 0;
+		vfe_dev->axi_data.pipeline_update = NO_UPDATE;
+		vfe_dev->axi_data.stream_update_aborted = true;
+		complete(&vfe_dev->stream_config_complete);
 	}
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
+}
+
+static int msm_isp_axi_wait_for_cfg_done(struct vfe_device *vfe_dev)
+{
+	unsigned long flags;
+	int rc = 0;
+
+	wait_for_completion_timeout(&vfe_dev->stream_config_complete,
+				    msecs_to_jiffies(VFE_MAX_CFG_TIMEOUT));
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	if (vfe_dev->axi_data.stream_update_aborted) {
+		rc = -EIO;
+	} else if (vfe_dev->axi_data.stream_update) {
+		vfe_dev->axi_data.stream_update = 0;
+		vfe_dev->axi_data.pipeline_update = NO_UPDATE;
+		rc = -ETIMEDOUT;
+	}
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
+	if (rc)
+		pr_err("%s: configuration failed: %d\n", __func__, rc);
 	return rc;
 }
 
@@ -1496,7 +1531,8 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 			enum msm_isp_camif_update_state camif_update)
 {
 	int i, rc = 0;
-	uint8_t src_state, wait_for_complete = 0;
+	uint8_t src_state;
+	uint32_t pending = 0;
 	uint32_t wm_reload_mask = 0x0;
 	struct msm_vfe_axi_stream *stream_info;
 	struct msm_vfe_axi_shared_data *axi_data = &vfe_dev->axi_data;
@@ -1533,7 +1569,7 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 
 		stream_info->state = START_PENDING;
 		if (src_state) {
-			wait_for_complete = 1;
+			pending |= BIT(HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i]));
 		} else {
 			if (vfe_dev->dump_reg)
 				msm_camera_io_dump_2(vfe_dev->vfe_base, 0x900);
@@ -1550,6 +1586,8 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 	}
 	msm_isp_update_stream_bandwidth(vfe_dev);
 	vfe_dev->hw_info->vfe_ops.axi_ops.reload_wm(vfe_dev, wm_reload_mask);
+	if (pending)
+		msm_isp_axi_arm_cfg(vfe_dev, pending, camif_update);
 	vfe_dev->hw_info->vfe_ops.core_ops.reg_update(vfe_dev, 0xF);
 	msm_isp_update_camif_output_count(vfe_dev, stream_cfg_cmd);
 	msm_isp_update_rdi_output_count(vfe_dev, stream_cfg_cmd);
@@ -1567,10 +1605,8 @@ static int msm_isp_start_axi_stream(struct vfe_device *vfe_dev,
 	else if (vfe_dev->axi_data.src_info[VFE_RAW_2].raw_stream_count > 0)
 		vfe_dev->axi_data.src_info[VFE_RAW_2].frame_id = 0;
 
-	if (wait_for_complete) {
-		vfe_dev->axi_data.stream_update = stream_cfg_cmd->num_streams;
-		rc = msm_isp_axi_wait_for_cfg_done(vfe_dev, camif_update);
-	}
+	if (pending)
+		rc = msm_isp_axi_wait_for_cfg_done(vfe_dev);
 
 	return rc;
 }
@@ -1581,7 +1617,7 @@ static int msm_isp_stop_axi_stream(struct vfe_device *vfe_dev,
 {
 	int i, rc = 0;
 	uint8_t wait_for_complete_for_this_stream = 0, cur_stream_cnt = 0;
-	uint8_t wait_for_complete = 0;
+	uint32_t pending = 0;
 	struct msm_vfe_axi_stream *stream_info = NULL;
 	struct msm_vfe_axi_shared_data *axi_data = &vfe_dev->axi_data;
 	int    ext_read =
@@ -1636,19 +1672,26 @@ static int msm_isp_stop_axi_stream(struct vfe_device *vfe_dev,
 			vfe_dev->hw_info->vfe_ops.core_ops.
 				reg_update(vfe_dev, 0xF);
 		}
-		wait_for_complete |= wait_for_complete_for_this_stream;
+		if (wait_for_complete_for_this_stream)
+			pending |= BIT(HANDLE_TO_IDX(stream_cfg_cmd->stream_handle[i]));
 	}
-	if (wait_for_complete) {
-		vfe_dev->axi_data.stream_update = stream_cfg_cmd->num_streams;
+	if (pending) {
+		msm_isp_axi_arm_cfg(vfe_dev, pending, camif_update);
 		vfe_dev->hw_info->vfe_ops.core_ops.
 				reg_update(vfe_dev, 0xF);
-		rc = msm_isp_axi_wait_for_cfg_done(vfe_dev, camif_update);
+		rc = msm_isp_axi_wait_for_cfg_done(vfe_dev);
 		if (rc < 0) {
 			pr_err("%s: wait for config done failed\n", __func__);
 			for (i = 0; i < stream_cfg_cmd->num_streams; i++) {
 				stream_info = &axi_data->stream_info[
 				HANDLE_TO_IDX(
 					stream_cfg_cmd->stream_handle[i])];
+				if (stream_info->state == INACTIVE)
+					continue;
+				if (stream_info->state == STOPPING) {
+					stream_info->state = INACTIVE;
+					continue;
+				}
 				stream_info->state = STOP_PENDING;
 				vfe_dev->hw_info->vfe_ops.core_ops.
 					reg_update(vfe_dev, 0xF);

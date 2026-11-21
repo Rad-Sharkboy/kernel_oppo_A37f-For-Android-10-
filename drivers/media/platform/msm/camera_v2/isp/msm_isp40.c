@@ -1427,11 +1427,7 @@ static int msm_vfe40_axi_halt(struct vfe_device *vfe_dev,
 	msm_camera_io_w(0x7FFFFFFF, vfe_dev->vfe_base + 0x30);
 	msm_camera_io_w(0xFEFFFEFF, vfe_dev->vfe_base + 0x34);
 	msm_camera_io_w(0x1, vfe_dev->vfe_base + 0x24);
-	/* if any stream is waiting for update, signal complete */
-	if (vfe_dev->axi_data.stream_update) {
-		pr_err("%s: calling complete on stream update\n", __func__);
-		complete(&vfe_dev->stream_config_complete);
-	}
+	msm_isp_axi_abort_cfg(vfe_dev);
 	if (blocking) {
 		init_completion(&vfe_dev->halt_complete);
 		/* Halt AXI Bus Bridge */
