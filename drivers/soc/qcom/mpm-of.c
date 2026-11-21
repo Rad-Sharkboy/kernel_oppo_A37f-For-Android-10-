@@ -528,6 +528,18 @@ bool msm_mpm_irqs_detectable(bool from_idle)
 			from_idle);
 }
 
+bool msm_mpm_suspend_wakes_mapped(void)
+{
+	unsigned long flags;
+	bool ready;
+
+	spin_lock_irqsave(&msm_mpm_lock, flags);
+	ready = msm_mpm_in_suspend && msm_mpm_irqs_detectable(false) &&
+		msm_mpm_gpio_irqs_detectable(false);
+	spin_unlock_irqrestore(&msm_mpm_lock, flags);
+	return ready;
+}
+
 void msm_mpm_enter_sleep(uint64_t sclk_count, bool from_idle,
 		const struct cpumask *cpumask)
 {

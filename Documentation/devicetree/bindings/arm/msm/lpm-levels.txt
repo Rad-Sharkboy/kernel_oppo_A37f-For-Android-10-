@@ -65,6 +65,8 @@ Required properties:
 	- qcom,time-overhead: The time spent in entering and exiting this
 	level in uS
  Optional properties:
+	- qcom,suspend-only: Restrict this level to final platform suspend with
+	  one online CPU and wake interrupts mapped at the MPM.
 	- qcom,notify-rpm: When set, the driver flushes the RPM sleep set and
 	configures the virtual MPM driver in prepration for a RPM assisted
 	sleep.

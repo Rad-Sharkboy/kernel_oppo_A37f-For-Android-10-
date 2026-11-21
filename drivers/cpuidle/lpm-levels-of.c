@@ -87,7 +87,8 @@ ssize_t lpm_enable_store(struct kobject *kobj, struct kobj_attribute *attr,
 }
 
 static int create_lvl_avail_nodes(const char *name,
-			struct kobject *parent, struct lpm_level_avail *avail)
+			struct kobject *parent, struct lpm_level_avail *avail,
+			bool suspend_only)
 {
 	struct attribute_group *attr_group = NULL;
 	struct attribute **attr = NULL;
@@ -112,10 +113,12 @@ static int create_lvl_avail_nodes(const char *name,
 		goto failed;
 	}
 
+	avail->idle_enabled = !suspend_only;
+	avail->suspend_enabled = true;
 	avail->idle_enabled_attr.attr.name = lpm_types[IDLE].str;
-	avail->idle_enabled_attr.attr.mode = 0644;
+	avail->idle_enabled_attr.attr.mode = suspend_only ? 0444 : 0644;
 	avail->idle_enabled_attr.show = lpm_enable_show;
-	avail->idle_enabled_attr.store = lpm_enable_store;
+	avail->idle_enabled_attr.store = suspend_only ? NULL : lpm_enable_store;
 
 	avail->suspend_enabled_attr.attr.name = lpm_types[SUSPEND].str;
 	avail->suspend_enabled_attr.attr.mode = 0644;
@@ -133,8 +136,6 @@ static int create_lvl_avail_nodes(const char *name,
 		goto failed;
 	}
 
-	avail->idle_enabled = true;
-	avail->suspend_enabled = true;
 	avail->kobj = kobj;
 
 	return ret;
@@ -187,7 +188,7 @@ static int create_cpu_lvl_nodes(struct lpm_cluster *p, struct kobject *parent)
 			}
 
 			ret = create_lvl_avail_nodes(p->cpu->levels[j].name,
-					cpu_kobj[cpu_idx], &level_list[i]);
+					cpu_kobj[cpu_idx], &level_list[i], false);
 			if (ret)
 				goto release_kobj;
 		}
@@ -222,7 +223,8 @@ int create_cluster_lvl_nodes(struct lpm_cluster *p, struct kobject *kobj)
 
 	for (i = 0; i < p->nlevels; i++) {
 		ret = create_lvl_avail_nodes(p->levels[i].level_name,
-				cluster_kobj, &p->levels[i].available);
+				cluster_kobj, &p->levels[i].available,
+				p->levels[i].suspend_only);
 		if (ret)
 			return ret;
 	}
@@ -441,6 +443,7 @@ static int parse_cluster_level(struct device_node *node,
 	}
 
 	level->notify_rpm = of_property_read_bool(node, "qcom,notify-rpm");
+	level->suspend_only = of_property_read_bool(node, "qcom,suspend-only");
 	level->last_core_only = of_property_read_bool(node,
 					"qcom,last-core-only");
 

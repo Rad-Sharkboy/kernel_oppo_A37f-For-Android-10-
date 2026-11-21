@@ -73,6 +73,7 @@ int msm_mpm_set_pin_type(unsigned int pin, unsigned int flow_type);
  * interrupts can wake the system up from low power mode.
  */
 bool msm_mpm_irqs_detectable(bool from_idle);
+bool msm_mpm_suspend_wakes_mapped(void);
 /**
  * msm_mpm_gpio_detectable() - Check if active gpio irqs can be monitored by
  *				MPM
@@ -136,6 +137,8 @@ static inline int msm_mpm_set_pin_wake(unsigned int pin, unsigned int on)
 static inline int msm_mpm_set_pin_type(unsigned int pin,
 				       unsigned int flow_type)
 { return -ENODEV; }
+static inline bool msm_mpm_suspend_wakes_mapped(void)
+{ return false; }
 static inline bool msm_mpm_irqs_detectable(bool from_idle)
 { return false; }
 static inline bool msm_mpm_gpio_irqs_detectable(bool from_idle)

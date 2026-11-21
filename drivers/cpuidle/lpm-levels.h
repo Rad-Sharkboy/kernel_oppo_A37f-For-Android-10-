@@ -57,6 +57,7 @@ struct lpm_cluster_level {
 	bool notify_rpm;
 	bool sync_level;
 	bool last_core_only;
+	bool suspend_only;
 	struct lpm_level_avail available;
 };
 
