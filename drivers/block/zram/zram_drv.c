@@ -346,36 +346,14 @@ static ssize_t comp_algorithm_store(struct device *dev,
 	return len;
 }
 
-/* flag operations needs meta->tb_lock */
-static int zram_test_flag(struct zram_meta *meta, u32 index,
-			enum zram_pageflags flag)
+static inline u64 zram_table_groups(u64 pages)
 {
-	return meta->table[index].value & BIT(flag);
+	return (pages + BITS_PER_LONG - 1) / BITS_PER_LONG;
 }
 
-static void zram_set_flag(struct zram_meta *meta, u32 index,
-			enum zram_pageflags flag)
+static inline struct zram_slot_group *zram_group(struct zram_meta *meta, u32 index)
 {
-	meta->table[index].value |= BIT(flag);
-}
-
-static void zram_clear_flag(struct zram_meta *meta, u32 index,
-			enum zram_pageflags flag)
-{
-	meta->table[index].value &= ~BIT(flag);
-}
-
-static size_t zram_get_obj_size(struct zram_meta *meta, u32 index)
-{
-	return meta->table[index].value & (BIT(ZRAM_FLAG_SHIFT) - 1);
-}
-
-static void zram_set_obj_size(struct zram_meta *meta,
-					u32 index, size_t size)
-{
-	unsigned long flags = meta->table[index].value >> ZRAM_FLAG_SHIFT;
-
-	meta->table[index].value = (flags << ZRAM_FLAG_SHIFT) | size;
+	return &meta->table[index / BITS_PER_LONG];
 }
 
 static inline int is_partial_io(struct bio_vec *bvec)
@@ -414,9 +392,11 @@ static void zram_meta_free(struct zram_meta *meta, u64 disksize)
 
 	/* Free all pages that are still in this zram device */
 	for (index = 0; index < num_pages; index++) {
-		unsigned long handle = meta->table[index].handle;
+		struct zram_slot_group *group = zram_group(meta, index);
+		unsigned int slot = index % BITS_PER_LONG;
+		unsigned long handle = group->handles[slot];
 
-		if (!handle || zram_test_flag(meta, index, ZRAM_SAME))
+		if (!group->sizes[slot] || group->sizes[slot] == ZRAM_UNIFORM_SIZE)
 			continue;
 
 		zs_free(meta->mem_pool, handle);
@@ -437,7 +417,7 @@ static struct zram_meta *zram_meta_alloc(int device_id, u64 disksize)
 		return NULL;
 
 	num_pages = disksize >> PAGE_SHIFT;
-	meta->table = vzalloc(num_pages * sizeof(*meta->table));
+	meta->table = vzalloc(zram_table_groups(num_pages) * sizeof(*meta->table));
 	if (!meta->table) {
 		pr_err("Error allocating zram address table\n");
 		goto out_error;
@@ -537,46 +517,36 @@ static void zram_copy_partial_same(struct bio_vec *bvec, int offset,
 }
 
 
-/*
- * To protect concurrent access to the same index entry,
- * caller should hold this table index entry's bit_spinlock to
- * indicate this index entry is accessing.
- */
-static void zram_free_page(struct zram *zram, size_t index)
+/* Caller owns the slot's lock bit. */
+static void zram_free_page(struct zram *zram, struct zram_slot_group *group,
+			   unsigned int slot)
 {
-	struct zram_meta *meta = zram->meta;
-	unsigned long handle = meta->table[index].handle;
+	size_t size = group->sizes[slot];
+	unsigned long handle = group->handles[slot];
 
-	if (zram_test_flag(meta, index, ZRAM_SAME)) {
-		zram_clear_flag(meta, index, ZRAM_SAME);
-		meta->table[index].handle = 0;
-		atomic64_dec(&zram->stats.same_pages);
-		atomic64_dec(&zram->stats.pages_stored);
+	if (!size)
 		return;
-	}
-
-	if (unlikely(!handle)) {
-		/*
-		 * No memory is allocated for zero filled pages.
-		 * Simply clear zero page flag.
-		 */
-		if (zram_test_flag(meta, index, ZRAM_ZERO)) {
-			zram_clear_flag(meta, index, ZRAM_ZERO);
+	if (size == ZRAM_UNIFORM_SIZE) {
+		if (!handle)
 			atomic64_dec(&zram->stats.zero_pages);
-			atomic64_dec(&zram->stats.same_pages);
-			atomic64_dec(&zram->stats.pages_stored);
-		}
-		return;
+		atomic64_dec(&zram->stats.same_pages);
+	} else {
+		zs_free(zram->meta->mem_pool, handle);
+		atomic64_sub(size, &zram->stats.compr_data_size);
 	}
-
-	zs_free(meta->mem_pool, handle);
-
-	atomic64_sub(zram_get_obj_size(meta, index),
-			&zram->stats.compr_data_size);
 	atomic64_dec(&zram->stats.pages_stored);
+	group->handles[slot] = 0;
+	group->sizes[slot] = 0;
+}
 
-	meta->table[index].handle = 0;
-	zram_set_obj_size(meta, index, 0);
+static void zram_discard_slot(struct zram *zram, u32 index)
+{
+	struct zram_slot_group *group = zram_group(zram->meta, index);
+	unsigned int slot = index % BITS_PER_LONG;
+
+	bit_spin_lock(slot, &group->locks);
+	zram_free_page(zram, group, slot);
+	bit_spin_unlock(slot, &group->locks);
 }
 
 static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
@@ -584,22 +554,21 @@ static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
 	int ret = 0;
 	unsigned char *cmem;
 	struct zram_meta *meta = zram->meta;
+	struct zram_slot_group *group = zram_group(meta, index);
+	unsigned int slot = index % BITS_PER_LONG;
 	unsigned long handle;
 	size_t size;
 
-	bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
-	handle = meta->table[index].handle;
-	size = zram_get_obj_size(meta, index);
+	bit_spin_lock(slot, &group->locks);
+	handle = group->handles[slot];
+	size = group->sizes[slot];
 
-	if (zram_test_flag(meta, index, ZRAM_SAME)) {
-		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
-		zram_fill_page(mem, handle);
-		return 0;
-	}
-
-	if (!handle || zram_test_flag(meta, index, ZRAM_ZERO)) {
-		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
-		clear_page(mem);
+	if (!size || size == ZRAM_UNIFORM_SIZE) {
+		bit_spin_unlock(slot, &group->locks);
+		if (size && handle)
+			zram_fill_page(mem, handle);
+		else
+			clear_page(mem);
 		return 0;
 	}
 
@@ -609,7 +578,7 @@ static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
 	else
 		ret = zcomp_decompress(zram->comp, cmem, size, mem);
 	zs_unmap_object(meta->mem_pool, handle);
-	bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+	bit_spin_unlock(slot, &group->locks);
 
 	/* Should NEVER happen. Return bio error if it does. */
 	if (unlikely(ret)) {
@@ -630,17 +599,17 @@ static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
 
 	if (partial) {
 		struct zram_meta *meta = zram->meta;
-		unsigned long element = 0;
+		struct zram_slot_group *group = zram_group(meta, index);
+		unsigned int slot = index % BITS_PER_LONG;
+		unsigned long element;
+		size_t size;
 		bool same;
 
-		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
-		same = zram_test_flag(meta, index, ZRAM_SAME);
-		if (same)
-			element = meta->table[index].handle;
-		else
-			same = !meta->table[index].handle ||
-			       zram_test_flag(meta, index, ZRAM_ZERO);
-		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+		bit_spin_lock(slot, &group->locks);
+		size = group->sizes[slot];
+		same = !size || size == ZRAM_UNIFORM_SIZE;
+		element = group->handles[slot];
+		bit_spin_unlock(slot, &group->locks);
 		if (same) {
 			zram_copy_partial_same(bvec, offset, element);
 			return 0;
@@ -691,6 +660,8 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 	struct page *page;
 	unsigned char *user_mem, *cmem, *src, *uncmem = NULL;
 	struct zram_meta *meta = zram->meta;
+	struct zram_slot_group *group = zram_group(meta, index);
+	unsigned int slot = index % BITS_PER_LONG;
 	struct zcomp_strm *zstrm = NULL;
 	bool partial = is_partial_io(bvec);
 	bool same;
@@ -725,18 +696,15 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 
 	if (same) {
 		/* Free memory associated with this sector now. */
-		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
-		zram_free_page(zram, index);
-		if (element) {
-			meta->table[index].handle = element;
-			zram_set_flag(meta, index, ZRAM_SAME);
-		} else {
-			zram_set_flag(meta, index, ZRAM_ZERO);
+		bit_spin_lock(slot, &group->locks);
+		zram_free_page(zram, group, slot);
+		group->handles[slot] = element;
+		group->sizes[slot] = ZRAM_UNIFORM_SIZE;
+		if (!element)
 			atomic64_inc(&zram->stats.zero_pages);
-		}
 		atomic64_inc(&zram->stats.same_pages);
 		atomic64_inc(&zram->stats.pages_stored);
-		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+		bit_spin_unlock(slot, &group->locks);
 		ret = 0;
 		goto out;
 	}
@@ -795,14 +763,14 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 	 * Free memory associated with this sector
 	 * before overwriting unused sectors.
 	 */
-	bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
-	zram_free_page(zram, index);
+	bit_spin_lock(slot, &group->locks);
+	zram_free_page(zram, group, slot);
 
-	meta->table[index].handle = handle;
-	zram_set_obj_size(meta, index, clen);
+	group->handles[slot] = handle;
+	group->sizes[slot] = clen;
 	atomic64_add(clen, &zram->stats.compr_data_size);
 	atomic64_inc(&zram->stats.pages_stored);
-	bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+	bit_spin_unlock(slot, &group->locks);
 out:
 	if (zstrm)
 		zcomp_strm_release(zram->comp, zstrm);
@@ -844,7 +812,6 @@ static void zram_bio_discard(struct zram *zram, u32 index,
 {
 	size_t n = bio->bi_size;
 	unsigned long freed = 0;
-	struct zram_meta *meta = zram->meta;
 
 	/*
 	 * zram manages data in physical block size units. Because logical block
@@ -865,9 +832,7 @@ static void zram_bio_discard(struct zram *zram, u32 index,
 	}
 
 	while (n >= PAGE_SIZE) {
-		bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
-		zram_free_page(zram, index);
-		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+		zram_discard_slot(zram, index);
 		freed++;
 		index++;
 		n -= PAGE_SIZE;
@@ -943,7 +908,7 @@ static ssize_t disksize_store(struct device *dev,
 
 	disksize = PAGE_ALIGN(disksize);
 	if ((disksize >> PAGE_SHIFT) > U32_MAX ||
-	    (disksize >> PAGE_SHIFT) > SIZE_MAX / sizeof(struct zram_table_entry) ||
+	    zram_table_groups(disksize >> PAGE_SHIFT) > SIZE_MAX / sizeof(struct zram_slot_group) ||
 	    (disksize >> SECTOR_SHIFT) > (sector_t)-1)
 		return -EOVERFLOW;
 
@@ -1125,18 +1090,14 @@ static void zram_slot_free_notify(struct block_device *bdev,
 				unsigned long index)
 {
 	struct zram *zram;
-	struct zram_meta *meta;
 
 	zram = bdev->bd_disk->private_data;
 	if (unlikely(!zram_meta_get(zram)))
 		return;
 	if (unlikely(index >= (zram->disksize >> PAGE_SHIFT)))
 		goto out;
-	meta = zram->meta;
 
-	bit_spin_lock(ZRAM_ACCESS, &meta->table[index].value);
-	zram_free_page(zram, index);
-	bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+	zram_discard_slot(zram, index);
 	atomic64_inc(&zram->stats.notify_free);
 out:
 	zram_meta_put(zram);

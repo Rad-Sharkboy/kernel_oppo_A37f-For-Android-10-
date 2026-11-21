@@ -35,34 +35,18 @@ static const unsigned max_num_devices = 32;
 	(1 << (ZRAM_LOGICAL_BLOCK_SHIFT - SECTOR_SHIFT))
 
 
-/*
- * The lower ZRAM_FLAG_SHIFT bits of table.value is for
- * object size (excluding header), the higher bits is for
- * zram_pageflags.
- *
- * zram is mainly used for memory efficiency so we want to keep memory
- * footprint small so we can squeeze size and flags into a field.
- * The lower ZRAM_FLAG_SHIFT bits is for object size (excluding header),
- * the higher bits is for zram_pageflags.
- */
-#define ZRAM_FLAG_SHIFT 24
+/* Zero means empty, PAGE_SIZE is raw, and a uniform slot stores its word. */
+#define ZRAM_UNIFORM_SIZE (PAGE_SIZE + 1)
+#if PAGE_SHIFT < 16
+typedef u16 zram_slot_size_t;
+#else
+typedef u32 zram_slot_size_t;
+#endif
 
-/* Flags for zram pages (table[page_no].value) */
-enum zram_pageflags {
-	/* Page consists entirely of zeros */
-	ZRAM_ZERO = ZRAM_FLAG_SHIFT,
-	ZRAM_ACCESS,	/* page is now accessed */
-	ZRAM_SAME,	/* nonzero uniform page; handle stores its word */
-
-	__NR_ZRAM_PAGEFLAGS,
-};
-
-/*-- Data structures */
-
-/* Allocated for each disk page */
-struct zram_table_entry {
-	unsigned long handle;
-	unsigned long value;
+struct zram_slot_group {
+	unsigned long locks;
+	unsigned long handles[BITS_PER_LONG];
+	zram_slot_size_t sizes[BITS_PER_LONG];
 };
 
 struct zram_stats {
@@ -81,7 +65,7 @@ struct zram_stats {
 };
 
 struct zram_meta {
-	struct zram_table_entry *table;
+	struct zram_slot_group *table;
 	struct zs_pool *mem_pool;
 	size_t max_comp_size;
 };
