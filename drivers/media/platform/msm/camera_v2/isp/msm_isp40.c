@@ -689,7 +689,8 @@ static void msm_vfe40_process_reg_update(struct vfe_device *vfe_dev,
 
 	if (vfe_dev->axi_data.stream_update)
 		msm_isp_axi_stream_update(vfe_dev, input_src);
-	if (atomic_read(&vfe_dev->stats_data.stats_update))
+	if ((input_src & BIT(VFE_PIX_0)) &&
+	    atomic_read(&vfe_dev->stats_data.stats_update))
 		msm_isp_stats_stream_update(vfe_dev);
 	if (atomic_read(&vfe_dev->axi_data.axi_cfg_update))
 		msm_isp_axi_cfg_update(vfe_dev, input_src);
@@ -1517,59 +1518,9 @@ static int msm_vfe40_stats_check_streams(
 }
 
 static void msm_vfe40_stats_cfg_comp_mask(struct vfe_device *vfe_dev,
-	uint32_t stats_mask, uint8_t enable)
+	uint32_t stats_mask, uint8_t group, uint8_t enable)
 {
-	uint32_t comp_stats_mask;
-	uint32_t i = 0;
-	atomic_t *stats_comp;
-	struct msm_vfe_stats_shared_data *stats_data = &vfe_dev->stats_data;
-
-	stats_mask = stats_mask & 0xFF;
-
-	if (vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask >
-			MAX_NUM_STATS_COMP_MASK) {
-		pr_err("%s: num of comp masks %d exceed max %d\n",
-			__func__,
-			vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask,
-			MAX_NUM_STATS_COMP_MASK);
-		return;
-	}
-
-	for (i = 0;
-		i < vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask; i++) {
-
-		stats_data->reg_mask =
-		  msm_camera_io_r(vfe_dev->vfe_base + 0x44);
-		comp_stats_mask =
-		  stats_data->reg_mask & (STATS_COMP_BIT_MASK << (i*8));
-		stats_comp = &stats_data->stats_comp_mask[i];
-
-		if (enable) {
-			if (comp_stats_mask)
-				continue;
-
-			stats_data->reg_mask |= (stats_mask << (16 + i*8));
-			atomic_add(stats_mask, stats_comp);
-		} else {
-			/*
-			 * Check if comp mask in reg is valid
-			 * and contains this stat
-			 */
-			if (!comp_stats_mask ||
-				!((comp_stats_mask >> (16 + i*8)) &
-					stats_mask))
-				continue;
-
-			atomic_sub(stats_mask, stats_comp);
-			stats_data->reg_mask &= ~(stats_mask << (16 + i*8));
-		}
-		ISP_DBG("%s: comp_mask: %x atomic stats[0]: %x %x\n",
-			__func__, stats_data->reg_mask,
-			atomic_read(&stats_data->stats_comp_mask[0]),
-			atomic_read(&stats_data->stats_comp_mask[1]));
-		msm_camera_io_w(stats_data->reg_mask, vfe_dev->vfe_base + 0x44);
-		return;
-	}
+	msm_isp_stats_set_group(vfe_dev, stats_mask, group, enable, 0x44, 0);
 }
 
 static void msm_vfe40_stats_cfg_wm_irq_mask(

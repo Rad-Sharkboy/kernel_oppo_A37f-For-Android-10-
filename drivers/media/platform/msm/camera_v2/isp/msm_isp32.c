@@ -633,9 +633,13 @@ static void msm_vfe32_process_reg_update(struct vfe_device *vfe_dev,
 
 	if (vfe_dev->axi_data.stream_update)
 		msm_isp_axi_stream_update(vfe_dev, input_src);
-	if (atomic_read(&vfe_dev->stats_data.stats_update))
+	if ((input_src & BIT(VFE_PIX_0)) &&
+	    atomic_read(&vfe_dev->stats_data.stats_update))
 		msm_isp_stats_stream_update(vfe_dev);
+	if (atomic_read(&vfe_dev->axi_data.axi_cfg_update))
+		msm_isp_axi_cfg_update(vfe_dev, input_src);
 	if (vfe_dev->axi_data.stream_update ||
+	    atomic_read(&vfe_dev->axi_data.axi_cfg_update) ||
 		atomic_read(&vfe_dev->stats_data.stats_update)) {
 		if (input_src & (1 << VFE_PIX_0)) {
 			vfe_dev->hw_info->vfe_ops.core_ops.
@@ -1279,9 +1283,8 @@ static int msm_vfe32_stats_check_streams(
 }
 
 static void msm_vfe32_stats_cfg_comp_mask(struct vfe_device *vfe_dev,
-	uint32_t stats_mask, uint8_t enable)
+	uint32_t stats_mask, uint8_t group, uint8_t enable)
 {
-	return;
 }
 
 static void msm_vfe32_stats_cfg_wm_irq_mask(struct vfe_device *vfe_dev,

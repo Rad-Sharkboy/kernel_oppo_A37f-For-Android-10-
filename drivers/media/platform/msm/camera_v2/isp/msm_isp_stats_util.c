@@ -14,6 +14,7 @@
 #include <media/v4l2-subdev.h>
 #include <media/msmb_isp.h>
 #include "msm_isp_util.h"
+#include "msm_camera_io_util.h"
 #include "msm_isp_stats_util.h"
 
 static int msm_isp_stats_cfg_ping_pong_address(struct vfe_device *vfe_dev,
@@ -375,55 +376,97 @@ void msm_isp_update_stats_framedrop_reg(struct vfe_device *vfe_dev)
 	}
 }
 
+void msm_isp_stats_set_group(struct vfe_device *vfe_dev, uint32_t mask,
+	uint8_t group, bool enable, uint32_t offset, uint8_t skip)
+{
+	struct msm_vfe_stats_shared_data *stats = &vfe_dev->stats_data;
+	uint32_t bits, shift, reg, updated;
+
+	if (!mask || group >= MAX_NUM_STATS_COMP_MASK ||
+	    group >= vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask)
+		return;
+
+	bits = atomic_read(&stats->stats_comp_mask[group]);
+	bits = enable ? bits | mask : bits & ~mask;
+	shift = 16 + 8 * group;
+	reg = msm_camera_io_r(vfe_dev->vfe_base + offset);
+	updated = (reg & ~(0xffU << shift)) | (((bits >> skip) & 0xff) << shift);
+	stats->reg_mask = updated;
+	atomic_set(&stats->stats_comp_mask[group], bits);
+	if (updated != reg)
+		msm_camera_io_w(updated, vfe_dev->vfe_base + offset);
+}
+
 void msm_isp_stats_stream_update(struct vfe_device *vfe_dev)
 {
-	int i;
-	uint32_t stats_mask = 0, comp_stats_mask = 0;
-	uint32_t enable = 0;
-	struct msm_vfe_stats_shared_data *stats_data = &vfe_dev->stats_data;
+	struct msm_vfe_stats_shared_data *stats = &vfe_dev->stats_data;
+	struct msm_vfe_stats_ops *ops = &vfe_dev->hw_info->vfe_ops.stats_ops;
+	uint32_t modules[2] = { 0 };
+	uint32_t groups[2][MAX_NUM_STATS_COMP_MASK] = { { 0 } };
+	unsigned long flags;
+	int i, enable, group;
+
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	if (!atomic_read(&stats->stats_update))
+		goto out;
 	for (i = 0; i < vfe_dev->hw_info->stats_hw_info->num_stats_type; i++) {
-		if (stats_data->stream_info[i].state == STATS_START_PENDING ||
-				stats_data->stream_info[i].state ==
-					STATS_STOP_PENDING) {
-			stats_mask |= i;
-			enable = stats_data->stream_info[i].state ==
-				STATS_START_PENDING ? 1 : 0;
-			stats_data->stream_info[i].state =
-				stats_data->stream_info[i].state ==
-				STATS_START_PENDING ?
-				STATS_STARTING : STATS_STOPPING;
-			vfe_dev->hw_info->vfe_ops.stats_ops.enable_module(
-				vfe_dev, BIT(i), enable);
-			vfe_dev->hw_info->vfe_ops.stats_ops.cfg_comp_mask(
-			   vfe_dev, BIT(i), enable);
-		} else if (stats_data->stream_info[i].state == STATS_STARTING ||
-			stats_data->stream_info[i].state == STATS_STOPPING) {
-			if (stats_data->stream_info[i].composite_flag)
-				comp_stats_mask |= i;
-			stats_data->stream_info[i].state =
-				stats_data->stream_info[i].state ==
-				STATS_STARTING ? STATS_ACTIVE : STATS_INACTIVE;
+		struct msm_vfe_stats_stream *stream = &stats->stream_info[i];
+
+		switch (stream->state) {
+		case STATS_START_PENDING:
+		case STATS_STOP_PENDING:
+			enable = stream->state == STATS_START_PENDING;
+			modules[enable] |= BIT(i);
+			group = stream->composite_flag;
+			if (group > 0 && group <= MAX_NUM_STATS_COMP_MASK)
+				groups[enable][group - 1] |= BIT(i);
+			stream->state = enable ? STATS_STARTING : STATS_STOPPING;
+			break;
+		case STATS_STARTING:
+			stream->state = STATS_ACTIVE;
+			break;
+		case STATS_STOPPING:
+			stream->state = STATS_INACTIVE;
+			break;
+		default:
+			break;
 		}
 	}
-	atomic_sub(1, &stats_data->stats_update);
-	if (!atomic_read(&stats_data->stats_update))
+	for (enable = 0; enable < 2; enable++) {
+		if (!modules[enable])
+			continue;
+		ops->enable_module(vfe_dev, modules[enable], enable);
+		for (group = 0; group < MAX_NUM_STATS_COMP_MASK; group++)
+			if (groups[enable][group])
+				ops->cfg_comp_mask(vfe_dev, groups[enable][group],
+						   group, enable);
+	}
+	if (atomic_dec_and_test(&stats->stats_update))
 		complete(&vfe_dev->stats_config_complete);
+out:
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
 }
 
 static int msm_isp_stats_wait_for_cfg_done(struct vfe_device *vfe_dev)
 {
-	int rc;
-	init_completion(&vfe_dev->stats_config_complete);
+	unsigned long flags;
+	int rc = 0;
+
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	INIT_COMPLETION(vfe_dev->stats_config_complete);
 	atomic_set(&vfe_dev->stats_data.stats_update, 2);
-	rc = wait_for_completion_timeout(
-		&vfe_dev->stats_config_complete,
-		msecs_to_jiffies(VFE_MAX_CFG_TIMEOUT));
-	if (rc == 0) {
-		pr_err("%s: wait timeout\n", __func__);
-		rc = -1;
-	} else {
-		rc = 0;
+	vfe_dev->hw_info->vfe_ops.core_ops.reg_update(vfe_dev, BIT(VFE_PIX_0));
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
+	wait_for_completion_timeout(&vfe_dev->stats_config_complete,
+				    msecs_to_jiffies(VFE_MAX_CFG_TIMEOUT));
+	spin_lock_irqsave(&vfe_dev->shared_data_lock, flags);
+	if (atomic_read(&vfe_dev->stats_data.stats_update)) {
+		atomic_set(&vfe_dev->stats_data.stats_update, 0);
+		rc = -ETIMEDOUT;
 	}
+	spin_unlock_irqrestore(&vfe_dev->shared_data_lock, flags);
+	if (rc)
+		pr_err("%s: wait timeout\n", __func__);
 	return rc;
 }
 
@@ -520,7 +563,7 @@ static int msm_isp_start_stats_stream(struct vfe_device *vfe_dev,
 			vfe_dev, stats_mask, stream_cfg_cmd->enable);
 		for (i = 0; i < num_stats_comp_mask; i++) {
 			vfe_dev->hw_info->vfe_ops.stats_ops.cfg_comp_mask(
-			 vfe_dev, comp_stats_mask[i], 1);
+			 vfe_dev, comp_stats_mask[i], i, 1);
 		}
 	}
 	return rc;
@@ -587,7 +630,7 @@ static int msm_isp_stop_stats_stream(struct vfe_device *vfe_dev,
 			vfe_dev, stats_mask, stream_cfg_cmd->enable);
 		for (i = 0; i < num_stats_comp_mask; i++) {
 			vfe_dev->hw_info->vfe_ops.stats_ops.cfg_comp_mask(
-			   vfe_dev, comp_stats_mask[i], 0);
+			   vfe_dev, comp_stats_mask[i], i, 0);
 		}
 	}
 

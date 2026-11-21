@@ -50,7 +50,6 @@
 
 #define VFE_MAX_CFG_TIMEOUT 3000
 #define VFE_CLK_INFO_MAX 16
-#define STATS_COMP_BIT_MASK 0xFF0000
 
 #define MSM_ISP_MIN_AB 400000000
 #define MSM_ISP_MIN_IB 480000000
@@ -199,7 +198,7 @@ struct msm_vfe_stats_ops {
 	void (*clear_framedrop) (struct vfe_device *vfe_dev,
 		struct msm_vfe_stats_stream *stream_info);
 	void (*cfg_comp_mask) (struct vfe_device *vfe_dev,
-		uint32_t stats_mask, uint8_t enable);
+		uint32_t stats_mask, uint8_t group, uint8_t enable);
 	void (*cfg_wm_irq_mask) (struct vfe_device *vfe_dev,
 		struct msm_vfe_stats_stream *stream_info);
 	void (*clear_wm_irq_mask) (struct vfe_device *vfe_dev,
