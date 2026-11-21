@@ -78,7 +78,8 @@ void msm_isp_process_stats_irq(struct vfe_device *vfe_dev,
 	struct msm_isp_buffer *done_buf;
 	struct msm_vfe_stats_stream *stream_info = NULL;
 	uint32_t pingpong_status;
-	uint32_t comp_stats_type_mask = 0, atomic_stats_mask = 0;
+	uint32_t comp_stats_type_mask = 0, mask;
+	uint32_t groups[MAX_NUM_STATS_COMP_MASK];
 	uint32_t stats_comp_mask = 0, stats_irq_mask = 0;
 	uint32_t num_stats_comp_mask =
 		vfe_dev->hw_info->stats_hw_info->num_stats_comp_mask;
@@ -90,44 +91,33 @@ void msm_isp_process_stats_irq(struct vfe_device *vfe_dev,
 		return;
 	ISP_DBG("%s: status: 0x%x\n", __func__, irq_status0);
 
-	/*
-	 * If any of composite mask is set, clear irq bits from mask,
-	 * they will be restored by comp mask
-	 */
-	if (stats_comp_mask) {
-		for (j = 0; j < num_stats_comp_mask; j++) {
-			stats_irq_mask &= ~atomic_read(
-				&vfe_dev->stats_data.stats_comp_mask[j]);
-		}
-	}
-
+	if (num_stats_comp_mask > ARRAY_SIZE(groups))
+		return;
 	for (j = 0; j < num_stats_comp_mask; j++) {
-		atomic_stats_mask = atomic_read(
-			&vfe_dev->stats_data.stats_comp_mask[j]);
-		if (!stats_comp_mask) {
-			stats_irq_mask &= ~atomic_stats_mask;
-		} else {
-			/* restore irq bits from composite mask */
-			if (stats_comp_mask & (1 << j))
-				stats_irq_mask |= atomic_stats_mask;
-		}
-		/* if no irq bits set from this composite mask continue*/
-		if (!stats_irq_mask)
+		groups[j] = atomic_read(&vfe_dev->stats_data.stats_comp_mask[j]);
+		stats_irq_mask &= ~groups[j];
+	}
+	pingpong_status = vfe_dev->hw_info->vfe_ops.stats_ops.get_pingpong_status(vfe_dev);
+	for (j = 0; j <= num_stats_comp_mask; j++) {
+		if (!j)
+			mask = stats_irq_mask;
+		else if (stats_comp_mask & BIT(j - 1))
+			mask = groups[j - 1];
+		else
+			continue;
+		if (!mask)
 			continue;
 		memset(&buf_event, 0, sizeof(struct msm_isp_event_data));
 		buf_event.timestamp = ts->event_time;
 		buf_event.frame_id =
 			vfe_dev->axi_data.src_info[VFE_PIX_0].frame_id;
 		buf_event.input_intf = VFE_PIX_0;
-		pingpong_status = vfe_dev->hw_info->
-			vfe_ops.stats_ops.get_pingpong_status(vfe_dev);
 
 		for (i = 0; i < vfe_dev->hw_info->stats_hw_info->num_stats_type;
 			i++) {
-			if (!(stats_irq_mask & (1 << i)))
+			if (!(mask & BIT(i)))
 				continue;
 
-			stats_irq_mask &= ~(1 << i);
 			stream_info = &vfe_dev->stats_data.stream_info[i];
 			done_buf = NULL;
 			msm_isp_stats_cfg_ping_pong_address(vfe_dev,
