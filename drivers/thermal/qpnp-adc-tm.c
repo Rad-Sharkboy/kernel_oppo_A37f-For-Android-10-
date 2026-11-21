@@ -213,6 +213,7 @@ struct qpnp_adc_tm_chip {
 	int				max_channels_available;
 	atomic_t			wq_cnt;
 	struct qpnp_vadc_chip		*vadc_dev;
+	struct workqueue_struct		*workqueue;
 	struct work_struct		threshold_work;
 	bool				high_irq_wake;
 	bool				low_irq_wake;
@@ -1251,7 +1252,7 @@ static void qpnp_adc_tm_queue_work(struct qpnp_adc_tm_chip *chip,
 		struct work_struct *work)
 {
 	atomic_inc(&chip->wq_cnt);
-	if (!queue_work(system_highpri_wq, work))
+	if (!queue_work(chip->workqueue, work))
 		atomic_dec(&chip->wq_cnt);
 }
 
@@ -1705,6 +1706,8 @@ static void qpnp_adc_tm_release_sensors(struct qpnp_adc_tm_chip *chip, int count
 		if (!IS_ERR_OR_NULL(sensor->tz_dev))
 			thermal_zone_device_unregister(sensor->tz_dev);
 	}
+	if (chip->workqueue)
+		destroy_workqueue(chip->workqueue);
 }
 
 static int qpnp_adc_tm_probe(struct spmi_device *spmi)
@@ -1855,6 +1858,11 @@ static int qpnp_adc_tm_probe(struct spmi_device *spmi)
 		sen_idx++;
 	}
 	chip->max_channels_available = count_adc_channel_list;
+	chip->workqueue = alloc_workqueue("qpnp_adc_tm", WQ_HIGHPRI, 0);
+	if (!chip->workqueue) {
+		rc = -ENOMEM;
+		goto fail;
+	}
 	INIT_WORK(&chip->threshold_work, qpnp_adc_tm_threshold_work);
 	atomic_set(&chip->wq_cnt, 0);
 
