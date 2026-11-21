@@ -16,6 +16,7 @@
 #include <linux/regulator/consumer.h>
 #include <linux/io.h>
 #include <linux/err.h>
+#include <linux/of.h>
 #include <soc/qcom/camera2.h>
 #include <linux/msm-bus.h>
 #include "msm_camera_io_util.h"
@@ -263,6 +264,42 @@ int msm_cam_clk_getinfo(struct clk **clk_ptr, int num_clk, bool *enable, long *r
 	return 0;
 }
 #endif
+
+int msm_camera_enable_top_gdsc(struct device *dev, struct regulator **supply)
+{
+	struct regulator *reg;
+	int rc;
+
+	/* Only a permanent miss after both DT and board lookup is cached. */
+	if (*supply == ERR_PTR(-ENODEV))
+		return 0;
+	reg = regulator_get(dev, "qcom,gdscr-vdd");
+	if (IS_ERR(reg)) {
+		rc = PTR_ERR(reg);
+		if (!of_find_property(dev->of_node, "qcom,gdscr-vdd-supply", NULL)) {
+			if (rc == -ENODEV && dev->of_node)
+				*supply = reg;
+			return 0;
+		}
+		return rc;
+	}
+	rc = regulator_enable(reg);
+	if (rc) {
+		regulator_put(reg);
+		return rc;
+	}
+	*supply = reg;
+	return 0;
+}
+
+void msm_camera_disable_top_gdsc(struct regulator **supply)
+{
+	if (IS_ERR_OR_NULL(*supply))
+		return;
+	regulator_disable(*supply);
+	regulator_put(*supply);
+	*supply = NULL;
+}
 
 int msm_camera_config_vreg(struct device *dev, struct camera_vreg_t *cam_vreg,
 		int num_vreg, enum msm_camera_vreg_name_t *vreg_seq,

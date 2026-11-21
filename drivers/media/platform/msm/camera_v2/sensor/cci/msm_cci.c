@@ -766,7 +766,6 @@ static int32_t msm_cci_init(struct v4l2_subdev *sd,
 #endif
 	uint8_t i = 0;
 	int32_t rc = 0, ret = 0;
-	bool regulator_enabled = false;
 	struct cci_device *cci_dev;
 	enum cci_i2c_master_t master;
 
@@ -847,19 +846,10 @@ static int32_t msm_cci_init(struct v4l2_subdev *sd,
 			pr_err("%s:%d cannot set pin to active state\n",
 				__func__, __LINE__);
 	}
-	cci_dev->reg_ptr = regulator_get(&(cci_dev->pdev->dev),
-					 "qcom,gdscr-vdd");
-	if (IS_ERR_OR_NULL(cci_dev->reg_ptr)) {
-		pr_err(" %s: Failed in getting TOP gdscr regulator handle\n",
-			__func__);
-	} else {
-		rc = regulator_enable(cci_dev->reg_ptr);
-		if (rc) {
-			pr_err(" %s: regulator enable failed for TOP GDSCR\n",
-				__func__);
-			goto clk_enable_failed;
-		}
-		regulator_enabled = true;
+	rc = msm_camera_enable_top_gdsc(&cci_dev->pdev->dev, &cci_dev->reg_ptr);
+	if (rc) {
+		pr_err("%s: TOP GDSC enable failed: %d\n", __func__, rc);
+		goto clk_enable_failed;
 	}
 	rc = msm_cam_clk_enable(&cci_dev->pdev->dev, cci_clk_info,
 		cci_dev->cci_clk, cci_dev->num_clk, 1);
@@ -936,12 +926,7 @@ clk_enable_failed:
 	msm_camera_request_gpio_table(cci_dev->cci_gpio_tbl,
 		cci_dev->cci_gpio_tbl_size, 0);
 
-	if (!IS_ERR_OR_NULL(cci_dev->reg_ptr)) {
-		if (regulator_enabled)
-			regulator_disable(cci_dev->reg_ptr);
-		regulator_put(cci_dev->reg_ptr);
-		cci_dev->reg_ptr = NULL;
-	}
+	msm_camera_disable_top_gdsc(&cci_dev->reg_ptr);
 request_gpio_failed:
 	cci_dev->ref_count--;
 	return rc;
@@ -965,11 +950,7 @@ static int32_t msm_cci_release(struct v4l2_subdev *sd)
 	disable_irq(cci_dev->irq->start);
 	msm_cam_clk_enable(&cci_dev->pdev->dev, cci_clk_info,
 		cci_dev->cci_clk, cci_dev->num_clk, 0);
-	if (!IS_ERR_OR_NULL(cci_dev->reg_ptr)) {
-		regulator_disable(cci_dev->reg_ptr);
-		regulator_put(cci_dev->reg_ptr);
-		cci_dev->reg_ptr = NULL;
-	}
+	msm_camera_disable_top_gdsc(&cci_dev->reg_ptr);
 	if (cci_dev->cci_pinctrl_status) {
 		rc = pinctrl_select_state(cci_dev->cci_pinctrl.pinctrl,
 				cci_dev->cci_pinctrl.gpio_state_suspend);
