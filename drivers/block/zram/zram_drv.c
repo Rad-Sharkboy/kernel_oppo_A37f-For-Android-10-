@@ -697,6 +697,11 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 	if (same) {
 		/* Free memory associated with this sector now. */
 		bit_spin_lock(slot, &group->locks);
+		if (group->sizes[slot] == ZRAM_UNIFORM_SIZE &&
+		    group->handles[slot] == element) {
+			bit_spin_unlock(slot, &group->locks);
+			goto out;
+		}
 		zram_free_page(zram, group, slot);
 		group->handles[slot] = element;
 		group->sizes[slot] = ZRAM_UNIFORM_SIZE;
@@ -723,6 +728,8 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 	src = zstrm->buffer;
 	if (unlikely(clen > meta->max_comp_size)) {
 		clen = PAGE_SIZE;
+		zcomp_strm_release(zram->comp, zstrm);
+		zstrm = NULL;
 		if (partial)
 			src = uncmem;
 	}
@@ -756,7 +763,8 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 	}
 
 	zs_unmap_object(meta->mem_pool, handle);
-	zcomp_strm_release(zram->comp, zstrm);
+	if (zstrm)
+		zcomp_strm_release(zram->comp, zstrm);
 	zstrm = NULL;
 
 	/*
