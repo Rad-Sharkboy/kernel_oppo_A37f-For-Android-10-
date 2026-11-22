@@ -124,12 +124,19 @@ static void swap_fn(struct work_struct *work)
 	int si = 0, smallest = 0;
 	int i;
 	int tasksize;
-	int total_sz = 0;
+	u64 total_sz = 0;
+	unsigned int budget;
+	u64 remaining_sz;
 	int total_scan = 0;
 	int total_reclaimed = 0;
 	int nr_to_reclaim;
 	int efficiency;
 
+	if (!ACCESS_ONCE(enable_process_reclaim) || ACCESS_ONCE(per_swap_size) <= 0)
+		return;
+	budget = min_t(long, ACCESS_ONCE(per_swap_size), get_nr_swap_pages());
+	if (!budget)
+		return;
 	rcu_read_lock();
 	for_each_process(tsk) {
 		struct task_struct *p;
@@ -138,8 +145,6 @@ static void swap_fn(struct work_struct *work)
 		if (tsk->flags & PF_KTHREAD)
 			continue;
 
-		if (test_task_flag(tsk, TIF_MEMDIE))
-			continue;
 
 		p = find_lock_task_mm(tsk);
 		if (!p)
@@ -190,6 +195,7 @@ static void swap_fn(struct work_struct *work)
 
 	rcu_read_unlock();
 
+	remaining_sz = total_sz;
 	while (si--) {
 		tsk = selected[si].p;
 		/* App state may have changed since selection. */
@@ -201,24 +207,25 @@ static void swap_fn(struct work_struct *work)
 		}
 		selected[si].oom_score_adj = tsk->signal->oom_score_adj;
 		task_unlock(tsk);
-		if (selected[si].oom_score_adj < min_score_adj)
+		if (!budget || selected[si].oom_score_adj < min_score_adj ||
+		    test_task_flag(tsk, TIF_MEMDIE))
 			goto next_task;
 
-		nr_to_reclaim =
-			(selected[si].tasksize * per_swap_size) / total_sz;
-		/* scan atleast a page */
-		if (!nr_to_reclaim)
-			nr_to_reclaim = 1;
+		nr_to_reclaim = div64_u64((u64)selected[si].tasksize * budget,
+					  remaining_sz);
+		nr_to_reclaim = clamp_t(int, nr_to_reclaim, 1, selected[si].tasksize);
+		budget -= nr_to_reclaim;
 
 		rp = reclaim_task_anon(selected[si].p, nr_to_reclaim);
 
 		trace_process_reclaim(selected[si].tasksize,
 				selected[si].oom_score_adj, rp.nr_scanned,
-				rp.nr_reclaimed, per_swap_size, total_sz,
+				rp.nr_reclaimed, per_swap_size, min_t(u64, total_sz, INT_MAX),
 				nr_to_reclaim);
 		total_scan += rp.nr_scanned;
 		total_reclaimed += rp.nr_reclaimed;
 next_task:
+		remaining_sz -= selected[si].tasksize;
 		put_task_struct(selected[si].p);
 	}
 
@@ -251,12 +258,13 @@ static int vmpressure_notifier(struct notifier_block *nb,
 	if (!current_is_kswapd())
 		return 0;
 
+	if (pressure < pressure_min || pressure >= pressure_max || !get_nr_swap_pages())
+		return 0;
+
 	if (0 <= atomic_dec_if_positive(&skip_reclaim))
 		return 0;
 
-	if ((pressure >= pressure_min) && (pressure < pressure_max))
-		if (!work_pending(&swap_work))
-			queue_work(system_unbound_wq, &swap_work);
+	queue_work(system_unbound_wq, &swap_work);
 	return 0;
 }
 
