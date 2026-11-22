@@ -126,15 +126,16 @@ static void swap_fn(struct work_struct *work)
 	int tasksize;
 	u64 total_sz = 0;
 	unsigned int budget;
+	int requested = ACCESS_ONCE(per_swap_size);
 	u64 remaining_sz;
 	int total_scan = 0;
 	int total_reclaimed = 0;
 	int nr_to_reclaim;
 	int efficiency;
 
-	if (!ACCESS_ONCE(enable_process_reclaim) || ACCESS_ONCE(per_swap_size) <= 0)
+	if (!ACCESS_ONCE(enable_process_reclaim) || requested <= 0)
 		return;
-	budget = min_t(long, ACCESS_ONCE(per_swap_size), get_nr_swap_pages());
+	budget = min_t(long, requested, max_t(long, 0, get_nr_swap_pages()));
 	if (!budget)
 		return;
 	rcu_read_lock();
@@ -220,7 +221,7 @@ static void swap_fn(struct work_struct *work)
 
 		trace_process_reclaim(selected[si].tasksize,
 				selected[si].oom_score_adj, rp.nr_scanned,
-				rp.nr_reclaimed, per_swap_size, min_t(u64, total_sz, INT_MAX),
+				rp.nr_reclaimed, requested, min_t(u64, total_sz, INT_MAX),
 				nr_to_reclaim);
 		total_scan += rp.nr_scanned;
 		total_reclaimed += rp.nr_reclaimed;
