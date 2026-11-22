@@ -215,6 +215,8 @@ struct size_class {
 
 	/* Number of PAGE_SIZE sized pages to combine to form a 'zspage' */
 	int pages_per_zspage;
+	unsigned int objects_per_zspage;
+	unsigned long free_slots;
 	/* huge object: pages_per_zspage == 1 && maxobj_per_zspage == 1 */
 	bool huge;
 
@@ -1433,6 +1435,7 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size)
 			first_page = new_page;
 			new_page = NULL;
 			set_zspage_mapping(first_page, class->index, ZS_EMPTY);
+			class->free_slots += class->objects_per_zspage;
 			atomic_long_add(class->pages_per_zspage,
 					&pool->pages_allocated);
 			zs_stat_inc(class, OBJ_ALLOCATED, get_maxobj_per_zspage(
@@ -1440,6 +1443,7 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size)
 		}
 	}
 
+	class->free_slots--;
 	obj = obj_malloc(first_page, class, handle);
 	/* Now move the zspage to another fullness group, if required */
 	fix_fullness_group(class, first_page);
@@ -1505,8 +1509,10 @@ void zs_free(struct zs_pool *pool, unsigned long handle)
 
 	spin_lock(&class->lock);
 	obj_free(pool, class, obj);
+	class->free_slots++;
 	fullness = fix_fullness_group(class, first_page);
 	if (fullness == ZS_EMPTY) {
+		class->free_slots -= class->objects_per_zspage;
 		zs_stat_dec(class, OBJ_ALLOCATED, get_maxobj_per_zspage(
 				class->size, class->pages_per_zspage));
 		atomic_long_sub(class->pages_per_zspage,
@@ -1705,6 +1711,7 @@ static void putback_zspage(struct zs_pool *pool, struct size_class *class,
 	set_zspage_mapping(first_page, class->index, fullness);
 
 	if (fullness == ZS_EMPTY) {
+		class->free_slots -= class->objects_per_zspage;
 		zs_stat_dec(class, OBJ_ALLOCATED, get_maxobj_per_zspage(
 			class->size, class->pages_per_zspage));
 		atomic_long_sub(class->pages_per_zspage,
@@ -1729,23 +1736,22 @@ static unsigned long __zs_compact(struct zs_pool *pool,
 				struct size_class *class,
 				unsigned long deadline)
 {
-	int nr_to_migrate;
 	struct zs_compact_control cc;
-	struct page *src_page;
+	struct page *src_page = NULL;
 	struct page *dst_page = NULL;
 	unsigned long nr_total_migrated = 0;
 	unsigned long before;
 
 	spin_lock(&class->lock);
-	while ((src_page = isolate_source_page(class))) {
-		if (time_after_eq(jiffies, deadline))
+	while (class->free_slots >= class->objects_per_zspage && time_before(jiffies, deadline)) {
+		src_page = isolate_source_page(class);
+		if (!src_page)
 			break;
 		before = nr_total_migrated;
 
 		BUG_ON(!is_first_page(src_page));
 
 		/* The goal is to migrate all live objects in source page */
-		nr_to_migrate = src_page->inuse;
 		cc.index = 0;
 		cc.s_page = src_page;
 
@@ -1760,7 +1766,6 @@ static unsigned long __zs_compact(struct zs_pool *pool,
 
 			putback_zspage(pool, class, dst_page);
 			nr_total_migrated += cc.nr_migrated;
-			nr_to_migrate -= cc.nr_migrated;
 		}
 
 		/* Stop if we couldn't find slot */
@@ -1879,6 +1884,7 @@ struct zs_pool *zs_create_pool(char *name, gfp_t flags)
 		class->size = size;
 		class->index = i;
 		class->pages_per_zspage = pages_per_zspage;
+		class->objects_per_zspage = get_maxobj_per_zspage(size, pages_per_zspage);
 		if (pages_per_zspage == 1 &&
 			get_maxobj_per_zspage(size, pages_per_zspage) == 1)
 			class->huge = true;
