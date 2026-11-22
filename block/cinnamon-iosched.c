@@ -77,6 +77,7 @@ struct cinnamon_data {
 	/* Batching state */
 	unsigned int batch_count;
 	unsigned int read_batch_count;   /* tracks reads in current cycle */
+	bool trim_served;
 	unsigned int fg_dispatch_count;  /* consecutive foreground dispatches */
 
 	/* Latency EWMA (ns), not a sum over num_requests. */
@@ -628,7 +629,8 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	}
 
 	/* 2. TRIM queue */
-	if (!list_empty(&cd->queues[PRIO_TRIM])) {
+	if (!list_empty(&cd->queues[PRIO_TRIM]) &&
+	    (!cd->trim_served || cd->queued == cd->queue_counts[PRIO_TRIM])) {
 		rq = list_first_entry(&cd->queues[PRIO_TRIM],
 				      struct request, queuelist);
 		target_pressure = 0;
@@ -708,6 +710,7 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	}
 
 	/* No requests */
+	cd->trim_served = false;
 	cd->empty_dispatch_count++;
 	cinnamon_set_pressure(cd, 0);
 
@@ -720,6 +723,8 @@ dispatch:
 	if (rq) {
 		/* Decrement count for the queue this request belongs to */
 		prio = get_req_prio(rq);
+		if (prio != PRIO_CRITICAL)
+			cd->trim_served = prio == PRIO_TRIM;
 		if (prio >= 0 && prio < PRIO_COUNT && cd->queue_counts[prio] > 0) {
 			cd->queue_counts[prio]--;
 			cd->queued--;
@@ -857,6 +862,7 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	cd->dispatch_seq = 0;
 	cd->last_adjust_dispatch_seq = 0;
 	cd->empty_dispatch_count = 0;
+	cd->trim_served = false;
 
 	cd->write_starved_count = 0;
 	cd->last_starved_jiffies = 0;
