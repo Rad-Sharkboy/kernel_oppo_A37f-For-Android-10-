@@ -47,7 +47,6 @@
 #define MAX_MERGE_SCAN               8             /* O(1) merge scan limit */
 #define FG_STARVE_LIMIT              16            /* Max foreground dispatches before forcing background */
 
-#define EMMC_MAJOR                   179
 #define EMMC_MAX_BATCH                16
 #define EMMC_MIN_PRESSURE_THRES       12
 #define EMMC_MAX_PRESSURE_THRES       24
@@ -121,7 +120,7 @@ struct cinnamon_data {
 	unsigned int dispatch_seq;
 	unsigned int last_adjust_dispatch_seq;
 	int empty_dispatch_count;
-	bool emmc_mode;
+	int emmc_mode;	/* -1 selects the MMC host classification */
 
 	/* Starvation auto-recovery */
 	unsigned int write_starved_count;
@@ -177,10 +176,17 @@ static inline int get_req_prio(struct request *rq)
 	return val & CINNAMON_PRIO_MASK;
 }
 
+static bool cinnamon_is_emmc(struct cinnamon_data *cd)
+{
+	if (cd->emmc_mode >= 0)
+		return cd->emmc_mode;
+	return test_bit(QUEUE_FLAG_EMBEDDED_MMC, &cd->q->queue_flags);
+}
+
 /* Clamp tunables for eMMC */
 static void cinnamon_clamp_for_emmc(struct cinnamon_data *cd)
 {
-	if (!cd->emmc_mode)
+	if (!cinnamon_is_emmc(cd))
 		return;
 	cd->read_batch = min(cd->read_batch, EMMC_MAX_BATCH);
 	cd->write_batch = min(cd->write_batch, EMMC_MAX_BATCH);
@@ -350,7 +356,7 @@ static void cinnamon_account_sequence(struct cinnamon_data *cd,
 
 static bool cinnamon_sequence_ready(struct cinnamon_data *cd)
 {
-	return cd->emmc_mode && cd->seq_write_count >= CINNAMON_SEQ_TRIGGER &&
+	return cinnamon_is_emmc(cd) && cd->seq_write_count >= CINNAMON_SEQ_TRIGGER &&
 		(cd->seq_write_burst < CINNAMON_SEQ_BURST ||
 		 list_empty(&cd->queues[PRIO_READ_FG]));
 }
@@ -856,12 +862,7 @@ static int cinnamon_init_queue(struct request_queue *q, struct elevator_type *e)
 	cd->last_starved_jiffies = 0;
 	cd->starvation_recovery_until = 0;
 
-	cd->emmc_mode = false;
-	if (q->backing_dev_info.dev) {
-		dev_t devt = q->backing_dev_info.dev->devt;
-		if (MAJOR(devt) == EMMC_MAJOR)
-			cd->emmc_mode = true;
-	}
+	cd->emmc_mode = -1;
 	cinnamon_clamp_for_emmc(cd);
 
 	eq->elevator_data = cd;
@@ -1091,7 +1092,7 @@ static ssize_t cinnamon_batch_stats_show(struct elevator_queue *e, char *page)
 static ssize_t cinnamon_emmc_mode_show(struct elevator_queue *e, char *page)
 {
 	struct cinnamon_data *cd = e->elevator_data;
-	return sprintf(page, "%d\n", cd->emmc_mode ? 1 : 0);
+	return sprintf(page, "%d\n", cinnamon_is_emmc(cd) ? 1 : 0);
 }
 
 static ssize_t cinnamon_emmc_mode_store(struct elevator_queue *e, const char *page, size_t count)
@@ -1102,7 +1103,7 @@ static ssize_t cinnamon_emmc_mode_store(struct elevator_queue *e, const char *pa
 	if (kstrtol(page, 10, &val) || val > INT_MAX / 2)
 		return -EINVAL;
 	spin_lock_irqsave(cd->q->queue_lock, flags);
-	cd->emmc_mode = (val != 0);
+	cd->emmc_mode = val == -1 ? -1 : (val != 0);
 	cinnamon_clamp_for_emmc(cd);
 	cd->last_manual_param_change_jiffies = jiffies;
 	spin_unlock_irqrestore(cd->q->queue_lock, flags);
