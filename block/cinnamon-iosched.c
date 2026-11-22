@@ -623,7 +623,7 @@ static int cinnamon_dispatch(struct request_queue *q, int force)
 	if (!list_empty(&cd->queues[PRIO_CRITICAL])) {
 		rq = list_first_entry(&cd->queues[PRIO_CRITICAL],
 				      struct request, queuelist);
-		target_pressure = 1;
+		target_pressure = rq_data_dir(rq) == READ ? 1 : 2;
 		cd->fg_dispatch_count++;
 		goto dispatch;
 	}
@@ -751,8 +751,9 @@ dispatch:
 		set_req_time_and_prio(rq, 0, 0);
 
 		/* Update batching counters */
-		cd->batch_count = (target_pressure == 2) ? cd->batch_count + 1 : 0;
-		if (target_pressure == 1)
+		cd->batch_count = (prio != PRIO_TRIM && rq_data_dir(rq) == WRITE) ?
+			cd->batch_count + 1 : 0;
+		if (prio != PRIO_TRIM && rq_data_dir(rq) == READ)
 			cd->read_batch_count++;
 		else
 			cd->read_batch_count = 0;
