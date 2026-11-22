@@ -1198,20 +1198,23 @@ static int reclaim_pte_range(pmd_t *pmd, unsigned long addr,
 {
 	struct reclaim_param *rp = walk->private;
 	struct vm_area_struct *vma = rp->vma;
-	pte_t *pte, ptent;
+	pte_t *pte, *first, ptent;
 	spinlock_t *ptl;
 	struct page *page;
 	LIST_HEAD(page_list);
 	int isolated;
 	int reclaimed;
 
+	if (!rp->nr_to_reclaim)
+		return 0;
 	split_huge_page_pmd(vma, addr, pmd);
-	if (pmd_trans_unstable(pmd) || !rp->nr_to_reclaim)
+	if (pmd_trans_unstable(pmd))
 		return 0;
 cont:
 	isolated = 0;
-	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
-	for (; addr != end; pte++, addr += PAGE_SIZE) {
+	first = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	for (pte = first; addr != end && isolated < min_t(int, SWAP_CLUSTER_MAX, rp->nr_to_reclaim);
+			pte++, addr += PAGE_SIZE) {
 		ptent = *pte;
 		if (!pte_present(ptent))
 			continue;
@@ -1228,20 +1231,20 @@ cont:
 				page_is_file_cache(page));
 		isolated++;
 		rp->nr_scanned++;
-		if ((isolated >= SWAP_CLUSTER_MAX) || !rp->nr_to_reclaim)
-			break;
 	}
-	pte_unmap_unlock(pte - 1, ptl);
+	pte_unmap_unlock(first, ptl);
+	if (!isolated)
+		return 0;
 	reclaimed = reclaim_pages_from_list(&page_list, vma);
 	rp->nr_reclaimed += reclaimed;
-	rp->nr_to_reclaim -= reclaimed;
+	rp->nr_to_reclaim -= rp->manual ? isolated : reclaimed;
 	if (rp->nr_to_reclaim < 0)
 		rp->nr_to_reclaim = 0;
 
+	cond_resched();
 	if (rp->nr_to_reclaim && (addr != end))
 		goto cont;
 
-	cond_resched();
 	return 0;
 }
 
@@ -1258,7 +1261,7 @@ struct reclaim_param reclaim_task_anon(struct task_struct *task,
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
 	struct mm_walk reclaim_walk = {};
-	struct reclaim_param rp;
+	struct reclaim_param rp = { 0 };
 
 	rp.nr_reclaimed = 0;
 	rp.nr_scanned = 0;
@@ -1273,9 +1276,10 @@ struct reclaim_param reclaim_task_anon(struct task_struct *task,
 	rp.nr_to_reclaim = nr_to_reclaim;
 	reclaim_walk.private = &rp;
 
-	down_read(&mm->mmap_sem);
+	if (!down_read_trylock(&mm->mmap_sem))
+		goto put_mm;
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
-		if (is_vm_hugetlb_page(vma))
+		if (is_vm_hugetlb_page(vma) || (vma->vm_flags & (VM_LOCKED | VM_IO | VM_PFNMAP)))
 			continue;
 
 		if (vma->vm_file)
@@ -1289,8 +1293,10 @@ struct reclaim_param reclaim_task_anon(struct task_struct *task,
 			&reclaim_walk);
 	}
 
-	flush_tlb_mm(mm);
+	if (rp.nr_scanned || IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		flush_tlb_mm(mm);
 	up_read(&mm->mmap_sem);
+put_mm:
 	mmput(mm);
 out:
 	put_task_struct(task);
@@ -1309,7 +1315,7 @@ static ssize_t reclaim_write(struct file *file, const char __user *buf,
 	struct mm_walk reclaim_walk = {};
 	unsigned long start = 0;
 	unsigned long end = 0;
-	struct reclaim_param rp;
+	struct reclaim_param rp = { 0 };
 
 	memset(buffer, 0, sizeof(buffer));
 	if (count > sizeof(buffer) - 1)
@@ -1371,43 +1377,35 @@ static ssize_t reclaim_write(struct file *file, const char __user *buf,
 	reclaim_walk.mm = mm;
 	reclaim_walk.pmd_entry = reclaim_pte_range;
 
-	rp.nr_to_reclaim = ~0;
+	/* Keep explicit Android compaction to one isolation batch. */
+	rp.manual = true;
+	rp.nr_to_reclaim = SWAP_CLUSTER_MAX;
 	rp.nr_reclaimed = 0;
 	reclaim_walk.private = &rp;
 
 	down_read(&mm->mmap_sem);
-	if (type == RECLAIM_RANGE) {
-		vma = find_vma(mm, start);
-		while (vma) {
-			if (vma->vm_start > end)
+	vma = type == RECLAIM_RANGE ? find_vma(mm, start) : mm->mmap;
+	for (; vma && rp.nr_to_reclaim; vma = vma->vm_next) {
+		unsigned long lo = vma->vm_start, hi = vma->vm_end;
+
+		if (type == RECLAIM_RANGE) {
+			if (lo >= end)
 				break;
-			if (is_vm_hugetlb_page(vma))
-				continue;
-
-			rp.vma = vma;
-			walk_page_range(max(vma->vm_start, start),
-					min(vma->vm_end, end),
-					&reclaim_walk);
-			vma = vma->vm_next;
+			lo = max(lo, start);
+			hi = min(hi, end);
 		}
-	} else {
-		for (vma = mm->mmap; vma; vma = vma->vm_next) {
-			if (is_vm_hugetlb_page(vma))
-				continue;
-
-			if (type == RECLAIM_ANON && vma->vm_file)
-				continue;
-
-			if (type == RECLAIM_FILE && !vma->vm_file)
-				continue;
-
-			rp.vma = vma;
-			walk_page_range(vma->vm_start, vma->vm_end,
-				&reclaim_walk);
-		}
+		if (lo >= hi || is_vm_hugetlb_page(vma) ||
+		    (vma->vm_flags & (VM_LOCKED | VM_IO | VM_PFNMAP)))
+			continue;
+		if ((type == RECLAIM_ANON && vma->vm_file) ||
+		    (type == RECLAIM_FILE && !vma->vm_file))
+			continue;
+		rp.vma = vma;
+		walk_page_range(lo, hi, &reclaim_walk);
 	}
 
-	flush_tlb_mm(mm);
+	if (rp.nr_scanned || IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		flush_tlb_mm(mm);
 	up_read(&mm->mmap_sem);
 	mmput(mm);
 out:
