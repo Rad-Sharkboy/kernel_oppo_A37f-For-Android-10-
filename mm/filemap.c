@@ -498,19 +498,24 @@ out:
 }
 EXPORT_SYMBOL(add_to_page_cache_locked);
 
-int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
-				pgoff_t offset, gfp_t gfp_mask)
+static int add_cache_page_lru(struct page *page, struct address_space *mapping,
+				pgoff_t offset, gfp_t gfp_mask, bool writing)
 {
 	int ret;
 
 	ret = add_to_page_cache(page, mapping, offset, gfp_mask);
 	if (ret == 0) {
-		if (workingset_refault(mapping, page))
+		if (workingset_refault(mapping, page, writing))
 			lru_cache_add_lru(page, LRU_ACTIVE_FILE);
 		else
 			lru_cache_add_file(page);
 	}
 	return ret;
+}
+int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
+				pgoff_t offset, gfp_t gfp_mask)
+{
+	return add_cache_page_lru(page, mapping, offset, gfp_mask, gfp_mask & __GFP_WRITE);
 }
 EXPORT_SYMBOL_GPL(add_to_page_cache_lru);
 
@@ -2302,8 +2307,8 @@ retry:
 		goto retry;
 	}
 
-	status = add_to_page_cache_lru(page, mapping, index,
-						GFP_KERNEL & ~gfp_notmask);
+	status = add_cache_page_lru(page, mapping, index,
+						GFP_KERNEL & ~gfp_notmask, true);
 	if (unlikely(status)) {
 		page_cache_release(page);
 		if (status == -EEXIST)

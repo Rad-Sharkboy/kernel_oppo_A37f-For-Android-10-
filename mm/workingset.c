@@ -170,7 +170,7 @@ void workingset_eviction(struct address_space *mapping, struct page *page)
 	atomic_long_inc(&evictions);
 }
 
-bool workingset_refault(struct address_space *mapping, struct page *page)
+bool workingset_refault(struct address_space *mapping, struct page *page, bool writing)
 {
 	struct identity_bucket *identity;
 	struct history_bucket *bucket;
@@ -216,7 +216,7 @@ bool workingset_refault(struct address_space *mapping, struct page *page)
 	spin_unlock(&history_locks[hh % LOCK_COUNT]);
 unlock_identity:
 	spin_unlock_irqrestore(&identity_locks[ih % LOCK_COUNT], flags);
-	if (!zone)
+	if (!zone || writing)
 		return false;
 	atomic_long_inc(&refaults);
 	if (distance > zone_page_state(zone, NR_ACTIVE_FILE))
