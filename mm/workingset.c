@@ -32,11 +32,15 @@ struct refault_entry {
 	u64 cookie;
 	pgoff_t index;
 	unsigned long age;
-	struct zone *zone;
 };
 
 struct history_bucket {
 	struct refault_entry entries[HISTORY_WAYS];
+#ifdef CONFIG_NUMA
+	struct zone *zones[HISTORY_WAYS];
+#else
+	u8 zones[HISTORY_WAYS];
+#endif
 	unsigned int next;
 };
 
@@ -155,7 +159,12 @@ void workingset_eviction(struct address_space *mapping, struct page *page)
 	entry->cookie = cookie;
 	entry->index = page->index;
 	entry->age = age;
-	entry->zone = zone;
+#ifdef CONFIG_NUMA
+	bucket->zones[entry - bucket->entries] = zone;
+#else
+	BUILD_BUG_ON(MAX_NR_ZONES > 256);
+	bucket->zones[entry - bucket->entries] = zone_idx(zone);
+#endif
 	spin_unlock(&history_locks[hh % LOCK_COUNT]);
 	spin_unlock_irqrestore(&identity_locks[ih % LOCK_COUNT], flags);
 	atomic_long_inc(&evictions);
@@ -194,7 +203,11 @@ bool workingset_refault(struct address_space *mapping, struct page *page)
 
 		if (entry->cookie != cookie || entry->index != page->index)
 			continue;
-		zone = entry->zone;
+#ifdef CONFIG_NUMA
+		zone = bucket->zones[i];
+#else
+		zone = &NODE_DATA(0)->node_zones[bucket->zones[i]];
+#endif
 		distance = (unsigned long)atomic_long_read(zone_age(zone)) -
 			entry->age;
 		entry->cookie = 0;
